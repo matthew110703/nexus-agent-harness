@@ -5,7 +5,7 @@ import type {} from '@deepseek-ai/dsh-credentials'
 import { CONNECT_PATH } from '@deepseek-ai/dsh-client-connection'
 import type { ConnectionTrustRequest, PeerScope } from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { BrowserAuth } from './browser-auth.ts'
+import { BrowserAuth, isEffectiveHttps } from './browser-auth.ts'
 
 /** Stable plugin name. */
 export const name = 'host-authentication-token'
@@ -30,37 +30,6 @@ export const Config: z<Config> = z.object({
   cookieMaxAgeDays: z.natural().min(1).default(30),
   trustForwardedProto: z.boolean().default(false),
 })
-
-/** True when a socket remote address is local loopback (IPv4 or IPv6). */
-function isLoopbackRemoteAddress(address: string | undefined): boolean {
-  if (address === undefined) return false
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
-}
-
-/**
- * Determine whether the incoming request arrived over HTTPS, honoring
- * `X-Forwarded-Proto: https` only when explicitly enabled and received from a
- * loopback proxy peer.
- */
-export function isEffectiveHttps(
-  request: ConnectionTrustRequest,
-  serverProtocol: string | undefined,
-  trustForwardedProto = false,
-): boolean {
-  if (serverProtocol === 'https:') return true
-  if (!trustForwardedProto) return false
-  const socket = request.socket
-  const remoteAddress = socket !== undefined && 'remoteAddress' in socket && typeof socket.remoteAddress === 'string'
-    ? socket.remoteAddress
-    : undefined
-  if (!isLoopbackRemoteAddress(remoteAddress)) return false
-  const raw = request.headers instanceof Headers
-    ? request.headers.get('x-forwarded-proto') ?? undefined
-    : request.headers['x-forwarded-proto']
-  const header = Array.isArray(raw) ? raw[0] : raw
-  if (header === undefined) return false
-  return header.split(',')[0]?.trim().toLowerCase() === 'https'
-}
 
 /**
  * Register the token provider and its optional Web transport integration.

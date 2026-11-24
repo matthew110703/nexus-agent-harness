@@ -87,6 +87,39 @@ function header(
   return typeof value === 'string' ? value : undefined
 }
 
+/** True when a socket remote address is local loopback (127.0.0.0/8, ::1, or IPv4-mapped loopback). */
+function isLoopbackRemoteAddress(address: string | undefined): boolean {
+  if (address === undefined) return false
+  if (address === '::1') return true
+  const bare = address.startsWith('::ffff:') ? address.slice(7) : address
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/u.test(bare)
+}
+
+/**
+ * Determine whether the incoming request arrived over HTTPS, honoring
+ * `X-Forwarded-Proto: https` only when explicitly enabled and received from a
+ * loopback proxy peer.
+ */
+export function isEffectiveHttps(
+  request: ConnectionTrustRequest,
+  serverProtocol: string | undefined,
+  trustForwardedProto = false,
+): boolean {
+  if (serverProtocol === 'https:') return true
+  if (!trustForwardedProto) return false
+  const socket = request.socket
+  const remoteAddress = socket !== undefined && 'remoteAddress' in socket && typeof socket.remoteAddress === 'string'
+    ? socket.remoteAddress
+    : undefined
+  if (!isLoopbackRemoteAddress(remoteAddress)) return false
+  const raw = request.headers instanceof Headers
+    ? request.headers.get('x-forwarded-proto') ?? undefined
+    : request.headers['x-forwarded-proto'] ?? request.headers['X-Forwarded-Proto']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (value === undefined) return false
+  return value.split(',')[0]?.trim().toLowerCase() === 'https'
+}
+
 /** Protocol-scoped cookie audience; HTTP retains its existing authority-only spelling. */
 function requestAudience(headers: ConnectionTrustRequest['headers'], secure: boolean): string | undefined {
   const host = header(headers, 'host')
