@@ -14,7 +14,10 @@ import process from 'node:process'
 
 const HARNESS_PORT = Number(process.env.NEXUS_HARNESS_PORT || 3080)
 const GATEWAY_URL = process.env.NEXUS_GATEWAY_URL || 'http://127.0.0.1:7861'
-const OVERLAY_PATH = process.env.NEXUS_OVERLAY || 'apps/cli/config/examples/colab.overlay.yml'
+const OVERLAY_PATHS = [
+  process.env.NEXUS_OVERLAY || 'apps/cli/config/examples/colab.overlay.yml',
+  process.env.NEXUS_EXTRA_OVERLAY || '',
+].filter(Boolean)
 const API_KEY = process.env.NEXUS_API_KEY || ''
 
 const TRYCLOUDFLARE_RE = /https:\/\/([a-z0-9-]+\.trycloudflare\.com)/i
@@ -69,13 +72,12 @@ export function redactSecrets(line, secret = API_KEY) {
   return line.split(secret).join('[REDACTED_NEXUS_API_KEY]')
 }
 
-/** Build the exact launcher-first `dsh` argv for Colab Web mode. */
-export function buildDshArgs({ overlay, publicUrl, trustedHost, port }) {
+/** Build source-fork launcher args with all requested Cordis overlays. */
+export function buildDshArgs({ overlays, publicUrl, trustedHost, port }) {
   return [
     'dsh',
     'web',
-    '--patch',
-    overlay,
+    ...overlays.flatMap((overlay) => ['--patch', overlay]),
     '--host',
     '127.0.0.1',
     '--port',
@@ -189,7 +191,7 @@ async function main() {
 
   const publicUrl = `https://${tunnelHost}`
   const dshArgs = buildDshArgs({
-    overlay: OVERLAY_PATH,
+    overlays: OVERLAY_PATHS,
     publicUrl,
     trustedHost: tunnelHost,
     port: HARNESS_PORT,
