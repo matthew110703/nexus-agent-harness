@@ -128,8 +128,10 @@ export interface WebRoute {
  * Answers one GET or HEAD request with a Fetch response and its admitted Peer.
  * Anonymous HTTP admission may omit the Peer; an in-process
  * {@link WebServer.readResource} read passes the Peer its caller admitted.
+ * Socket-backed HTTP exchanges also pass the underlying socket so anonymous
+ * resources that authenticate requests themselves retain peer-address facts.
  */
-export type WebResource = (request: Request, peer?: PeerScope) => Promise<Response>
+export type WebResource = (request: Request, peer?: PeerScope, socket?: WebAuthRequest['socket']) => Promise<Response>
 
 /** One named route answered by a resource instead of a handler. */
 export interface WebResourceRoute {
@@ -826,7 +828,7 @@ export class WebServer extends Service {
     for (const [name, value] of Object.entries(req.headers)) {
       for (const item of typeof value === 'string' ? [value] : value ?? []) headers.append(name, item)
     }
-    const response = await resource(new Request(target, { method: req.method, headers, signal }), peer)
+    const response = await resource(new Request(target, { method: req.method, headers, signal }), peer, req.socket)
     await writeResponse(res, response, req.method === 'HEAD', signal)
     if (!signal.aborted) res.end()
   }

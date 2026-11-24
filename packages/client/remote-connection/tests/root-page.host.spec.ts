@@ -440,3 +440,21 @@ it('reports provider faults as unavailable without rendering a login page or pri
   }
   expect(renderedPeers).toHaveLength(0)
 })
+
+it('accepts a Token cookie minted behind a loopback HTTPS proxy on subsequent GET /', async () => {
+  const { ctx, service, send } = await mounted()
+  await ctx.plugin(Token, { cookieMaxAgeDays: 30, trustForwardedProto: true })
+  const link = new URL(service.loginUrl())
+  const exchanged = await send(link.pathname + link.search, 'GET', { 'x-forwarded-proto': 'https' })
+  expect(exchanged.status).toBe(303)
+  expect(exchanged.headers['set-cookie']?.[0]).toContain('; Secure')
+  const tokenCookie = cookie(exchanged)
+
+  const proxiedRoot = await send('/', 'GET', { cookie: tokenCookie, 'x-forwarded-proto': 'https' })
+  expect(proxiedRoot.status).toBe(200)
+  expect(proxiedRoot.body).toContain('PRIVATE_APPLICATION')
+
+  const plainHttpRoot = await send('/', 'GET', { cookie: tokenCookie })
+  expect(plainHttpRoot.status).toBe(401)
+  expect(plainHttpRoot.body).not.toContain('PRIVATE_APPLICATION')
+})

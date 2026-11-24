@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-web-app'
 import type {} from '@deepseek-ai/dsh-credentials'
 import type { PeerScope } from '@deepseek-ai/dsh-client-connection'
-import type { WebEntryUrl } from '@deepseek-ai/dsh-host-webserver'
+import type { WebAuthRequest, WebEntryUrl } from '@deepseek-ai/dsh-host-webserver'
 import { HarnessError } from '@deepseek-ai/dsh-error'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { LoginTickets } from './login-tickets.ts'
@@ -148,8 +148,8 @@ export default class RemoteConnection extends TypertRemoteService {
       yield registerPairingRoutes(ctx, this.pairing, this.lifetime, request => auth.createSessionCookie(request, ctx.webServer.protocol === 'https:'))
       yield ctx.webServer.register({
         kind: 'exact', path: '/', auth: 'anonymous',
-        resource: async (request, admitted) => {
-          const task = this.readRoot(request, admitted)
+        resource: async (request, admitted, socket) => {
+          const task = this.readRoot(request, admitted, socket)
           this.pending.add(task)
           try { return await task } finally { this.pending.delete(task) }
         },
@@ -168,11 +168,13 @@ export default class RemoteConnection extends TypertRemoteService {
     return this.disposed || this.owner.fiber.uid === null || this.owner.fiber.state === FiberState.UNLOADING
   }
 
-  private async readRoot(request: Request, admitted?: PeerScope): Promise<Response> {
+  private async readRoot(request: Request, admitted?: PeerScope, socket?: WebAuthRequest['socket']): Promise<Response> {
     const signal = AbortSignal.any([request.signal, this.lifetime.signal])
     signal.throwIfAborted()
     const admission = admitted === undefined
-      ? this.owner.connection.authentication.authenticate({ headers: request.headers, method: request.method, url: request.url, signal })
+      ? this.owner.connection.authentication.authenticate({
+        headers: request.headers, method: request.method, url: request.url, signal, socket,
+      })
       : { peer: admitted }
     const qrLogin = isQrLogin(new URL(request.url))
     if ('rejection' in admission || qrLogin) {
