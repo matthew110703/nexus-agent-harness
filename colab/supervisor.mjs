@@ -110,6 +110,61 @@ async function waitForPort(port, timeoutMs = 30_000) {
   return false
 }
 
+/** Convert an OpenAI `/v1/models` payload into `llm-pi-ai` model profile entries. */
+export function parseDiscoveredModels(payload) {
+  const list = Array.isArray(payload?.data) ? payload.data : []
+  const seen = new Set()
+  const models = []
+  for (const item of list) {
+    if (typeof item?.id !== 'string' || item.id.trim().length === 0) continue
+    const id = item.id.trim()
+    if (seen.has(id)) continue
+    seen.add(id)
+    const entry = {
+      id,
+      name: typeof item.name === 'string' && item.name.trim().length > 0 ? item.name.trim() : id,
+    }
+    const rawModalities = Array.isArray(item.input)
+      ? item.input
+      : Array.isArray(item.modalities)
+        ? item.modalities
+        : undefined
+    if (rawModalities !== undefined) {
+      const input = rawModalities.filter((m) => m === 'text' || m === 'image')
+      if (input.length > 0) entry.input = input
+    }
+    const contextWindow = item.context_window ?? item.context_length ?? item.contextWindow
+    if (typeof contextWindow === 'number' && Number.isInteger(contextWindow) && contextWindow >= 1) {
+      entry.contextWindow = contextWindow
+    }
+    const maxTokens = item.max_tokens ?? item.maxTokens
+    if (typeof maxTokens === 'number' && Number.isInteger(maxTokens) && maxTokens >= 1) {
+      entry.maxTokens = maxTokens
+    }
+    models.push(entry)
+  }
+  return models
+}
+
+async function discoverGatewayModels() {
+  try {
+    const modelsUrl = new URL('/v1/models', GATEWAY_URL)
+    const res = await fetch(modelsUrl, {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) {
+      console.warn(`[supervisor] Warning: gateway /v1/models returned HTTP ${res.status}; starting with empty model list.`)
+      return []
+    }
+    const payload = await res.json()
+    return parseDiscoveredModels(payload)
+  } catch (err) {
+    console.warn(`[supervisor] Warning: could not fetch /v1/models (${redactSecrets(String(err))}); starting with empty model list.`)
+    return []
+  }
+}
+
 async function verifyGatewayHealth() {
   if (!API_KEY) {
     throw new Error('NEXUS_API_KEY is not set in the environment')
@@ -126,6 +181,15 @@ async function main() {
   console.log(`[supervisor] Node ${process.versions.node} verified.`)
   console.log('[supervisor] Verifying independent Nexus gateway health (127.0.0.1:7861)...')
   await verifyGatewayHealth()
+
+  const discoveredModels = process.env.NEXUS_DISCOVERED_MODELS
+    ? undefined
+    : await discoverGatewayModels()
+  if (discoveredModels !== undefined) {
+    const names = discoveredModels.map((m) => m.id).join(', ')
+    const suffix = discoveredModels.length > 0 ? `: ${names}` : ''
+    console.log(`[supervisor] Discovered ${discoveredModels.length} model(s) from Nexus gateway${suffix}.`)
+  }
 
   if (await isPortOpen(HARNESS_PORT)) {
     throw new Error(
@@ -197,9 +261,13 @@ async function main() {
     port: HARNESS_PORT,
   })
   console.log(`[supervisor] Starting Nexus Harness (${publicUrl})...`)
+  const harnessEnv = {
+    ...process.env,
+    ...(discoveredModels !== undefined ? { NEXUS_DISCOVERED_MODELS: JSON.stringify(discoveredModels) } : {}),
+  }
   const harness = spawn('pnpm', dshArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: process.env,
+    env: harnessEnv,
   })
   children.add(harness)
 

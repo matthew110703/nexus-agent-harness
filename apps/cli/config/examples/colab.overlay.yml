@@ -31,6 +31,7 @@
           - image
         defaultContextWindow: 32768
         defaultMaxTokens: 4096
+        models: !!js JSON.parse(process.env.NEXUS_DISCOVERED_MODELS || '[]')
         compat:
           supportsDeveloperRole: false
           maxTokensField: max_tokens
