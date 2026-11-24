@@ -418,6 +418,7 @@
     { "path": "./packages/util/output-retention" },
     { "path": "./packages/util/atomic-write" },
     { "path": "./packages/attachment/attachment" },
+    { "path": "./packages/experimental/nexus-host" },
     { "path": "./packages/attachment/attachment-local" },
     { "path": "./packages/client/file-upload/tsconfig.host.json" },
     { "path": "./packages/client/remote-connection/tsconfig.host.json" },

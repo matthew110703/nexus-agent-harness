@@ -1,0 +1,36 @@
+# Nexus Harness Colab overlay:
+#   dsh web --patch apps/cli/config/examples/colab.overlay.yml \
+#     --public-url https://<tunnel>.trycloudflare.com \
+#     --trusted-host <tunnel>.trycloudflare.com \
+#     --no-open
+#
+# Security defaults:
+# - Loopback-only Nexus gateway (http://127.0.0.1:7861/v1) with Host-only NEXUS_API_KEY
+# - Trust X-Forwarded-Proto: https only from loopback proxy peers (cloudflared)
+# - Constrain directory picker to approved Colab workspace roots
+
+- id: authentication-token
+  config:
+    trustForwardedProto: true
+
+- id: directory-picker
+  config:
+    allowedRoots:
+      - !!js process.env.NEXUS_WORKSPACE_ROOT || '/content/nexus-harness-workspace'
+
+- id: llm-pi-ai
+  config:
+    providers:
+      nexus:
+        displayName: Nexus Local Gateway
+        api: openai-completions
+        baseURL: !!js process.env.NEXUS_GATEWAY_URL || 'http://127.0.0.1:7861/v1'
+        apiKeyEnv: NEXUS_API_KEY
+        defaultInput:
+          - text
+          - image
+        defaultContextWindow: 32768
+        defaultMaxTokens: 4096
+        compat:
+          supportsDeveloperRole: false
+          maxTokensField: max_tokens

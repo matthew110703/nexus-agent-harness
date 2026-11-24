@@ -12,16 +12,55 @@ export const name = 'host-authentication-token'
 /** Services owning request admission and the persistent signing key. */
 export const inject = ['connection', 'connection.authentication', 'credentials']
 
-/** Default browser and API cookie lifetime. */
+/** Default browser and API cookie lifetime and reverse-proxy TLS handling. */
 export interface Config {
   /** Absolute cookie lifetime in days; default 30. */
   cookieMaxAgeDays: number
+  /**
+   * Trust `X-Forwarded-Proto: https` from loopback peers (e.g. local
+   * `cloudflared` or nginx TLS termination) when computing cookie `Secure`
+   * flags and request audience. Disabled by default so arbitrary headers are
+   * never trusted without explicit reverse-proxy opt-in.
+   */
+  trustForwardedProto?: boolean
 }
 
-/** Validate cookie lifetime before preparing the token implementation. */
+/** Validate cookie lifetime and proxy flags before preparing the token implementation. */
 export const Config: z<Config> = z.object({
   cookieMaxAgeDays: z.natural().min(1).default(30),
+  trustForwardedProto: z.boolean().default(false),
 })
+
+/** True when a socket remote address is local loopback (IPv4 or IPv6). */
+function isLoopbackRemoteAddress(address: string | undefined): boolean {
+  if (address === undefined) return false
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
+/**
+ * Determine whether the incoming request arrived over HTTPS, honoring
+ * `X-Forwarded-Proto: https` only when explicitly enabled and received from a
+ * loopback proxy peer.
+ */
+export function isEffectiveHttps(
+  request: ConnectionTrustRequest,
+  serverProtocol: string | undefined,
+  trustForwardedProto = false,
+): boolean {
+  if (serverProtocol === 'https:') return true
+  if (!trustForwardedProto) return false
+  const socket = request.socket
+  const remoteAddress = socket !== undefined && 'remoteAddress' in socket && typeof socket.remoteAddress === 'string'
+    ? socket.remoteAddress
+    : undefined
+  if (!isLoopbackRemoteAddress(remoteAddress)) return false
+  const raw = request.headers instanceof Headers
+    ? request.headers.get('x-forwarded-proto') ?? undefined
+    : request.headers['x-forwarded-proto']
+  const header = Array.isArray(raw) ? raw[0] : raw
+  if (header === undefined) return false
+  return header.split(',')[0]?.trim().toLowerCase() === 'https'
+}
 
 /**
  * Register the token provider and its optional Web transport integration.
@@ -34,7 +73,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const apiPeers = new Map<PeerScope['id'], PeerScope>()
   ctx.connection.authentication.register({
     authenticate(request) {
-      const secure = ctx.get('webServer')?.protocol === 'https:'
+      const secure = isEffectiveHttps(request, ctx.get('webServer')?.protocol, config.trustForwardedProto)
       if (auth.isAuthenticated(request, secure)) return peer
       const id = auth.authenticateApi(request, secure)
       return id === undefined ? undefined : apiPeers.get(id)
@@ -57,7 +96,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         await next()
         return
       }
-      auth.authorizeIndex(request, response, webCtx.webServer.protocol === 'https:')
+      auth.authorizeIndex(request, response, isEffectiveHttps(facts, webCtx.webServer.protocol, config.trustForwardedProto))
     })
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact', path: CONNECT_PATH, auth: 'anonymous',
@@ -69,7 +108,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           response.end('unauthorized')
           return
         }
-        auth.authorizeConnect(request, response, webCtx.webServer.protocol === 'https:', (interactions) => {
+        const secure = isEffectiveHttps(facts, webCtx.webServer.protocol, config.trustForwardedProto)
+        auth.authorizeConnect(request, response, secure, (interactions) => {
           const apiPeer = webCtx.connection.createPeer({ principal: { kind: 'owner' }, interactions })
           apiPeers.set(apiPeer.id, apiPeer)
           apiPeer.ctx.effect(() => () => { apiPeers.delete(apiPeer.id) }, 'authentication-token: API credential')
@@ -84,7 +124,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         return
       }
       if (apiPeers.get(admittedPeer.id) !== admittedPeer) {
-        if (auth.authenticateApi(request, webCtx.webServer.protocol === 'https:') === admittedPeer.id) {
+        const secure = isEffectiveHttps(request, webCtx.webServer.protocol, config.trustForwardedProto)
+        if (auth.authenticateApi(request, secure) === admittedPeer.id) {
           socket.destroy()
           return
         }

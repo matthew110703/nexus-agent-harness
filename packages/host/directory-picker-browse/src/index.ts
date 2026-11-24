@@ -9,9 +9,9 @@
  * @module @deepseek-ai/dsh-host-directory-picker-browse
  */
 
-import { mkdir, opendir, stat } from 'node:fs/promises'
+import { mkdir, opendir, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, dirname, join, posix, resolve, win32 } from 'node:path'
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, win32 } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import {
@@ -22,17 +22,29 @@ import type {
 } from '@deepseek-ai/dsh-host-directory-picker'
 
 /**
- * Ancestor chain from the filesystem root to `target` inclusive — the
- * breadcrumb rows of a listing, every one a jump target.
+ * True when `canonicalTarget` is equal to or nested inside `canonicalRoot`.
+ * Uses `path.relative` so sibling prefixes like `/workspace` vs `/workspace2`
+ * never falsely match.
  */
-function ancestryCrumbs(target: string): DirectoryEntry[] {
+export function isWithinRoot(canonicalTarget: string, canonicalRoot: string): boolean {
+  const rel = relative(canonicalRoot, canonicalTarget)
+  if (rel === '') return true
+  return !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+/**
+ * Ancestor chain from `stopRoot` (or the filesystem root when omitted) to
+ * `target` inclusive — the breadcrumb rows of a listing, every one a jump target.
+ */
+function ancestryCrumbs(target: string, stopRoot?: string): DirectoryEntry[] {
   const crumbs: DirectoryEntry[] = []
   let current = target
   for (;;) {
     const parent = dirname(current)
+    const atStop = stopRoot !== undefined && current === stopRoot
     // basename of a root is '' — label the root crumb by its full path ('/', 'C:\').
-    crumbs.unshift({ name: parent === current ? current : basename(current), path: current, hidden: false })
-    if (parent === current) return crumbs
+    crumbs.unshift({ name: parent === current || atStop ? current : basename(current), path: current, hidden: false })
+    if (parent === current || atStop) return crumbs
     current = parent
   }
 }
@@ -155,7 +167,12 @@ function messageOf(error: unknown): string {
  * shows what can be entered, and a broken link cannot).
  */
 async function directoryRow(
-  parent: string, name: string, isDirectory: boolean, isSymbolicLink: boolean, signal: AbortSignal | undefined,
+  parent: string,
+  name: string,
+  isDirectory: boolean,
+  isSymbolicLink: boolean,
+  signal: AbortSignal | undefined,
+  canonicalRoots: readonly string[],
 ): Promise<DirectoryEntry | null> {
   const path = join(parent, name)
   let enterable = isDirectory
@@ -172,6 +189,15 @@ async function directoryRow(
     }
   }
   if (!enterable) return null
+  if (canonicalRoots.length > 0 && isSymbolicLink) {
+    try {
+      const realTarget = await raceAbort(realpath(path), signal)
+      if (!canonicalRoots.some(root => isWithinRoot(realTarget, root))) return null
+    } catch {
+      if (signal?.aborted) throw asError(signal.reason)
+      return null
+    }
+  }
   // POSIX hidden convention; Windows' hidden attribute is not exposed by
   // dirents (Known Limitations). The client owns whether hidden rows show.
   return { name, path, hidden: name.startsWith('.') }
@@ -181,6 +207,13 @@ async function directoryRow(
 export interface Config {
   /** Complete-result bound of one listing level; see {@link BrowseDirectoryPicker.Config}. */
   maxEntries: number
+  /**
+   * Optional list of approved browsable roots. When non-empty, `list` and
+   * `createDirectory` reject any path (including symlink targets) outside these
+   * roots, omitted `path` defaults to the first root, and breadcrumbs clamp at
+   * the matching root.
+   */
+  allowedRoots?: string[]
 }
 
 /** The `ctx.directoryPicker` browse implementation (stable capability object per service life). */
@@ -194,6 +227,7 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
    */
   static Config: z<Config> = z.object({
     maxEntries: z.natural().min(1).default(1000),
+    allowedRoots: z.array(z.string().min(1)).default([]),
   })
 
   private readonly browseCapability: DirectoryPickerCapability = {
@@ -214,15 +248,44 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
     return this.browseCapability
   }
 
+  private async resolveAllowedRoots(): Promise<string[]> {
+    const roots: string[] = []
+    for (const raw of this.config.allowedRoots ?? []) {
+      const resolved = resolve(raw)
+      try {
+        roots.push(await realpath(resolved))
+      } catch {
+        roots.push(resolved)
+      }
+    }
+    return roots
+  }
+
   private async list(path?: string, signal?: AbortSignal): Promise<DirectoryListing> {
-    const home = homedir()
+    const canonicalRoots = await this.resolveAllowedRoots()
+    const home = canonicalRoots[0] ?? homedir()
     // The seam contract takes fully qualified paths only; resolve() would
     // silently rebase a relative or empty wire value under the host process
     // cwd (or, for rooted drive-less Windows forms, its current drive).
     if (path !== undefined && !fullyQualified(path)) {
       throw new DirectoryPickerError('directory-unreadable', path, `cannot list "${path}": not a fully qualified path`)
     }
-    const target = resolve(path ?? home)
+    let target = resolve(path ?? home)
+    let matchedRoot: string | undefined
+    if (canonicalRoots.length > 0) {
+      let canonicalTarget: string
+      try {
+        canonicalTarget = await raceAbort(realpath(target), signal)
+      } catch (error: unknown) {
+        signal?.throwIfAborted()
+        throw new DirectoryPickerError('directory-unreadable', target, `cannot list ${target}: ${messageOf(error)}`)
+      }
+      matchedRoot = canonicalRoots.find(root => isWithinRoot(canonicalTarget, root))
+      if (matchedRoot === undefined) {
+        throw new DirectoryPickerError('directory-unreadable', target, `cannot list ${target}: path is outside allowed workspace roots`)
+      }
+      target = canonicalTarget
+    }
     // Stream the level (opendir, one dirent at a time) into a name-sorted
     // window of maxEntries + 1 candidates: memory stays bounded no matter how
     // many children the directory holds, the window keeps the name-sorted
@@ -285,7 +348,7 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
       // A caller that departed between reads and probes stops before the
       // next probe (each probe's own await is raced inside directoryRow).
       signal?.throwIfAborted()
-      const row = await directoryRow(target, candidate.name, candidate.isDirectory, candidate.isSymbolicLink, signal)
+      const row = await directoryRow(target, candidate.name, candidate.isDirectory, candidate.isSymbolicLink, signal, canonicalRoots)
       if (row === null) continue
       if (entries.length === this.config.maxEntries) {
         truncated = true
@@ -293,7 +356,7 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
       }
       entries.push(row)
     }
-    return { path: target, home, crumbs: ancestryCrumbs(target), entries, truncated }
+    return { path: target, home, crumbs: ancestryCrumbs(target, matchedRoot), entries, truncated }
   }
 
   private async createDirectory(path: string, name: string): Promise<string> {
@@ -302,7 +365,20 @@ export default class BrowseDirectoryPicker extends DirectoryPicker {
     if (!fullyQualified(path)) {
       throw new DirectoryPickerError('directory-create-failed', path, `cannot create under "${path}": not a fully qualified parent path`)
     }
-    const parent = resolve(path)
+    let parent = resolve(path)
+    const canonicalRoots = await this.resolveAllowedRoots()
+    if (canonicalRoots.length > 0) {
+      let canonicalParent: string
+      try {
+        canonicalParent = await realpath(parent)
+      } catch (error: unknown) {
+        throw new DirectoryPickerError('directory-create-failed', parent, `cannot create under ${parent}: ${messageOf(error)}`)
+      }
+      if (!canonicalRoots.some(root => isWithinRoot(canonicalParent, root))) {
+        throw new DirectoryPickerError('directory-create-failed', parent, `cannot create under ${parent}: path is outside allowed workspace roots`)
+      }
+      parent = canonicalParent
+    }
     // The backend owns segment validation; the Remote controller also refuses
     // invalid wire input, but direct service consumers must hit the same fence.
     if (name.trim() === '' || name === '.' || name === '..' || /[/\\]/.test(name)) {
