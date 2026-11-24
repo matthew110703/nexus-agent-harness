@@ -20,11 +20,46 @@ const API_KEY = process.env.NEXUS_API_KEY || ''
 const TRYCLOUDFLARE_RE = /https:\/\/([a-z0-9-]+\.trycloudflare\.com)/i
 const LAUNCH_URL_RE = /(https?:\/\/[^\s]+?\?token=[A-Za-z0-9_-]+)/
 
-/** Verify Node.js meets the minimum Colab runtime version (24.9.0). */
+/**
+ * Check compatibility with the repository's Node engine:
+ *   ^24.22.3 || >=26.13.1
+ */
+export function isNodeVersionCompatible(versionString) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(versionString || '')
+
+  if (!match) {
+    return false
+  }
+
+  const version = match.slice(1, 4).map(Number)
+  const [major] = version
+
+  const compare = (a, b) => {
+    for (let i = 0; i < 3; i++) {
+      if (a[i] !== b[i]) {
+        return a[i] > b[i] ? 1 : -1
+      }
+    }
+    return 0
+  }
+
+  if (major === 24) {
+    return compare(version, [24, 22, 3]) >= 0
+  }
+
+  if (major >= 26) {
+    return compare(version, [26, 13, 1]) >= 0
+  }
+
+  return false
+}
+
+/** Enforce the repository's Node.js engine requirement. */
 export function assertMinNodeVersion(versionString = process.versions.node) {
-  const [major = 0, minor = 0] = versionString.split('.').map(Number)
-  if (major < 24 || (major === 24 && minor < 9)) {
-    throw new Error(`Node.js >= 24.9.0 is required (found ${versionString})`)
+  if (!isNodeVersionCompatible(versionString)) {
+    throw new Error(
+      `Node.js ^24.22.3 || >=26.13.1 is required (found ${versionString})`,
+    )
   }
 }
 
