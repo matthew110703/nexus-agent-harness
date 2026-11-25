@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -73,29 +74,62 @@ def create_app(
         ws = worker_mgr.status()
         return ws.alive, ws.active_kind, ws.active_model_id
 
-    def _stage_and_load(kind: str, model_id: str) -> tuple[Any, str]:
+    def _validate_loadable_model(kind: str, model_id: str) -> Any:
         model = reg.get(model_id)
-        if model is None or model.validation_status != "compatible":
-            raise HTTPException(status_code=404, detail=f"Unknown or incompatible model: {model_id}")
+        if model is None:
+            raise HTTPException(status_code=404, detail=f"Model not found in Nexus catalog: {model_id}")
+        if not model.structurally_valid:
+            reason = model.validation_reason or "Model files are incomplete"
+            raise HTTPException(status_code=422, detail=f"Model files are incomplete for {model_id}: {reason}")
+        if model.adapter_family == "unsupported" or not model.runtime_compatible or model.validation_status != "compatible":
+            reason = model.validation_reason or f"Unsupported model architecture ({model.architecture})"
+            raise HTTPException(status_code=422, detail=f"Unsupported model architecture for {model_id}: {reason}")
         if kind == "chat" and not model.is_chat_model:
             raise HTTPException(status_code=400, detail=f"Model {model_id} is not a chat model")
         if kind == "diffusion" and not model.is_image_model:
             raise HTTPException(status_code=400, detail=f"Model {model_id} is not an image-generation model")
+        return model
 
+    def _stage_and_load(kind: str, model_id: str, *, operation_id: Optional[str] = None) -> tuple[Any, str]:
+        model = _validate_loadable_model(kind, model_id)
         op_kind = "chat_model_load" if kind == "chat" else "diffusion_pipeline_load"
-        op = prog.start(op_kind, model_id, phase="staging", message=f"Preparing {model_id}")
+        if operation_id is not None and prog.get(operation_id) is not None:
+            op_id = operation_id
+            prog.update(op_id, phase="resolving", indeterminate=True, message=f"Resolving {model_id}")
+        else:
+            op = prog.start(
+                op_kind,
+                model_id,
+                phase="resolving",
+                operation_id=operation_id,
+                indeterminate=True,
+                message=f"Resolving {model_id}",
+            )
+            op_id = op.operation_id
         try:
             source_path = Path(model.source_path)
+            prog.update(op_id, phase="checkpoint_validation", indeterminate=True, message=f"Checking model files for {model_id}")
             staged_path = stage_model_directory(
                 source_path,
                 config.local_stage_root,
                 model_id=model_id,
                 progress=prog,
-                operation_id=op.operation_id,
+                operation_id=op_id,
                 min_free_margin_bytes=config.min_stage_free_margin_bytes,
                 allow_drive_fallback=config.allow_drive_fallback,
             )
-            prog.update(op.operation_id, phase="weight_loading", indeterminate=True, message=f"Loading {model_id} in isolated worker")
+            prog.update(
+                op_id,
+                phase="processor_init",
+                indeterminate=True,
+                message=f"Loading tokenizer/processor and weights for {model_id}",
+            )
+            prog.update(
+                op_id,
+                phase="weight_loading",
+                indeterminate=True,
+                message=f"Loading {model_id} weights in isolated worker",
+            )
             worker_mgr.load_model(
                 WorkerLoadRequest(
                     kind=kind,  # type: ignore[arg-type]
@@ -106,16 +140,26 @@ def create_app(
                     adapter_family=model.adapter_family,
                 )
             )
-            prog.complete(op.operation_id, phase="ready", message=f"{model_id} ready")
-            return model, op.operation_id
+            prog.update(op_id, phase="placement", indeterminate=True, message=f"Verifying worker state for {model_id}")
+            ws = worker_mgr.status()
+            if not ws.alive or ws.active_model_id != model_id:
+                raise WorkerError(
+                    f"Worker failed to confirm active model {model_id} (alive={ws.alive}, active={ws.active_model_id})",
+                    status_code=502,
+                )
+            prog.complete(op_id, phase="ready", message=f"{model_id} ready")
+            return model, op_id
         except InsufficientDiskSpaceError as exc:
-            prog.fail(op.operation_id, str(exc))
-            raise HTTPException(status_code=507, detail=str(exc)) from exc
+            prog.fail(op_id, f"Insufficient local disk space: {exc}")
+            raise HTTPException(status_code=507, detail=f"Insufficient local disk space: {exc}") from exc
         except WorkerError as exc:
-            prog.fail(op.operation_id, str(exc))
+            prog.fail(op_id, str(exc))
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except HTTPException as exc:
+            prog.fail(op_id, str(exc.detail))
+            raise
         except Exception as exc:
-            prog.fail(op.operation_id, str(exc))
+            prog.fail(op_id, f"{type(exc).__name__}: {exc}")
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
     @app.get("/health")
@@ -167,19 +211,115 @@ def create_app(
         }
 
     @app.post("/v1/runtime/load")
-    def runtime_load(body: dict[str, Any], _auth: None = Depends(require_auth)) -> dict[str, Any]:
+    def runtime_load(body: dict[str, Any], _auth: None = Depends(require_auth)) -> Any:
         model_id = str(body.get("model") or "").strip()
         kind = str(body.get("kind") or "chat")
+        async_mode = bool(body.get("async", False))
         if not model_id:
             raise HTTPException(status_code=400, detail="model is required")
+        if kind not in ("chat", "diffusion"):
+            raise HTTPException(status_code=400, detail=f"Invalid kind {kind!r}; expected 'chat' or 'diffusion'")
+
+        # Validate model catalog compatibility BEFORE touching worker or creating an operation.
+        _validate_loadable_model(kind, model_id)
+        op_kind = "chat_model_load" if kind == "chat" else "diffusion_pipeline_load"
+
+        ws = worker_mgr.status()
+        res_mgr.invalidate_if_mismatched(
+            worker_alive=ws.alive,
+            worker_active_kind=ws.active_kind,
+            worker_active_model_id=ws.active_model_id,
+        )
+        if ws.alive and ws.active_kind == kind and ws.active_model_id == model_id:
+            return {
+                "status": "loaded",
+                "operation_id": None,
+                "model": model_id,
+                "kind": kind,
+                "worker": ws.to_dict(),
+            }
+
+        # Deduplicate concurrent loads for the same (kind, model_id).
+        existing = prog.find_active(op_kind, model_id)
+        if existing is not None:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "loading",
+                    "operation_id": existing.operation_id,
+                    "model": model_id,
+                    "kind": kind,
+                    "worker": ws.to_dict(),
+                },
+            )
+
+        if async_mode:
+            op = prog.start(
+                op_kind,
+                model_id,
+                phase="resolving",
+                indeterminate=True,
+                message=f"Queued load for {model_id}",
+            )
+
+            def _run_background_load() -> None:
+                try:
+                    with res_mgr.acquire(
+                        kind,  # type: ignore[arg-type]
+                        model_id,
+                        lambda: _stage_and_load(kind, model_id, operation_id=op.operation_id),
+                        unload=lambda _: worker_mgr.unload(),
+                        verify_live=_verify_worker_live,
+                    ):
+                        # If already loaded by the time lock was acquired, mark complete.
+                        rec = prog.get(op.operation_id)
+                        if rec is not None and rec.get("status") == "running":
+                            live_ws = worker_mgr.status()
+                            if live_ws.alive and live_ws.active_model_id == model_id:
+                                prog.complete(op.operation_id, phase="ready", message=f"{model_id} ready")
+                except HTTPException as exc:
+                    rec = prog.get(op.operation_id)
+                    if rec is not None and rec.get("status") == "running":
+                        prog.fail(op.operation_id, str(exc.detail))
+                except Exception as exc:
+                    rec = prog.get(op.operation_id)
+                    if rec is not None and rec.get("status") == "running":
+                        prog.fail(op.operation_id, f"{type(exc).__name__}: {exc}")
+
+            threading.Thread(target=_run_background_load, name=f"nexus-load-{op.operation_id}", daemon=True).start()
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "loading",
+                    "operation_id": op.operation_id,
+                    "model": model_id,
+                    "kind": kind,
+                    "worker": ws.to_dict(),
+                },
+            )
+
+        loaded_op_id: Optional[str] = None
+
+        def _sync_loader() -> tuple[Any, str]:
+            nonlocal loaded_op_id
+            model_obj, op_id = _stage_and_load(kind, model_id)
+            loaded_op_id = op_id
+            return model_obj, op_id
+
         with res_mgr.acquire(
             kind,  # type: ignore[arg-type]
             model_id,
-            lambda: _stage_and_load(kind, model_id),
+            _sync_loader,
             unload=lambda _: worker_mgr.unload(),
             verify_live=_verify_worker_live,
         ):
-            return {"status": "loaded", "model": model_id, "kind": kind, "worker": worker_mgr.status().to_dict()}
+            return {
+                "status": "loaded",
+                "operation_id": loaded_op_id,
+                "model": model_id,
+                "kind": kind,
+                "worker": worker_mgr.status().to_dict(),
+            }
 
     @app.post("/v1/runtime/unload")
     def runtime_unload(body: Optional[dict[str, Any]] = None, _auth: None = Depends(require_auth)) -> dict[str, Any]:
@@ -291,6 +431,13 @@ def create_app(
         )
 
         if not stream:
+            gen_op = prog.start(
+                "chat_generation",
+                model_id,
+                phase="generating",
+                indeterminate=True,
+                message=f"Generating response with {model_id}",
+            )
             try:
                 with res_mgr.acquire(
                     "chat",
@@ -300,8 +447,13 @@ def create_app(
                     verify_live=_verify_worker_live,
                 ):
                     raw = worker_mgr.generate(gen_req)
+                prog.complete(gen_op.operation_id, phase="ready", message="Response complete")
             except WorkerError as exc:
+                prog.fail(gen_op.operation_id, str(exc))
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            except Exception as exc:
+                prog.fail(gen_op.operation_id, str(exc))
+                raise
             parser = create_tool_parser(model.tool_parser_family)
             parser.feed(str(raw.get("text") or ""))
             parsed = parser.finish(tools, tool_choice=tool_choice)
@@ -332,6 +484,13 @@ def create_app(
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             }) + "\n\n"
             parser = create_tool_parser(model.tool_parser_family)
+            gen_op = prog.start(
+                "chat_generation",
+                model_id,
+                phase="generating",
+                indeterminate=True,
+                message=f"Generating response with {model_id}",
+            )
             try:
                 with res_mgr.acquire(
                     "chat",
@@ -361,6 +520,7 @@ def create_app(
                         "choices": [{"index": 0, "delta": {"content": parsed.trailing_text}, "finish_reason": None}],
                     }, ensure_ascii=False) + "\n\n"
                 if parsed.errors:
+                    prog.fail(gen_op.operation_id, "; ".join(parsed.errors))
                     yield "data: " + json.dumps({
                         "error": {"message": "; ".join(parsed.errors), "type": "tool_call_parse_error"}
                     }) + "\n\n"
@@ -379,6 +539,7 @@ def create_app(
                             "finish_reason": None,
                         }],
                     }, ensure_ascii=False) + "\n\n"
+                prog.complete(gen_op.operation_id, phase="ready", message="Response complete")
                 yield "data: " + json.dumps({
                     "id": request_id,
                     "object": "chat.completion.chunk",
@@ -388,6 +549,7 @@ def create_app(
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as exc:
+                prog.fail(gen_op.operation_id, f"{type(exc).__name__}: {exc}")
                 yield "data: " + json.dumps({
                     "error": {"message": f"{type(exc).__name__}: {exc}", "type": "nexus_inference_error"}
                 }) + "\n\n"

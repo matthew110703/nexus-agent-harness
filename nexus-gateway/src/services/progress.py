@@ -8,16 +8,24 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
-OperationKind = Literal["chat_model_load", "diffusion_pipeline_load", "image_generation", "model_staging"]
+OperationKind = Literal[
+    "chat_model_load",
+    "chat_generation",
+    "diffusion_pipeline_load",
+    "image_generation",
+    "model_staging",
+]
 OperationStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 OperationPhase = Literal[
+    "resolving",
     "discovery",
     "staging",
     "checkpoint_validation",
+    "processor_init",
     "weight_loading",
     "placement",
-    "processor_init",
     "ready",
+    "generating",
     "denoising",
     "saving",
 ]
@@ -144,6 +152,13 @@ class ProgressService:
     def fail(self, operation_id: str, error: str) -> Optional[ProgressRecord]:
         return self.update(operation_id, status="failed", indeterminate=False, error=error, message=error)
 
+    def find_active(self, kind: OperationKind, model: str) -> Optional[ProgressRecord]:
+        with self._lock:
+            for record in reversed(list(self._records.values())):
+                if record.kind == kind and record.model == model and record.status in ("queued", "running"):
+                    return record
+        return None
+
     def get(self, operation_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
             rec = self._records.get(operation_id)
@@ -152,6 +167,12 @@ class ProgressService:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             records = [r.to_dict() for r in self._records.values()]
-        latest_chat = next((r for r in reversed(records) if r["kind"] in ("chat_model_load", "model_staging")), None)
-        latest_diffusion = next((r for r in reversed(records) if r["kind"] in ("diffusion_pipeline_load", "image_generation")), None)
+        latest_chat = next(
+            (r for r in reversed(records) if r["kind"] in ("chat_model_load", "chat_generation", "model_staging")),
+            None,
+        )
+        latest_diffusion = next(
+            (r for r in reversed(records) if r["kind"] in ("diffusion_pipeline_load", "image_generation")),
+            None,
+        )
         return {"chat": latest_chat, "diffusion": latest_diffusion, "operations": records[-16:]}

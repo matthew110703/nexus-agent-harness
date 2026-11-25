@@ -273,6 +273,55 @@ export function createNexusGenerateImageTool(
   })
 }
 
+const OPERATION_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/
+
+function redactSecrets(text: string, apiKey: string): string {
+  let out = text
+  if (apiKey) {
+    out = out.split(apiKey).join('[REDACTED]')
+  }
+  return out.replace(/Bearer\s+[a-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]')
+}
+
+function normalizeUpstreamError(status: number, rawBody: string, apiKey: string): string {
+  const safeRaw = redactSecrets(rawBody, apiKey)
+  try {
+    const parsed = JSON.parse(safeRaw) as Record<string, unknown>
+    const detail = parsed.detail
+    let message = typeof parsed.error === 'string' ? parsed.error : ''
+    if (!message && typeof detail === 'string') {
+      message = detail
+    } else if (!message && detail && typeof detail === 'object') {
+      const nested = detail as Record<string, unknown>
+      const errObj = nested.error as Record<string, unknown> | undefined
+      if (typeof errObj?.message === 'string') {
+        message = errObj.message
+      } else if (typeof nested.message === 'string') {
+        message = nested.message
+      }
+    }
+    if (!message) {
+      message = `Gateway request failed (HTTP ${status})`
+    }
+    const payload: Record<string, unknown> = {
+      error: redactSecrets(message, apiKey),
+      status,
+    }
+    if (typeof parsed.operation_id === 'string') {
+      payload.operation_id = parsed.operation_id
+    }
+    if (safeRaw.length > 0 && safeRaw.length <= 2048) {
+      payload.details = safeRaw
+    }
+    return JSON.stringify(payload)
+  } catch {
+    return JSON.stringify({
+      error: safeRaw.trim().slice(0, 300) || `Gateway request failed (HTTP ${status})`,
+      status,
+    })
+  }
+}
+
 async function fetchGatewayJson(
   config: Config,
   baseUrl: URL,
@@ -280,13 +329,14 @@ async function fetchGatewayJson(
   method: 'GET' | 'POST',
   signal: AbortSignal,
   body?: unknown,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<{ status: number; body: string }> {
   const apiKey = process.env[config.apiKeyEnv] ?? ''
   if (!apiKey) {
     return { status: 503, body: JSON.stringify({ error: 'Nexus gateway token not configured on Host' }) }
   }
   const endpoint = new URL(upstreamPath, baseUrl)
-  const upstream = await fetch(endpoint, {
+  const upstream = await fetchImpl(endpoint, {
     method,
     headers: {
       authorization: `Bearer ${apiKey}`,
@@ -299,7 +349,10 @@ async function fetchGatewayJson(
   if (text.length > MAX_PROXY_RESPONSE_BYTES) {
     return { status: 502, body: JSON.stringify({ error: 'Upstream payload too large' }) }
   }
-  return { status: upstream.status, body: text }
+  if (!upstream.ok) {
+    return { status: upstream.status, body: normalizeUpstreamError(upstream.status, text, apiKey) }
+  }
+  return { status: upstream.status, body: redactSecrets(text, apiKey) }
 }
 
 function registerGatewayGetProxy(
@@ -308,6 +361,7 @@ function registerGatewayGetProxy(
   baseUrl: URL,
   publicPath: string,
   upstreamPath: string,
+  fetchImpl: typeof fetch = fetch,
 ): () => void {
   return ctx.connection.fetch.register({
     path: publicPath,
@@ -316,15 +370,16 @@ function registerGatewayGetProxy(
     async fetch(request) {
       const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
       try {
-        const res = await fetchGatewayJson(config, baseUrl, upstreamPath, 'GET', signal)
+        const res = await fetchGatewayJson(config, baseUrl, upstreamPath, 'GET', signal, undefined, fetchImpl)
         return new Response(res.body, {
           status: res.status,
           headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
         })
-      } catch {
+      } catch (err) {
+        const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
         return new Response(
-          JSON.stringify({ error: 'Nexus gateway unavailable' }),
-          { status: 502, headers: { 'content-type': 'application/json' } },
+          JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
+          { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
         )
       }
     },
@@ -335,19 +390,58 @@ function registerGatewayGetProxy(
  * Register the `nexus_generate_image` tool and authenticated same-origin Host
  * endpoints for progress, runtime status, load/unload, and profile image selection.
  */
-export function apply(ctx: Context, config: Config): void {
+export function apply(
+  ctx: Context,
+  config: Config,
+  fetchImpl: typeof fetch = fetch,
+  selectionPath: string = resolveImageSelectionPath(ctx),
+): void {
   const baseUrl = assertLoopbackGatewayUrl(config.gatewayUrl)
-  const selectionPath = resolveImageSelectionPath(ctx)
 
-  const tool = createNexusGenerateImageTool(ctx, config, fetch, selectionPath)
+  const tool = createNexusGenerateImageTool(ctx, config, fetchImpl, selectionPath)
   ctx.effect(() => ctx.tools.register(tool), 'nexus-host: nexus_generate_image tool')
 
+  // GET /api/nexus.runtime-progress (supports optional ?operation_id=<op_id>)
   ctx.effect(
-    () => registerGatewayGetProxy(ctx, config, baseUrl, '/api/nexus.runtime-progress', '/v1/progress'),
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/nexus.runtime-progress',
+        methods: ['GET'],
+        requestBody: 'buffered',
+        async fetch(request) {
+          const reqUrl = new URL(request.url, 'http://localhost')
+          const opId = reqUrl.searchParams.get('operation_id')?.trim() ?? ''
+          let upstreamPath = '/v1/progress'
+          if (opId.length > 0) {
+            if (!OPERATION_ID_RE.test(opId)) {
+              return new Response(
+                JSON.stringify({ error: 'Invalid operation_id format' }),
+                { status: 400, headers: { 'content-type': 'application/json' } },
+              )
+            }
+            upstreamPath = `/v1/progress/${encodeURIComponent(opId)}`
+          }
+          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
+          try {
+            const res = await fetchGatewayJson(config, baseUrl, upstreamPath, 'GET', signal, undefined, fetchImpl)
+            return new Response(res.body, {
+              status: res.status,
+              headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+            })
+          } catch (err) {
+            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
+            return new Response(
+              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
+              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
+            )
+          }
+        },
+      }),
     'nexus-host: /api/nexus.runtime-progress proxy',
   )
+
   ctx.effect(
-    () => registerGatewayGetProxy(ctx, config, baseUrl, '/api/nexus.runtime', '/v1/runtime'),
+    () => registerGatewayGetProxy(ctx, config, baseUrl, '/api/nexus.runtime', '/v1/runtime', fetchImpl),
     'nexus-host: /api/nexus.runtime proxy',
   )
 
@@ -361,7 +455,7 @@ export function apply(ctx: Context, config: Config): void {
         async fetch(request) {
           const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
           try {
-            const res = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal)
+            const res = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal, undefined, fetchImpl)
             if (res.status !== 200) {
               return new Response(res.body, { status: res.status, headers: { 'content-type': 'application/json' } })
             }
@@ -375,10 +469,11 @@ export function apply(ctx: Context, config: Config): void {
               }),
               { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } },
             )
-          } catch {
+          } catch (err) {
+            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
             return new Response(
-              JSON.stringify({ error: 'Nexus gateway unavailable' }),
-              { status: 502, headers: { 'content-type': 'application/json' } },
+              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
+              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
             )
           }
         },
@@ -402,19 +497,34 @@ export function apply(ctx: Context, config: Config): void {
             return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'content-type': 'application/json' } })
           }
           const rawId = body.modelId
+          let models: Array<{ id: string }> = []
+          let qualityProfiles: string[] = ['normal', 'detailed', 'maximum']
+          try {
+            const catalogRes = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal, undefined, fetchImpl)
+            if (catalogRes.status !== 200) {
+              return new Response(catalogRes.body, { status: catalogRes.status, headers: { 'content-type': 'application/json' } })
+            }
+            const parsed = JSON.parse(catalogRes.body) as { data?: Array<{ id: string }>; quality_profiles?: string[] }
+            models = parsed.data ?? []
+            qualityProfiles = parsed.quality_profiles ?? qualityProfiles
+          } catch (err) {
+            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
+            return new Response(
+              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
+              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
+            )
+          }
           if (rawId === null || rawId === '') {
             writeSelectedImageModel(selectionPath, null)
-            return new Response(JSON.stringify({ selectedModelId: null }), { status: 200, headers: { 'content-type': 'application/json' } })
+            return new Response(
+              JSON.stringify({ selectedModelId: null, models, qualityProfiles }),
+              { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } },
+            )
           }
           if (typeof rawId !== 'string') {
             return new Response(JSON.stringify({ error: 'modelId must be a string or null' }), { status: 400, headers: { 'content-type': 'application/json' } })
           }
-          const catalogRes = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal)
-          if (catalogRes.status !== 200) {
-            return new Response(catalogRes.body, { status: catalogRes.status, headers: { 'content-type': 'application/json' } })
-          }
-          const parsed = JSON.parse(catalogRes.body) as { data?: Array<{ id: string }> }
-          const valid = (parsed.data ?? []).some(m => m.id === rawId)
+          const valid = models.some(m => m.id === rawId)
           if (!valid) {
             return new Response(
               JSON.stringify({ error: `Image model "${rawId}" is not available in the Nexus catalog` }),
@@ -422,7 +532,10 @@ export function apply(ctx: Context, config: Config): void {
             )
           }
           writeSelectedImageModel(selectionPath, rawId)
-          return new Response(JSON.stringify({ selectedModelId: rawId }), { status: 200, headers: { 'content-type': 'application/json' } })
+          return new Response(
+            JSON.stringify({ selectedModelId: rawId, models, qualityProfiles }),
+            { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } },
+          )
         },
       }),
     'nexus-host: /api/nexus.image-model endpoint',
@@ -436,9 +549,9 @@ export function apply(ctx: Context, config: Config): void {
         methods: ['POST'],
         requestBody: 'buffered',
         async fetch(request) {
-          let body: { model?: string; kind?: 'chat' | 'diffusion' }
+          let body: { model?: string; kind?: 'chat' | 'diffusion'; async?: boolean }
           try {
-            body = JSON.parse(await request.text()) as { model?: string; kind?: 'chat' | 'diffusion' }
+            body = JSON.parse(await request.text()) as { model?: string; kind?: 'chat' | 'diffusion'; async?: boolean }
           } catch {
             return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'content-type': 'application/json' } })
           }
@@ -446,9 +559,30 @@ export function apply(ctx: Context, config: Config): void {
             return new Response(JSON.stringify({ error: 'model is required' }), { status: 400, headers: { 'content-type': 'application/json' } })
           }
           const kind = body.kind === 'diffusion' ? 'diffusion' : 'chat'
-          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.imageTimeoutMs)])
-          const res = await fetchGatewayJson(config, baseUrl, '/v1/runtime/load', 'POST', signal, { model: body.model.trim(), kind })
-          return new Response(res.body, { status: res.status, headers: { 'content-type': 'application/json' } })
+          const asyncMode = Boolean(body.async)
+          const timeoutMs = asyncMode ? Math.max(config.progressTimeoutMs, 15_000) : config.imageTimeoutMs
+          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)])
+          try {
+            const res = await fetchGatewayJson(
+              config,
+              baseUrl,
+              '/v1/runtime/load',
+              'POST',
+              signal,
+              { model: body.model.trim(), kind, async: asyncMode },
+              fetchImpl,
+            )
+            return new Response(res.body, {
+              status: res.status,
+              headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+            })
+          } catch (err) {
+            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
+            return new Response(
+              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
+              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
+            )
+          }
         },
       }),
     'nexus-host: /api/nexus.runtime-load proxy',
@@ -462,8 +596,19 @@ export function apply(ctx: Context, config: Config): void {
         requestBody: 'buffered',
         async fetch(request) {
           const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)])
-          const res = await fetchGatewayJson(config, baseUrl, '/v1/runtime/unload', 'POST', signal, {})
-          return new Response(res.body, { status: res.status, headers: { 'content-type': 'application/json' } })
+          try {
+            const res = await fetchGatewayJson(config, baseUrl, '/v1/runtime/unload', 'POST', signal, {}, fetchImpl)
+            return new Response(res.body, {
+              status: res.status,
+              headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+            })
+          } catch (err) {
+            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
+            return new Response(
+              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
+              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
+            )
+          }
         },
       }),
     'nexus-host: /api/nexus.runtime-unload proxy',
