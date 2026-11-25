@@ -1,13 +1,16 @@
-# Nexus Harness Colab overlay:
+# Nexus Harness 1.0.0 Colab overlay:
 #   dsh web --patch apps/cli/config/examples/colab.overlay.yml \
 #     --public-url https://<tunnel>.trycloudflare.com \
 #     --trusted-host <tunnel>.trycloudflare.com \
 #     --no-open
 #
-# Security defaults:
+# Architecture & security defaults:
 # - Loopback-only Nexus gateway (http://127.0.0.1:7861/v1) with Host-only NEXUS_API_KEY
 # - Trust X-Forwarded-Proto: https only from loopback proxy peers (cloudflared)
-# - Constrain directory picker to approved Colab workspace roots
+# - Constrain directory picker to approved persistent Drive + Colab workspace roots
+# - Native Nexus Host plugin (independent image generation + progress/runtime proxies)
+# - Native Plugin Marketplace (Installed + Discover tabs) backed by Nexus curated index
+# - Zero MCP integrations
 
 - id: authentication-token
   config:
@@ -16,7 +19,9 @@
 - id: directory-picker
   config:
     allowedRoots:
-      - !!js process.env.NEXUS_WORKSPACE_ROOT || '/content/nexus-harness-workspace'
+      - !!js process.env.NEXUS_WORKSPACE_ROOT || '/content/drive/MyDrive/Nexus/workspaces/projects'
+      - !!js process.env.NEXUS_SHARED_WORKSPACE_ROOT || '/content/drive/MyDrive/Nexus/workspaces/shared'
+      - !!js process.env.NEXUS_OUTPUTS_ROOT || '/content/drive/MyDrive/Nexus/outputs'
 
 - id: llm-pi-ai
   config:
@@ -35,3 +40,20 @@
         compat:
           supportsDeveloperRole: false
           maxTokensField: max_tokens
+
+- insert:
+    - id: nexus-host
+      name: '@deepseek-ai/dsh-nexus-host'
+      config:
+        gatewayUrl: !!js process.env.NEXUS_GATEWAY_ROOT_URL || 'http://127.0.0.1:7861'
+        apiKeyEnv: NEXUS_API_KEY
+        imageTimeoutMs: 900000
+        progressTimeoutMs: 5000
+    - id: plugin-market
+      name: '@deepseek-ai/dsh-plugin-market'
+      disabled: !!js "!ctx.get('profileContext')"
+      config:
+        indexes:
+          - !!js process.env.NEXUS_PLUGIN_INDEX_URL || 'http://127.0.0.1:7861/v1/plugin-index.json'
+    - id: ui-plugin-market
+      name: '@deepseek-ai/dsh-client-ui-plugin-market'

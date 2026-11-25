@@ -1,0 +1,38 @@
+{
+  "models": {
+    "Qwen3-VL-8B-Instruct": {
+      "tool_behavior_verified": true,
+      "reasoning": {
+        "status": "supported",
+        "mode": "binary_toggle",
+        "levels": {
+          "off": null,
+          "high": "high"
+        },
+        "default": "high",
+        "source": "verified_sidecar_override"
+      }
+    },
+    "Qwen3.6-35B-A3B": {
+      "tool_behavior_verified": true,
+      "reasoning": {
+        "status": "supported",
+        "mode": "binary_toggle",
+        "levels": {
+          "off": null,
+          "high": "high"
+        },
+        "default": "high",
+        "source": "verified_sidecar_override"
+      }
+    },
+    "Qwen2.5-VL-7B-Instruct": {
+      "reasoning": {
+        "status": "unsupported",
+        "mode": "none",
+        "levels": {},
+        "source": "verified_sidecar_override"
+      }
+    }
+  }
+}

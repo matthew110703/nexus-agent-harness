@@ -90,14 +90,21 @@ export function buildDshArgs({ overlays, publicUrl, trustedHost, port }) {
   ]
 }
 
-async function isPortOpen(port, host = '127.0.0.1') {
+async function isPortOpen(port, host = '127.0.0.1', timeoutMs = 2500) {
   return new Promise((resolve) => {
     const socket = net.createConnection({ port, host })
-    socket.once('connect', () => {
+    let settled = false
+    let timer
+    const finish = (isOpen) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
       socket.destroy()
-      resolve(true)
-    })
-    socket.once('error', () => resolve(false))
+      resolve(isOpen)
+    }
+    timer = setTimeout(() => finish(false), timeoutMs)
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
   })
 }
 
@@ -122,7 +129,11 @@ export function parseDiscoveredModels(payload) {
     seen.add(id)
     const entry = {
       id,
-      name: typeof item.name === 'string' && item.name.trim().length > 0 ? item.name.trim() : id,
+      name: typeof item.display_name === 'string' && item.display_name.trim().length > 0
+        ? item.display_name.trim()
+        : typeof item.name === 'string' && item.name.trim().length > 0
+          ? item.name.trim()
+          : id,
     }
     const rawModalities = Array.isArray(item.input)
       ? item.input
@@ -137,9 +148,24 @@ export function parseDiscoveredModels(payload) {
     if (typeof contextWindow === 'number' && Number.isInteger(contextWindow) && contextWindow >= 1) {
       entry.contextWindow = contextWindow
     }
-    const maxTokens = item.max_tokens ?? item.maxTokens
+    const maxTokens = item.max_output_tokens ?? item.max_tokens ?? item.maxTokens
     if (typeof maxTokens === 'number' && Number.isInteger(maxTokens) && maxTokens >= 1) {
       entry.maxTokens = maxTokens
+    }
+    // Preserve model-specific reasoning Efforts without inventing fake levels.
+    const rawEfforts = item.reasoning_efforts ?? item.reasoningEfforts
+    if (rawEfforts === false) {
+      entry.reasoningEfforts = false
+    } else if (rawEfforts && typeof rawEfforts === 'object' && !Array.isArray(rawEfforts)) {
+      const cleaned = {}
+      for (const [level, wire] of Object.entries(rawEfforts)) {
+        if (wire === null || typeof wire === 'string') {
+          cleaned[level] = wire
+        }
+      }
+      if (Object.keys(cleaned).length > 0) {
+        entry.reasoningEfforts = cleaned
+      }
     }
     models.push(entry)
   }

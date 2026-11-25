@@ -51,20 +51,33 @@ describe('nexus-host', () => {
     )
 
     const result = await tool.execute(
-      { prompt: 'a glowing moon', steps: 4 },
+      { prompt: 'a glowing moon', quality: 'maximum', steps: 4 },
       { signal: new AbortController().signal } as never,
     )
     expect(saveImage).toHaveBeenCalledTimes(1)
-    expect(result).toEqual({
+    const expected = {
       attachmentId: 'att_01',
       model: 'FLUX.2-klein-kv',
+      quality: 'maximum',
       filename: 'nexus_abc.png',
       width: 256,
       height: 256,
       steps: 4,
       operationId: 'op_1',
       savedToDrive: true,
-    })
+      attachment: {
+        attachmentId: 'att_01',
+        mediaType: 'image/png',
+        bytes: 12,
+        width: 256,
+        height: 256,
+        name: 'nexus_abc.png',
+      },
+    }
+    expect(result).toEqual(expected)
+    const rendered = tool.output.render({ prompt: 'a glowing moon', quality: 'maximum', steps: 4 }, expected)
+    expect(rendered).toHaveLength(2)
+    expect(rendered[1]).toMatchObject({ type: 'image', attachment: { attachmentId: 'att_01' } })
     delete process.env.TEST_NEXUS_KEY
   })
 })
