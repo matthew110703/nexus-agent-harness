@@ -89,9 +89,12 @@ def test_registry_discovers_chat_and_flux(tmp_path: Path) -> None:
     vlm.mkdir()
     (vlm / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
     (vlm / "tokenizer_config.json").write_text(json.dumps({"chat_template": "tools tool_call"}))
+    (vlm / "model.safetensors").write_bytes(b"weights")
     flux = tmp_path / "FLUX2"
     flux.mkdir()
-    (flux / "model_index.json").write_text(json.dumps({"_class_name": "Flux2KleinKVPipeline"}))
+    (flux / "model_index.json").write_text(json.dumps({"_class_name": "Flux2KleinKVPipeline", "vae": ["diffusers", "AutoencoderKL"]}))
+    (flux / "vae").mkdir()
+    (flux / "vae" / "config.json").write_text("{}")
 
     reg = ModelRegistry(tmp_path)
     reg.scan()

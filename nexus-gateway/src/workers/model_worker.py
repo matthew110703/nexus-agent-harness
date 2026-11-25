@@ -1,4 +1,4 @@
-"""Isolated GPU model worker subprocess owning CUDA context, weights, and inference."""
+"""Isolated GPU model worker subprocess owning CUDA context, weights, inference, and cancellation."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import os
+import queue
 import signal
 import sys
 import threading
@@ -16,16 +17,14 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 import uvicorn
 
-# Ensure nexus-gateway/src is importable when launched as a subprocess script.
 _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from adapters.diffusers import DiffusersImageAdapter  # noqa: E402
+from adapters.diffusers import DiffusersImageAdapter, GenerationCancelledError  # noqa: E402
 from adapters.qwen_vl import QwenVLChatAdapter  # noqa: E402
 from adapters.transformers import TransformersChatAdapter  # noqa: E402
 from api.middleware.auth import assert_loopback_host, make_auth_dependency  # noqa: E402
-from services.progress import ProgressService  # noqa: E402
 
 
 class ModelWorkerState:
@@ -37,7 +36,29 @@ class ModelWorkerState:
         self.active_model_id: Optional[str] = None
         self.adapter: Any = None
         self.last_error: Optional[str] = None
-        self.progress = ProgressService(max_records=32)
+        self._cancel_lock = threading.Lock()
+        self._cancel_events: dict[str, threading.Event] = {}
+
+    def register_cancel_event(self, operation_id: str) -> threading.Event:
+        ev = threading.Event()
+        with self._cancel_lock:
+            self._cancel_events[operation_id] = ev
+        return ev
+
+    def clear_cancel_event(self, operation_id: str) -> None:
+        with self._cancel_lock:
+            self._cancel_events.pop(operation_id, None)
+
+    def cancel_operation(self, operation_id: Optional[str] = None) -> list[str]:
+        cancelled: list[str] = []
+        with self._cancel_lock:
+            targets = [operation_id] if operation_id else list(self._cancel_events.keys())
+            for op_id in targets:
+                ev = self._cancel_events.get(op_id)
+                if ev is not None:
+                    ev.set()
+                    cancelled.append(op_id)
+        return cancelled
 
     def _cuda_stats(self) -> tuple[int, int]:
         try:
@@ -90,6 +111,7 @@ class ModelWorkerState:
         model_id = str(payload.get("model_id") or "")
         model_path = Path(str(payload.get("model_path") or ""))
         architecture = str(payload.get("architecture") or "")
+        adapter_family = str(payload.get("adapter_family") or "")
         if kind not in ("chat", "diffusion") or not model_id or not model_path.exists():
             raise HTTPException(status_code=400, detail="Valid kind, model_id, and existing model_path are required")
 
@@ -98,18 +120,25 @@ class ModelWorkerState:
                 return {"status": "ready", "reused": True, **self.status()}
             self._unload_unlocked()
             try:
-                if kind == "diffusion":
-                    adapter = DiffusersImageAdapter(model_id=model_id, model_path=model_path, architecture=architecture)
-                elif "vl" in architecture.lower() or "vl" in model_id.lower():
+                if adapter_family == "diffusers":
+                    adapter: Any = DiffusersImageAdapter(model_id=model_id, model_path=model_path, architecture=architecture)
+                elif adapter_family == "qwen_vl":
                     adapter = QwenVLChatAdapter(model_id=model_id, model_path=model_path, architecture=architecture)
-                else:
+                elif adapter_family == "transformers_causal":
                     adapter = TransformersChatAdapter(model_id=model_id, model_path=model_path, architecture=architecture)
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported adapter_family {adapter_family!r} for model {model_id}",
+                    )
                 adapter.load(precision=payload.get("precision"))
                 self.adapter = adapter
                 self.active_kind = kind
                 self.active_model_id = model_id
                 self.last_error = None
                 return {"status": "ready", "reused": False, **self.status()}
+            except HTTPException:
+                raise
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 self._unload_unlocked()
@@ -117,7 +146,7 @@ class ModelWorkerState:
 
 
 def create_worker_app(secret_token: str) -> FastAPI:
-    app = FastAPI(title="Nexus Isolated Model Worker", version="1.0.0")
+    app = FastAPI(title="Nexus Isolated Model Worker", version="1.0.1")
     state = ModelWorkerState()
     require_auth = make_auth_dependency(secret_token)
 
@@ -134,6 +163,12 @@ def create_worker_app(secret_token: str) -> FastAPI:
         state.unload()
         return {"status": "unloaded", **state.status()}
 
+    @app.post("/worker/cancel")
+    def worker_cancel(body: Optional[dict[str, Any]] = None, _auth: None = Depends(require_auth)) -> dict[str, Any]:
+        op_id = (body or {}).get("operation_id")
+        cancelled = state.cancel_operation(str(op_id) if op_id else None)
+        return {"status": "cancelled", "operations": cancelled}
+
     @app.post("/worker/generate")
     def worker_generate(body: dict[str, Any], _auth: None = Depends(require_auth)) -> Any:
         if state.active_kind != "chat" or state.adapter is None:
@@ -141,7 +176,10 @@ def create_worker_app(secret_token: str) -> FastAPI:
         stream = bool(body.get("stream", False))
         if not stream:
             with state.lock:
-                text = "".join(state.adapter.generate_stream(body))
+                try:
+                    text = "".join(state.adapter.generate_stream(body))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
             return {"text": text, "model_id": state.active_model_id}
 
         def event_stream():
@@ -156,14 +194,48 @@ def create_worker_app(secret_token: str) -> FastAPI:
         return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
     @app.post("/worker/generate-image")
-    def worker_generate_image(body: dict[str, Any], _auth: None = Depends(require_auth)) -> dict[str, Any]:
+    def worker_generate_image(body: dict[str, Any], _auth: None = Depends(require_auth)) -> Any:
         if state.active_kind != "diffusion" or state.adapter is None:
             raise HTTPException(status_code=409, detail="No diffusion pipeline loaded in worker")
-        with state.lock:
-            return state.adapter.generate(body)
+        op_id = str(body.get("operation_id") or "img_op")
+        cancel_event = state.register_cancel_event(op_id)
+        ev_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue()
+
+        def _on_progress(event: dict[str, Any]) -> None:
+            ev_queue.put({"type": "progress", "operation_id": op_id, **event})
+
+        def _run_generation() -> None:
+            with state.lock:
+                try:
+                    result = state.adapter.generate(body, on_progress=_on_progress, cancel_event=cancel_event)
+                    ev_queue.put({"type": "result", "operation_id": op_id, "data": result})
+                except GenerationCancelledError as exc:
+                    ev_queue.put({"type": "cancelled", "operation_id": op_id, "message": str(exc)})
+                except Exception as exc:
+                    ev_queue.put({"type": "error", "operation_id": op_id, "message": f"{type(exc).__name__}: {exc}"})
+                finally:
+                    state.clear_cancel_event(op_id)
+                    ev_queue.put(None)
+
+        thread = threading.Thread(target=_run_generation, daemon=True)
+        thread.start()
+
+        def ndjson_stream():
+            try:
+                while True:
+                    item = ev_queue.get()
+                    if item is None:
+                        break
+                    yield json.dumps(item, ensure_ascii=False) + "\n"
+            finally:
+                cancel_event.set()
+                thread.join(timeout=5.0)
+
+        return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
 
     @app.post("/worker/shutdown")
     def worker_shutdown(_auth: None = Depends(require_auth)) -> dict[str, str]:
+        state.cancel_operation(None)
         state.unload()
         threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
         return {"status": "shutting_down"}

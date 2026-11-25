@@ -1,4 +1,4 @@
-"""Single-active-model GPU resource manager serializing chat, diffusion, and sub-agents."""
+"""Single-active-model GPU resource manager with live worker-state reconciliation."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ class ResourceManager:
     """
     Ensures at most one chat model or diffusion pipeline is resident on the GPU at a time.
     Uses a non-thread-owned `threading.Lock` so FastAPI/Starlette sync generators that
-    acquire on Worker Thread A and finish on Worker Thread B never raise
-    `RuntimeError: cannot release un-acquired lock`.
+    acquire on Thread A and finish on Thread B never raise `cannot release un-acquired lock`.
+    Reconciles against live worker status so a crashed/restarted worker never leaves a stale handle.
     """
 
     def __init__(self) -> None:
@@ -46,6 +46,26 @@ class ResourceManager:
     def active_kind(self) -> Optional[ActiveKind]:
         with self._state_lock:
             return self._active.kind if self._active is not None else None
+
+    def invalidate_if_mismatched(
+        self,
+        *,
+        worker_alive: bool,
+        worker_active_kind: Optional[str],
+        worker_active_model_id: Optional[str],
+    ) -> bool:
+        """Clear stale cached handle if the worker died, restarted, or holds a different model."""
+        with self._state_lock:
+            if self._active is None:
+                return False
+            if (
+                not worker_alive
+                or worker_active_kind != self._active.kind
+                or worker_active_model_id != self._active.model_id
+            ):
+                self._active = None
+                return True
+            return False
 
     def _unload_unlocked(self) -> None:
         with self._state_lock:
@@ -80,9 +100,17 @@ class ResourceManager:
         model_id: str,
         loader: Callable[[], Any],
         unload: Optional[Callable[[Any], None]] = None,
+        verify_live: Optional[Callable[[], tuple[bool, Optional[str], Optional[str]]]] = None,
     ) -> Iterator[Any]:
         self._gate.acquire()
         try:
+            if verify_live is not None:
+                alive, w_kind, w_model = verify_live()
+                self.invalidate_if_mismatched(
+                    worker_alive=alive,
+                    worker_active_kind=w_kind,
+                    worker_active_model_id=w_model,
+                )
             with self._state_lock:
                 current = self._active
             if current is not None and (current.kind != kind or current.model_id != model_id):

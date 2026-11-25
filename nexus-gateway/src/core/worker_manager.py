@@ -8,14 +8,18 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from workers.worker_protocol import WorkerGenerateRequest, WorkerImageRequest, WorkerLoadRequest, WorkerStatus
+
+# Allocated (not reserved!) CUDA VRAM ceiling after unload before triggering worker recycle.
+MAX_LEAKED_ALLOCATED_VRAM_BYTES = 512 * 1024 * 1024  # 512 MiB
 
 
 def _pick_free_loopback_port() -> int:
@@ -35,8 +39,9 @@ class WorkerError(RuntimeError):
 class WorkerManager:
     """
     Manages a dedicated isolated subprocess for GPU model execution.
-    Supports on-demand spawn, health checks, graceful unload, forced process
-    termination when VRAM is not reclaimed, and preserves local staged caches.
+    Redirects worker stdout/stderr to a managed log file (never undrained pipes),
+    streams NDJSON image progress, supports real cancellation, and verifies actual
+    allocated VRAM release on unload.
     """
 
     def __init__(
@@ -45,10 +50,13 @@ class WorkerManager:
         worker_script: Optional[Path] = None,
         python_executable: Optional[str] = None,
         startup_timeout_s: float = 30.0,
+        log_path: Optional[Path] = None,
     ) -> None:
         self._worker_script = worker_script or (Path(__file__).resolve().parents[1] / "workers" / "model_worker.py")
         self._python = python_executable or sys.executable
         self._startup_timeout_s = startup_timeout_s
+        self._log_path = log_path or Path(tempfile.gettempdir()) / "nexus-model-worker.log"
+        self._log_fh: Any = None
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._port: Optional[int] = None
@@ -60,6 +68,24 @@ class WorkerManager:
     @property
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def _redact(self, text: str) -> str:
+        out = text
+        if self._secret:
+            out = out.replace(self._secret, "[REDACTED_WORKER_SECRET]")
+        api_key = os.environ.get("NEXUS_API_KEY", "")
+        if api_key:
+            out = out.replace(api_key, "[REDACTED_NEXUS_API_KEY]")
+        return out
+
+    def _read_log_tail(self, max_chars: int = 800) -> str:
+        try:
+            if self._log_path.is_file():
+                raw = self._log_path.read_text(encoding="utf-8", errors="replace")
+                return self._redact(raw[-max_chars:])
+        except OSError:
+            pass
+        return ""
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -90,9 +116,9 @@ class WorkerManager:
                 detail = json.loads(body).get("detail", body)
             except Exception:
                 detail = body
-            raise WorkerError(f"Worker error ({exc.code}): {detail}", status_code=exc.code) from exc
+            raise WorkerError(f"Worker error ({exc.code}): {self._redact(str(detail))}", status_code=exc.code) from exc
         except Exception as exc:
-            raise WorkerError(f"Worker RPC failed: {type(exc).__name__}: {exc}", status_code=502) from exc
+            raise WorkerError(f"Worker RPC failed: {type(exc).__name__}: {self._redact(str(exc))}", status_code=502) from exc
 
     def ensure_started(self) -> WorkerStatus:
         with self._lock:
@@ -107,7 +133,9 @@ class WorkerManager:
             secret = secrets.token_urlsafe(32)
             env = {**os.environ, "NEXUS_WORKER_SECRET": secret}
             cmd = [self._python, str(self._worker_script), "--host", "127.0.0.1", "--port", str(port)]
-            proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_fh = self._log_path.open("ab")
+            proc = subprocess.Popen(cmd, env=env, stdout=self._log_fh, stderr=subprocess.STDOUT)
             self._proc = proc
             self._port = port
             self._secret = secret
@@ -117,10 +145,9 @@ class WorkerManager:
             deadline = time.monotonic() + self._startup_timeout_s
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
-                    stderr_tail = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", errors="replace")[-500:]
-                    self._last_error = f"Worker exited early (code {proc.returncode}): {stderr_tail}"
-                    self._proc = None
-                    self._port = None
+                    tail = self._read_log_tail()
+                    self._last_error = f"Worker exited early (code {proc.returncode}): {tail}"
+                    self._terminate_unlocked()
                     raise WorkerError(self._last_error, status_code=503)
                 try:
                     info = self._request_json("GET", "/worker/health", timeout=2.0)
@@ -190,13 +217,65 @@ class WorkerManager:
                         yield chunk
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise WorkerError(f"Worker stream error ({exc.code}): {body}", status_code=exc.code) from exc
+            raise WorkerError(f"Worker stream error ({exc.code}): {self._redact(body)}", status_code=exc.code) from exc
         except Exception as exc:
-            raise WorkerError(f"Worker stream failed: {type(exc).__name__}: {exc}", status_code=502) from exc
+            raise WorkerError(f"Worker stream failed: {type(exc).__name__}: {self._redact(str(exc))}", status_code=502) from exc
 
-    def generate_image(self, req: WorkerImageRequest, *, timeout: float = 900.0) -> dict[str, Any]:
+    def cancel_operation(self, operation_id: Optional[str] = None) -> dict[str, Any]:
+        if not self.is_running:
+            return {"status": "not_running", "operations": []}
+        try:
+            return self._request_json("POST", "/worker/cancel", {"operation_id": operation_id}, timeout=5.0)
+        except WorkerError:
+            return {"status": "unreachable", "operations": []}
+
+    def generate_image(
+        self,
+        req: WorkerImageRequest,
+        *,
+        on_progress: Optional[Callable[[dict[str, Any]], None]] = None,
+        timeout: float = 900.0,
+    ) -> dict[str, Any]:
+        """Consume NDJSON image-generation stream, relaying real progress and handling disconnects."""
         self.ensure_started()
-        return self._request_json("POST", "/worker/generate-image", req.to_dict(), timeout=timeout)
+        if self._port is None:
+            raise WorkerError("Model worker is not running", status_code=503)
+        url = f"http://127.0.0.1:{self._port}/worker/generate-image"
+        http_req = urllib.request.Request(
+            url,
+            data=json.dumps(req.to_dict()).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        result_data: Optional[dict[str, Any]] = None
+        try:
+            with urllib.request.urlopen(http_req, timeout=timeout) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    ev_type = event.get("type")
+                    if ev_type == "progress" and on_progress is not None:
+                        on_progress(event)
+                    elif ev_type == "result":
+                        result_data = event.get("data")
+                    elif ev_type == "cancelled":
+                        raise WorkerError(str(event.get("message") or "Image generation cancelled"), status_code=499)
+                    elif ev_type == "error":
+                        raise WorkerError(str(event.get("message") or "Worker image generation error"), status_code=500)
+        except WorkerError:
+            raise
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise WorkerError(f"Worker image error ({exc.code}): {self._redact(body)}", status_code=exc.code) from exc
+        except Exception as exc:
+            self.cancel_operation(req.operation_id or None)
+            raise WorkerError(f"Worker image stream disconnected: {type(exc).__name__}: {self._redact(str(exc))}", status_code=502) from exc
+
+        if not isinstance(result_data, dict):
+            raise WorkerError("Worker image stream ended without returning a result", status_code=502)
+        return result_data
 
     def unload(self, *, terminate_on_failure: bool = True) -> dict[str, Any]:
         with self._lock:
@@ -208,6 +287,13 @@ class WorkerManager:
                 res = self._request_json("POST", "/worker/unload", {}, timeout=30.0)
                 self._active_kind = None
                 self._active_model_id = None
+                # Check actual allocated VRAM (not reserved pool) + active_model_id.
+                allocated = int(res.get("cuda_allocated_bytes") or 0)
+                still_loaded = res.get("active_model_id") is not None
+                if still_loaded or allocated > MAX_LEAKED_ALLOCATED_VRAM_BYTES:
+                    if terminate_on_failure:
+                        self._terminate_unlocked()
+                        return {"status": "terminated_for_vram_release", "leaked_allocated_bytes": allocated}
                 return res
             except WorkerError:
                 if terminate_on_failure:
@@ -230,9 +316,7 @@ class WorkerManager:
         self._port = None
         self._active_kind = None
         self._active_model_id = None
-        if proc is None:
-            return
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
                 proc.wait(timeout=5.0)
@@ -242,3 +326,9 @@ class WorkerManager:
                     proc.wait(timeout=3.0)
                 except Exception:
                     pass
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            except OSError:
+                pass
+            self._log_fh = None

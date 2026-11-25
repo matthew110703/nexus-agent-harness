@@ -1,9 +1,8 @@
-"""FastAPI application for the loopback-only Nexus Gateway."""
+"""FastAPI application for the loopback-only Nexus Gateway (v1.0.1)."""
 
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -14,11 +13,11 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from adapters.diffusers import QUALITY_PROFILES, resolve_image_generation_params
-from adapters.tool_calls import create_tool_parser
+from adapters.tool_calls import create_tool_parser, has_native_tool_parser
 from api.middleware.auth import make_auth_dependency
 from core.hardware_detector import detect_hardware
 from core.model_registry import ModelRegistry
-from core.model_staging import stage_model_directory
+from core.model_staging import InsufficientDiskSpaceError, stage_model_directory
 from core.resource_manager import ResourceManager
 from core.worker_manager import WorkerError, WorkerManager
 from services.conversation import normalize_openai_messages, resolve_reasoning_controls
@@ -38,6 +37,7 @@ class GatewayConfig:
     output_image_dir: Path = Path("/tmp/nexus-generated-images")
     plugin_index_path: Optional[Path] = None
     min_stage_free_margin_bytes: int = 2 * 1024 * 1024 * 1024
+    allow_drive_fallback: bool = False
 
 
 def create_app(
@@ -48,7 +48,7 @@ def create_app(
     resources: Optional[ResourceManager] = None,
     worker: Optional[WorkerManager] = None,
 ) -> FastAPI:
-    app = FastAPI(title="Nexus Gateway", version="1.0.0")
+    app = FastAPI(title="Nexus Gateway", version="1.0.1")
     require_auth = make_auth_dependency(config.api_key)
 
     reg = registry or ModelRegistry(
@@ -68,6 +68,10 @@ def create_app(
     app.state.resources = res_mgr
     app.state.worker = worker_mgr
     app.state.started_at = time.time()
+
+    def _verify_worker_live() -> tuple[bool, Optional[str], Optional[str]]:
+        ws = worker_mgr.status()
+        return ws.alive, ws.active_kind, ws.active_model_id
 
     def _stage_and_load(kind: str, model_id: str) -> tuple[Any, str]:
         model = reg.get(model_id)
@@ -89,6 +93,7 @@ def create_app(
                 progress=prog,
                 operation_id=op.operation_id,
                 min_free_margin_bytes=config.min_stage_free_margin_bytes,
+                allow_drive_fallback=config.allow_drive_fallback,
             )
             prog.update(op.operation_id, phase="weight_loading", indeterminate=True, message=f"Loading {model_id} in isolated worker")
             worker_mgr.load_model(
@@ -98,10 +103,14 @@ def create_app(
                     model_path=str(staged_path),
                     architecture=model.architecture,
                     loader_family=model.loader_family,
+                    adapter_family=model.adapter_family,
                 )
             )
             prog.complete(op.operation_id, phase="ready", message=f"{model_id} ready")
             return model, op.operation_id
+        except InsufficientDiskSpaceError as exc:
+            prog.fail(op.operation_id, str(exc))
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
         except WorkerError as exc:
             prog.fail(op.operation_id, str(exc))
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -114,7 +123,7 @@ def create_app(
         ws = worker_mgr.status()
         return {
             "status": "ok",
-            "version": "1.0.0",
+            "version": "1.0.1",
             "uptime_s": round(time.time() - app.state.started_at, 2),
             "worker": ws.to_dict(),
             "chat_models": len(reg.chat_models()),
@@ -140,9 +149,15 @@ def create_app(
     @app.get("/v1/runtime")
     def runtime_status(_auth: None = Depends(require_auth)) -> dict[str, Any]:
         hw = detect_hardware(config.local_stage_root if config.local_stage_root.exists() else None)
+        ws = worker_mgr.status()
+        res_mgr.invalidate_if_mismatched(
+            worker_alive=ws.alive,
+            worker_active_kind=ws.active_kind,
+            worker_active_model_id=ws.active_model_id,
+        )
         return {
             "hardware": hw.to_dict(),
-            "worker": worker_mgr.status().to_dict(),
+            "worker": ws.to_dict(),
             "busy": res_mgr.is_busy,
             "active_model": res_mgr.active_model_id,
             "active_kind": res_mgr.active_kind,
@@ -157,7 +172,13 @@ def create_app(
         kind = str(body.get("kind") or "chat")
         if not model_id:
             raise HTTPException(status_code=400, detail="model is required")
-        with res_mgr.acquire(kind, model_id, lambda: _stage_and_load(kind, model_id), unload=lambda _: worker_mgr.unload()):  # type: ignore[arg-type]
+        with res_mgr.acquire(
+            kind,  # type: ignore[arg-type]
+            model_id,
+            lambda: _stage_and_load(kind, model_id),
+            unload=lambda _: worker_mgr.unload(),
+            verify_live=_verify_worker_live,
+        ):
             return {"status": "loaded", "model": model_id, "kind": kind, "worker": worker_mgr.status().to_dict()}
 
     @app.post("/v1/runtime/unload")
@@ -169,6 +190,14 @@ def create_app(
             return {"status": "terminated", "worker": worker_mgr.status().to_dict()}
         result = worker_mgr.unload(terminate_on_failure=True)
         return {"status": result.get("status", "unloaded"), "worker": worker_mgr.status().to_dict()}
+
+    @app.post("/v1/runtime/cancel")
+    def runtime_cancel(body: Optional[dict[str, Any]] = None, _auth: None = Depends(require_auth)) -> dict[str, Any]:
+        op_id = (body or {}).get("operation_id")
+        res = worker_mgr.cancel_operation(str(op_id) if op_id else None)
+        for cancelled_id in res.get("operations") or []:
+            prog.update(cancelled_id, status="cancelled", indeterminate=False, message="Cancelled by user")
+        return res
 
     @app.get("/v1/progress")
     @app.get("/runtime/progress")
@@ -187,6 +216,8 @@ def create_app(
     @app.post("/v1/tools/parse")
     def parse_tools_endpoint(body: dict[str, Any], _auth: None = Depends(require_auth)) -> dict[str, Any]:
         family = str(body.get("parser_family") or "qwen")
+        if not has_native_tool_parser(family):
+            raise HTTPException(status_code=422, detail=f"No native tool parser implemented for family {family!r}")
         text = str(body.get("text") or "")
         tools = body.get("tools") or []
         tool_choice = body.get("tool_choice", "auto")
@@ -211,14 +242,33 @@ def create_app(
         messages = normalize_openai_messages(body.get("messages") or [])
         tools = body.get("tools") or []
         tool_choice = body.get("tool_choice", "auto")
+        if tool_choice not in ("auto", "none") and not isinstance(tool_choice, dict):
+            raise HTTPException(status_code=400, detail=f"Unsupported tool_choice {tool_choice!r}; supported: 'auto', 'none', or function selector")
+        if isinstance(tool_choice, dict):
+            selected_name = (tool_choice.get("function") or {}).get("name")
+            if not isinstance(selected_name, str) or not selected_name:
+                raise HTTPException(status_code=400, detail="tool_choice object must specify function.name")
+            tools = [t for t in tools if (t.get("function") or t).get("name") == selected_name]
+            if not tools:
+                raise HTTPException(status_code=400, detail=f"tool_choice requested unadvertised tool {selected_name!r}")
         if tool_choice == "none":
             tools = []
+        if tools and (model.tool_template_compatible != "yes" or not has_native_tool_parser(model.tool_parser_family)):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Model {model_id} does not support native tool calling (parser={model.tool_parser_family}, template_compatible={model.tool_template_compatible})",
+            )
+
         stream = bool(body.get("stream", False))
         max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or model.max_output_tokens or 4096)
         temperature = float(body.get("temperature", 0.7))
         top_p = float(body.get("top_p", 0.9))
 
-        requested_effort = body.get("reasoning_effort") or (body.get("reasoning") or {}).get("effort") if isinstance(body.get("reasoning"), dict) else body.get("reasoning_effort")
+        requested_effort = (
+            (body.get("reasoning") or {}).get("effort")
+            if isinstance(body.get("reasoning"), dict)
+            else body.get("reasoning_effort")
+        )
         wire_effort, enable_thinking = resolve_reasoning_controls(
             model,
             requested_effort=str(requested_effort) if requested_effort is not None else None,
@@ -242,13 +292,24 @@ def create_app(
 
         if not stream:
             try:
-                with res_mgr.acquire("chat", model_id, lambda: _stage_and_load("chat", model_id), unload=lambda _: worker_mgr.unload()):
+                with res_mgr.acquire(
+                    "chat",
+                    model_id,
+                    lambda: _stage_and_load("chat", model_id),
+                    unload=lambda _: worker_mgr.unload(),
+                    verify_live=_verify_worker_live,
+                ):
                     raw = worker_mgr.generate(gen_req)
             except WorkerError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
             parser = create_tool_parser(model.tool_parser_family)
             parser.feed(str(raw.get("text") or ""))
             parsed = parser.finish(tools, tool_choice=tool_choice)
+            if parsed.errors:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": {"message": "; ".join(parsed.errors), "type": "tool_call_parse_error"}},
+                )
             message: dict[str, Any] = {"role": "assistant", "content": parsed.text}
             finish_reason = "stop"
             if parsed.tool_calls:
@@ -272,7 +333,13 @@ def create_app(
             }) + "\n\n"
             parser = create_tool_parser(model.tool_parser_family)
             try:
-                with res_mgr.acquire("chat", model_id, lambda: _stage_and_load("chat", model_id), unload=lambda _: worker_mgr.unload()):
+                with res_mgr.acquire(
+                    "chat",
+                    model_id,
+                    lambda: _stage_and_load("chat", model_id),
+                    unload=lambda _: worker_mgr.unload(),
+                    verify_live=_verify_worker_live,
+                ):
                     for chunk in worker_mgr.generate_stream(gen_req):
                         visible = parser.feed(chunk)
                         if visible:
@@ -284,6 +351,21 @@ def create_app(
                                 "choices": [{"index": 0, "delta": {"content": visible}, "finish_reason": None}],
                             }, ensure_ascii=False) + "\n\n"
                 parsed = parser.finish(tools, tool_choice=tool_choice)
+                # Flush any valid trailing buffered text without duplicating already-emitted text.
+                if parsed.trailing_text:
+                    yield "data: " + json.dumps({
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": parsed.trailing_text}, "finish_reason": None}],
+                    }, ensure_ascii=False) + "\n\n"
+                if parsed.errors:
+                    yield "data: " + json.dumps({
+                        "error": {"message": "; ".join(parsed.errors), "type": "tool_call_parse_error"}
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 finish_reason = "tool_calls" if parsed.tool_calls else "stop"
                 for idx, tc in enumerate(parsed.tool_calls):
                     yield "data: " + json.dumps({
@@ -324,10 +406,10 @@ def create_app(
             raise HTTPException(status_code=400, detail="prompt is required")
         model_id = str(body.get("model") or "").strip()
         if not model_id:
-            candidates = reg.image_models()
-            if not candidates:
-                raise HTTPException(status_code=503, detail="No compatible local Diffusers image model discovered")
-            model_id = candidates[0].id
+            raise HTTPException(
+                status_code=400,
+                detail="model is required: select an image model explicitly instead of defaulting silently",
+            )
         model = reg.get(model_id)
         if model is None or not model.is_image_model or model.validation_status != "compatible":
             raise HTTPException(status_code=404, detail=f"Unknown or incompatible image model: {model_id}")
@@ -348,20 +430,40 @@ def create_app(
 
         op = prog.start("image_generation", model_id, phase="denoising", message=f"Generating image with {model_id}")
         prog.update(op.operation_id, steps_total=params["steps"], step=0)
+
+        def _relay_progress(ev: dict[str, Any]) -> None:
+            prog.update(
+                op.operation_id,
+                phase=ev.get("phase") or "denoising",
+                step=ev.get("step"),
+                steps_total=ev.get("steps_total"),
+                progress=ev.get("progress"),
+                indeterminate=ev.get("indeterminate"),
+                message=ev.get("message"),
+            )
+
         try:
-            with res_mgr.acquire("diffusion", model_id, lambda: _stage_and_load("diffusion", model_id), unload=lambda _: worker_mgr.unload()):
+            with res_mgr.acquire(
+                "diffusion",
+                model_id,
+                lambda: _stage_and_load("diffusion", model_id),
+                unload=lambda _: worker_mgr.unload(),
+                verify_live=_verify_worker_live,
+            ):
                 raw = worker_mgr.generate_image(
                     WorkerImageRequest(
                         model_id=model_id,
                         prompt=prompt,
+                        operation_id=op.operation_id,
                         quality=params["quality"],
                         width=params["width"],
                         height=params["height"],
                         steps=params["steps"],
                         seed=body.get("seed"),
-                        num_images=params["num_images"],
+                        num_images=1,
                         output_dir=str(config.output_image_dir),
-                    )
+                    ),
+                    on_progress=_relay_progress,
                 )
             prog.update(op.operation_id, phase="saving", step=params["steps"], steps_total=params["steps"], message="Saving PNG to Drive")
             saved = save_generated_image_artifact(
@@ -380,7 +482,10 @@ def create_app(
             prog.complete(op.operation_id, phase="ready", message=f"Saved {saved['filename']}")
             return saved
         except WorkerError as exc:
-            prog.fail(op.operation_id, str(exc))
+            if exc.status_code == 499:
+                prog.update(op.operation_id, status="cancelled", indeterminate=False, error=str(exc), message="Cancelled")
+            else:
+                prog.fail(op.operation_id, str(exc))
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         except Exception as exc:
             prog.fail(op.operation_id, str(exc))
@@ -388,7 +493,6 @@ def create_app(
 
     @app.get("/v1/plugin-index.json")
     def plugin_index() -> JSONResponse:
-        """Serve the curated Nexus plugin index for Harness Discover (loopback-only)."""
         path = config.plugin_index_path
         if path is not None and path.is_file():
             data = json.loads(path.read_text(encoding="utf-8"))

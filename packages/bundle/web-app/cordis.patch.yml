@@ -490,6 +490,11 @@
     - id: ui-model-selection
       name: '@deepseek-ai/dsh-client-ui-model-selection'
 
+    # Nexus runtime status & independent image-model control (enabled by colab.overlay.yml).
+    - id: nexus-runtime-ui
+      name: '@deepseek-ai/dsh-client-nexus-runtime-ui'
+      disabled: true
+
     - id: ui-permission
       name: '@deepseek-ai/dsh-client-ui-permission-presets'
 

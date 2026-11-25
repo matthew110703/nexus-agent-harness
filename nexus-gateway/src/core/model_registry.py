@@ -1,57 +1,52 @@
-"""Dynamic Drive model, adapter, upscaler, and reasoning-capability discovery."""
+"""Dynamic Drive model, adapter, upscaler, structural weight, and capability discovery."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 SourceType = Literal["hf_directory", "diffusers_pipeline", "gguf_package", "adapter", "upscaler", "unknown"]
+AdapterFamily = Literal["transformers_causal", "qwen_vl", "diffusers", "unsupported"]
 ToolCompatibility = Literal["yes", "no", "unknown"]
 ReasoningMode = Literal["none", "binary_toggle", "effort_levels", "unknown"]
 
-SUPPORTED_FLUX_PIPELINES = frozenset({
-    "FluxPipeline",
-    "Flux2Pipeline",
-    "Flux2KleinPipeline",
-    "Flux2KleinKVPipeline",
-    "StableDiffusionXLPipeline",
-    "QwenImagePipeline",
+SUPPORTED_DIFFUSERS_PIPELINES: dict[str, dict[str, Any]] = {
+    "FluxPipeline": {"min_diffusers": "0.30.0", "supports_guidance_scale": True, "supports_step_callback": True},
+    "Flux2Pipeline": {"min_diffusers": "0.32.0", "supports_guidance_scale": True, "supports_step_callback": True},
+    "Flux2KleinPipeline": {"min_diffusers": "0.32.0", "supports_guidance_scale": True, "supports_step_callback": True},
+    "Flux2KleinKVPipeline": {"min_diffusers": "0.32.0", "supports_guidance_scale": True, "supports_step_callback": True},
+    "StableDiffusionXLPipeline": {"min_diffusers": "0.24.0", "supports_guidance_scale": True, "supports_step_callback": True},
+    "QwenImagePipeline": {"min_diffusers": "0.32.0", "supports_guidance_scale": True, "supports_step_callback": True},
+}
+SUPPORTED_FLUX_PIPELINES = frozenset(SUPPORTED_DIFFUSERS_PIPELINES.keys())
+
+OPTIONAL_DIFFUSERS_COMPONENTS = frozenset({
+    "safety_checker",
+    "feature_extractor",
+    "image_encoder",
+    "watermarker",
 })
-VLM_MODEL_TYPES = frozenset({
-    "qwen2_vl",
-    "qwen2_5_vl",
-    "qwen3_vl",
-    "qwen3_5",
-    "qwen3_5_moe",
-    "llava",
-    "idefics2",
-    "idefics3",
-    "internvl_chat",
-    "pixtral",
-})
+
+QWEN_VLM_MODEL_TYPES = frozenset({"qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5", "qwen3_5_moe"})
+OTHER_VLM_MODEL_TYPES = frozenset({"llava", "idefics2", "idefics3", "internvl_chat", "pixtral"})
+VLM_MODEL_TYPES = QWEN_VLM_MODEL_TYPES | OTHER_VLM_MODEL_TYPES
+
 NON_CHAT_MODEL_TYPES = frozenset({
-    "t5",
-    "byt5",
-    "umt5",
-    "mt5",
-    "clip",
-    "clip_text_model",
-    "siglip",
-    "bert",
-    "roberta",
-    "autoencoder",
-    "vae",
-    "wan",
-    "hunyuan_video",
-    "hunyuanvideo",
-    "ltx_video",
-    "ltx",
-    "cogvideox",
-    "mochi",
+    "t5", "byt5", "umt5", "mt5", "clip", "clip_text_model", "siglip", "bert", "roberta",
+    "autoencoder", "vae", "wan", "hunyuan_video", "hunyuanvideo", "ltx_video", "ltx", "cogvideox", "mochi",
 })
 VIDEO_OR_ENCODER_NAME_HINTS = ("hunyuanvideo", "wan2", "ltx-", "byt5", "umt5", "t5-v1", "video")
+
+# Known Hugging Face weight filenames (never accept arbitrary *.pt files).
+HF_WEIGHT_FILENAME_RE = re.compile(
+    r"^(?:model(?:-\d+-of-\d+)?\.safetensors|pytorch_model(?:-\d+-of-\d+)?\.bin|consolidated(?:\.\d+)?\.safetensors)$"
+)
+# Native tool parser families with real implemented parsers (synced with adapters.tool_calls).
+IMPLEMENTED_TOOL_PARSERS = frozenset({"qwen"})
 
 
 @dataclass
@@ -64,7 +59,6 @@ class ReasoningCapability:
     confidence: Literal["verified", "inferred", "unverified"] = "unverified"
 
     def to_harness_reasoning_efforts(self) -> Any:
-        """Project into Harness `llm-pi-ai` `reasoningEfforts` (dict or `false` or `None`)."""
         if self.status == "unsupported":
             return False
         if self.status == "supported" and self.levels:
@@ -81,11 +75,14 @@ class DiscoveredModel:
     category: Literal["chat", "vlm", "image", "adapter", "upscaler", "other"] = "other"
     architecture: str = "unknown"
     loader_family: str = "unknown"
-    tool_parser_family: str = "qwen"
+    adapter_family: AdapterFamily = "unsupported"
+    tool_parser_family: str = "none"
     modalities: list[str] = field(default_factory=lambda: ["text"])
-    tool_template_compatible: ToolCompatibility = "unknown"
+    tool_template_compatible: ToolCompatibility = "no"
     tool_template_reason: str = ""
     tool_behavior_verified: Optional[bool] = None
+    structurally_valid: bool = False
+    runtime_compatible: bool = False
     validation_status: Literal["compatible", "unsupported", "unvalidated"] = "unvalidated"
     validation_reason: str = ""
     context_window: Optional[int] = None
@@ -102,11 +99,14 @@ class DiscoveredModel:
             "owned_by": "nexus",
             "display_name": self.display_name,
             "category": self.category,
+            "adapter_family": self.adapter_family,
             "modalities": list(self.modalities),
             "context_window": self.context_window or 32768,
             "max_output_tokens": self.max_output_tokens or 4096,
             "tool_template_compatible": self.tool_template_compatible,
             "tool_behavior_verified": self.tool_behavior_verified,
+            "structurally_valid": self.structurally_valid,
+            "runtime_compatible": self.runtime_compatible,
             "reasoning": asdict(self.reasoning),
         }
         efforts = self.reasoning.to_harness_reasoning_efforts()
@@ -153,7 +153,7 @@ def _read_chat_template(model_root: Path) -> str:
     return "\n".join(fragments)
 
 
-def _inspect_chat_template(model_root: Path) -> tuple[ToolCompatibility, str, ReasoningCapability]:
+def _inspect_chat_template(model_root: Path, parser_family: str) -> tuple[ToolCompatibility, str, ReasoningCapability]:
     template = _read_chat_template(model_root)
     if not template.strip():
         return (
@@ -163,13 +163,18 @@ def _inspect_chat_template(model_root: Path) -> tuple[ToolCompatibility, str, Re
         )
     low = template.lower()
     if "tools" in low and "tool_call" in low:
-        tool_compat: ToolCompatibility = "yes"
-        tool_reason = "Template references tools and tool_call blocks (requires live behavior verification)"
+        if parser_family in IMPLEMENTED_TOOL_PARSERS:
+            tool_compat: ToolCompatibility = "yes"
+            tool_reason = f"Template references tools/tool_call and maps to implemented parser '{parser_family}' (live behavior unverified)"
+        else:
+            tool_compat = "no"
+            tool_reason = f"Template references tools, but no native tool parser is implemented for family '{parser_family}'"
     else:
         tool_compat = "no"
         tool_reason = "Chat template does not declare tools/tool_call handling"
 
-    # Detect verified binary thinking toggle (e.g. Qwen3 `enable_thinking`).
+    # Only advertise verified binary `enable_thinking`; never fabricate multi-level
+    # effort controls merely from bare `reasoning_effort` mentions in a template.
     if "enable_thinking" in low:
         reasoning = ReasoningCapability(
             status="supported",
@@ -179,46 +184,106 @@ def _inspect_chat_template(model_root: Path) -> tuple[ToolCompatibility, str, Re
             source="chat_template:enable_thinking",
             confidence="verified",
         )
-    elif "reasoning_effort" in low:
-        reasoning = ReasoningCapability(
-            status="supported",
-            mode="effort_levels",
-            levels={"off": None, "low": "low", "medium": "medium", "high": "high"},
-            default="medium",
-            source="chat_template:reasoning_effort",
-            confidence="inferred",
-        )
     else:
         reasoning = ReasoningCapability(
-            status="unsupported",
-            mode="none",
+            status="unknown",
+            mode="unknown",
             levels={},
             default=None,
             source="chat_template",
-            confidence="inferred",
+            confidence="unverified",
         )
     return tool_compat, tool_reason, reasoning
 
 
-def _check_shard_completeness(model_root: Path) -> tuple[bool, str]:
-    """Validate weight index completeness if a sharded index file exists."""
+def _validate_hf_weights(model_root: Path) -> tuple[bool, str]:
+    """Require actual known HF weight files or complete indexed shards; reject config-only dirs."""
     for idx_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
         idx_path = model_root / idx_name
         if idx_path.is_file():
-            idx_data = _read_json(idx_path) or {}
-            weight_map = idx_data.get("weight_map")
-            if isinstance(weight_map, dict) and weight_map:
-                missing = sorted({str(fname) for fname in weight_map.values() if not (model_root / str(fname)).is_file()})
-                if missing:
-                    return False, f"Incomplete shards ({len(missing)} missing, e.g. {missing[0]})"
-                return True, "All indexed weight shards present"
-    return True, "Weight index check passed"
+            idx_data = _read_json(idx_path)
+            if not isinstance(idx_data, dict) or not isinstance(idx_data.get("weight_map"), dict) or not idx_data["weight_map"]:
+                return False, f"Malformed shard index {idx_name}"
+            shards = sorted({str(fname) for fname in idx_data["weight_map"].values()})
+            missing = [fname for fname in shards if not (model_root / fname).is_file()]
+            if missing:
+                return False, f"Incomplete shards ({len(missing)}/{len(shards)} missing, e.g. {missing[0]})"
+            return True, f"All {len(shards)} indexed weight shard(s) present"
+
+    # Unsharded checkpoint: must contain at least one known HF weight file (never arbitrary *.pt).
+    known_weights = [p.name for p in model_root.iterdir() if p.is_file() and HF_WEIGHT_FILENAME_RE.match(p.name)]
+    if known_weights:
+        return True, f"Unsharded HF weight file present ({known_weights[0]})"
+    return False, "Missing Hugging Face model weights (config-only or unsupported weight format)"
+
+
+def _validate_diffusers_pipeline(diffusers_root: Path, model_index: dict[str, Any]) -> tuple[bool, bool, str]:
+    """
+    Validate Diffusers pipeline class and required non-null components.
+    Returns (structurally_valid, runtime_compatible, reason).
+    """
+    class_name = str(model_index.get("_class_name") or "").strip()
+    if class_name not in SUPPORTED_DIFFUSERS_PIPELINES:
+        return False, False, f"Unsupported Diffusers pipeline class {class_name!r}"
+
+    # Inspect required non-null components; skip metadata keys, null, [null, null], and optional components.
+    required_components: list[str] = []
+    for key, spec in model_index.items():
+        if key.startswith("_") or key in OPTIONAL_DIFFUSERS_COMPONENTS:
+            continue
+        if spec is None:
+            continue
+        if isinstance(spec, list) and all(item is None for item in spec):
+            continue
+        required_components.append(key)
+
+    if not required_components:
+        return False, False, "model_index.json declares no non-null pipeline components"
+
+    for comp in required_components:
+        comp_dir = diffusers_root / comp
+        if not comp_dir.is_dir():
+            return False, False, f"Missing required Diffusers component directory '{comp}'"
+        has_files = any(p.is_file() for p in comp_dir.iterdir())
+        if not has_files:
+            return False, False, f"Required Diffusers component '{comp}' has no files"
+
+    # Check whether installed diffusers exports the pipeline class (when diffusers is installed).
+    runtime_ok = True
+    runtime_note = f"Validated Diffusers pipeline {class_name}"
+    if importlib.util.find_spec("diffusers") is not None:
+        try:
+            import diffusers  # type: ignore[import-not-found]
+
+            if not hasattr(diffusers, class_name):
+                runtime_ok = False
+                runtime_note = f"Installed diffusers does not export {class_name}"
+        except Exception as exc:
+            runtime_ok = False
+            runtime_note = f"Could not verify diffusers export for {class_name}: {exc}"
+
+    return True, runtime_ok, runtime_note
+
+
+def _select_hf_adapter_family(model_type: str, arch: str, config: dict[str, Any], model_root: Path) -> AdapterFamily:
+    """Explicit adapter dispatch based on verified config/processor metadata, never model-name substrings."""
+    low_arch = arch.lower()
+    has_vision = "vision_config" in config or model_type in VLM_MODEL_TYPES or "vl" in low_arch or "imagetext" in low_arch
+    if has_vision:
+        if model_type in QWEN_VLM_MODEL_TYPES or ("qwen" in model_type and ("vision_config" in config or "vl" in low_arch)):
+            return "qwen_vl"
+        if "qwen" in low_arch and ("vl" in low_arch or "vision_config" in config):
+            return "qwen_vl"
+        return "unsupported"
+    if (model_root / "preprocessor_config.json").is_file() and "qwen" in model_type:
+        return "qwen_vl"
+    return "transformers_causal"
 
 
 def _default_steps_for_diffusion(model_id: str, class_name: str) -> int:
     low_cls = class_name.lower().replace("_", "")
     low_name = model_id.lower()
-    if "kleinkv" in low_cls or "klein-kv" in low_name or "klein-9b-kv" in low_name or "klein" in low_name:
+    if "kleinkv" in low_cls or "klein" in low_name:
         return 4
     if "flux2" in low_cls and "dev" in low_name:
         return 50
@@ -260,7 +325,8 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
     if diffusers_root is not None:
         model_index = _read_json(diffusers_root / "model_index.json") or {}
         class_name = str(model_index.get("_class_name") or "unknown")
-        supported = class_name in SUPPORTED_FLUX_PIPELINES
+        struct_ok, runtime_ok, reason = _validate_diffusers_pipeline(diffusers_root, model_index)
+        usable = struct_ok and runtime_ok
         model = DiscoveredModel(
             id=model_id,
             display_name=model_id,
@@ -269,12 +335,16 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
             category="image",
             architecture=class_name,
             loader_family="diffusers",
+            adapter_family="diffusers" if usable else "unsupported",
+            tool_parser_family="none",
             modalities=["image"],
             tool_template_compatible="no",
-            validation_status="compatible" if supported else "unsupported",
-            validation_reason=f"{'Supported' if supported else 'Unsupported'} Diffusers pipeline {class_name}",
+            structurally_valid=struct_ok,
+            runtime_compatible=runtime_ok,
+            validation_status="compatible" if usable else "unsupported",
+            validation_reason=reason,
             is_chat_model=False,
-            is_image_model=supported,
+            is_image_model=usable,
             reasoning=ReasoningCapability(status="unsupported", mode="none", source="diffusers", confidence="verified"),
             default_steps=_default_steps_for_diffusion(model_id, class_name),
         )
@@ -285,7 +355,6 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
     hf_root = _resolve_snapshot_root(model_dir, "config.json")
     if hf_root is not None:
         config = _read_json(hf_root / "config.json") or {}
-        shards_ok, shards_msg = _check_shard_completeness(hf_root)
         model_type = str(config.get("model_type") or "unknown").lower()
         archs = config.get("architectures") or []
         arch = str(archs[0]) if isinstance(archs, list) and archs else model_type
@@ -305,18 +374,32 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
                 category="other",
                 architecture=arch,
                 loader_family="unsupported",
+                adapter_family="unsupported",
                 modalities=[],
                 tool_template_compatible="no",
+                structurally_valid=False,
+                runtime_compatible=False,
                 validation_status="unsupported",
                 validation_reason=f"Non-chat video or encoder checkpoint ({model_type}/{arch})",
                 is_chat_model=False,
                 is_image_model=False,
                 reasoning=ReasoningCapability(status="unsupported", mode="none", source="non_chat", confidence="verified"),
             )
-        is_vlm = model_type in VLM_MODEL_TYPES or "vision_config" in config
+
+        weights_ok, weights_msg = _validate_hf_weights(hf_root)
+        adapter_family = _select_hf_adapter_family(model_type, arch, config, hf_root)
+        is_vlm = adapter_family == "qwen_vl" or "vision_config" in config or model_type in VLM_MODEL_TYPES
+        parser_family = "qwen" if ("qwen" in model_type or "qwen" in low_arch) else "none"
+        tool_compat, tool_reason, reasoning = _inspect_chat_template(hf_root, parser_family)
+
+        runtime_ok = adapter_family != "unsupported"
+        usable = weights_ok and runtime_ok
+        reason = weights_msg if not weights_ok else (
+            f"Unsupported multimodal architecture ({model_type}/{arch})" if not runtime_ok else f"Valid checkpoint ({weights_msg})"
+        )
         text_cfg = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
         ctx_len = config.get("max_position_embeddings") or text_cfg.get("max_position_embeddings")
-        tool_compat, tool_reason, reasoning = _inspect_chat_template(hf_root)
+
         model = DiscoveredModel(
             id=model_id,
             display_name=model_id,
@@ -325,15 +408,18 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
             category="vlm" if is_vlm else "chat",
             architecture=arch,
             loader_family="transformers",
-            tool_parser_family="qwen" if "qwen" in model_type or "qwen" in low_arch else "generic_json",
+            adapter_family=adapter_family,
+            tool_parser_family=parser_family,
             modalities=["text", "image"] if is_vlm else ["text"],
             tool_template_compatible=tool_compat,
             tool_template_reason=tool_reason,
-            validation_status="compatible" if shards_ok else "unsupported",
-            validation_reason="Valid Hugging Face config.json" if shards_ok else shards_msg,
+            structurally_valid=weights_ok,
+            runtime_compatible=runtime_ok,
+            validation_status="compatible" if usable else "unsupported",
+            validation_reason=reason,
             context_window=int(ctx_len) if isinstance(ctx_len, int) and ctx_len > 0 else 32768,
             max_output_tokens=4096,
-            is_chat_model=shards_ok,
+            is_chat_model=usable,
             is_image_model=False,
             reasoning=reasoning,
         )
@@ -350,6 +436,7 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
             category="other",
             architecture="gguf",
             loader_family="ollama",
+            adapter_family="unsupported",
             validation_status="unsupported",
             validation_reason="GGUF requires optional Ollama backend",
         )
@@ -360,6 +447,7 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
         source_path=str(model_dir),
         source_type="unknown",
         category="other",
+        adapter_family="unsupported",
         validation_status="unsupported",
         validation_reason="Missing config.json, model_index.json, or .gguf artifacts",
     )

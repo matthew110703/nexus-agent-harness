@@ -1,4 +1,4 @@
-"""Model-specific native tool-call streaming parsers and schema validators."""
+"""Model-specific native tool-call streaming parsers and recursive JSON schema validators."""
 
 from __future__ import annotations
 
@@ -11,6 +11,12 @@ from typing import Any, Optional, Protocol
 OPEN_TAG = "<tool_call>"
 CLOSE_TAG = "</tool_call>"
 CONTROL_TOKEN_RE = re.compile(r"<\|(?:im_end|im_start|endoftext)\|>")
+IMPLEMENTED_PARSER_FAMILIES = frozenset({"qwen"})
+
+
+def has_native_tool_parser(family: str) -> bool:
+    """True only when a real native tool-call parser is implemented for `family`."""
+    return family in IMPLEMENTED_PARSER_FAMILIES
 
 
 @dataclass
@@ -30,6 +36,7 @@ class ParsedToolCall:
 @dataclass
 class ToolParseResult:
     text: str = ""
+    trailing_text: str = ""
     tool_calls: list[ParsedToolCall] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -93,6 +100,7 @@ class QwenToolCallStreamParser:
         return "".join(emitted)
 
     def finish(self, advertised_tools: list[dict[str, Any]], tool_choice: Any = "auto") -> ToolParseResult:
+        trailing = ""
         if self._in_call:
             self._errors.append("Unterminated <tool_call> block")
             self._in_call = False
@@ -102,10 +110,11 @@ class QwenToolCallStreamParser:
             visible = CONTROL_TOKEN_RE.sub("", self._buffer)
             if visible:
                 self._text_parts.append(visible)
+                trailing = visible
             self._buffer = ""
 
         if tool_choice == "none":
-            return ToolParseResult(text="".join(self._text_parts).strip(), tool_calls=[], errors=[])
+            return ToolParseResult(text="".join(self._text_parts).strip(), trailing_text=trailing, tool_calls=[], errors=[])
 
         schema_by_name = _index_tool_schemas(advertised_tools)
         valid_calls: list[ParsedToolCall] = []
@@ -138,7 +147,12 @@ class QwenToolCallStreamParser:
                 errors.append(f"Invalid arguments for tool {name!r}: {err}")
                 continue
             valid_calls.append(ParsedToolCall(id=f"call_{uuid.uuid4().hex[:12]}", name=name, arguments=arguments))
-        return ToolParseResult(text="".join(self._text_parts).strip(), tool_calls=valid_calls, errors=errors)
+        return ToolParseResult(
+            text="".join(self._text_parts).strip(),
+            trailing_text=trailing,
+            tool_calls=valid_calls,
+            errors=errors,
+        )
 
 
 class PlainTextOnlyParser:
@@ -154,7 +168,7 @@ class PlainTextOnlyParser:
         return clean
 
     def finish(self, advertised_tools: list[dict[str, Any]], tool_choice: Any = "auto") -> ToolParseResult:
-        return ToolParseResult(text="".join(self._parts).strip(), tool_calls=[], errors=[])
+        return ToolParseResult(text="".join(self._parts).strip(), trailing_text="", tool_calls=[], errors=[])
 
 
 def create_tool_parser(family: str) -> ToolCallStreamParser:
@@ -198,23 +212,41 @@ def _check_json_type(value: Any, expected: str) -> bool:
     return True
 
 
-def validate_tool_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> Optional[str]:
-    for key in schema.get("required") or []:
-        if key not in arguments:
-            return f"missing required field '{key}'"
-    properties = schema.get("properties") or {}
-    additional = schema.get("additionalProperties", True)
-    for key, value in arguments.items():
-        if key not in properties:
-            if additional is False:
-                return f"unexpected additional property '{key}'"
-            continue
-        prop = properties[key]
-        if not isinstance(prop, dict):
-            continue
-        expected_type = prop.get("type")
-        if isinstance(expected_type, str) and not _check_json_type(value, expected_type):
-            return f"field '{key}' expected type '{expected_type}'"
-        if "enum" in prop and value not in prop["enum"]:
-            return f"field '{key}' value {value!r} not in enum {prop['enum']!r}"
+def _validate_node(value: Any, schema: dict[str, Any], path: str) -> Optional[str]:
+    if not isinstance(schema, dict):
+        return None
+    expected_type = schema.get("type")
+    if isinstance(expected_type, str) and not _check_json_type(value, expected_type):
+        return f"field '{path}' expected type '{expected_type}'"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"field '{path}' value {value!r} not in enum {schema['enum']!r}"
+
+    if isinstance(value, dict):
+        for req_key in schema.get("required") or []:
+            if req_key not in value:
+                sub = f"{path}.{req_key}" if path else str(req_key)
+                return f"missing required field '{sub}'"
+        properties = schema.get("properties") or {}
+        additional = schema.get("additionalProperties", True)
+        for key, item_val in value.items():
+            sub = f"{path}.{key}" if path else str(key)
+            if key not in properties:
+                if additional is False:
+                    return f"unexpected additional property '{sub}'"
+                continue
+            err = _validate_node(item_val, properties[key], sub)
+            if err is not None:
+                return err
+
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for idx, elem in enumerate(value):
+            err = _validate_node(elem, schema["items"], f"{path}[{idx}]")
+            if err is not None:
+                return err
+
     return None
+
+
+def validate_tool_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> Optional[str]:
+    """Recursively validate tool arguments against JSON Schema (nested objects, arrays, enums, required)."""
+    return _validate_node(arguments, schema, "")

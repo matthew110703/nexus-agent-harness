@@ -16,6 +16,7 @@ class WorkerLoadRequest:
     model_path: str
     architecture: str = "unknown"
     loader_family: str = "transformers"
+    adapter_family: str = "transformers_causal"
     precision: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,6 +44,7 @@ class WorkerGenerateRequest:
 class WorkerImageRequest:
     model_id: str
     prompt: str
+    operation_id: str = ""
     quality: ImageQualityProfile = "detailed"
     width: Optional[int] = None
     height: Optional[int] = None

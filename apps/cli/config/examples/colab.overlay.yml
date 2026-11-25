@@ -41,6 +41,9 @@
           supportsDeveloperRole: false
           maxTokensField: max_tokens
 
+- id: nexus-runtime-ui
+  disabled: false
+
 - insert:
     - id: nexus-host
       name: '@deepseek-ai/dsh-nexus-host'

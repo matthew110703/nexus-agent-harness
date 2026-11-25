@@ -63,7 +63,7 @@ class FakeWorkerManager:
         for i in range(0, len(self.next_text), 7):
             yield self.next_text[i : i + 7]
 
-    def generate_image(self, req: WorkerImageRequest, *, timeout: float = 900.0) -> dict[str, Any]:
+    def generate_image(self, req: WorkerImageRequest, *, on_progress: Any = None, timeout: float = 900.0) -> dict[str, Any]:
         png = base64.b64encode(b"\x89PNG\r\n\x1a\nFAKE").decode("ascii")
         return {
             "model": req.model_id,
@@ -95,10 +95,13 @@ def _build_fixture_env(tmp_path: Path) -> tuple[TestClient, FakeWorkerManager, s
     (qwen / "tokenizer_config.json").write_text(
         json.dumps({"chat_template": "{% if tools %}<tool_call>{% endif %}{% if enable_thinking %}<think>{% endif %}"})
     )
+    (qwen / "model.safetensors").write_bytes(b"weights")
 
     flux = models_root / "FLUX.2-klein-9B"
     flux.mkdir(parents=True)
-    (flux / "model_index.json").write_text(json.dumps({"_class_name": "Flux2KleinPipeline"}))
+    (flux / "model_index.json").write_text(json.dumps({"_class_name": "Flux2KleinPipeline", "vae": ["diffusers", "AutoencoderKL"]}))
+    (flux / "vae").mkdir()
+    (flux / "vae" / "config.json").write_text("{}")
 
     # Non-chat video & text-encoder checkpoints must never leak into /v1/models
     for non_chat, cfg_body in [
@@ -167,7 +170,8 @@ def test_gateway_auth_models_reasoning_and_plugin_index(tmp_path: Path) -> None:
     idx = client.get("/v1/plugin-index.json")
     assert idx.status_code == 200
     assert idx.json()["format"] == 1
-    assert len(idx.json()["plugins"]) >= 1
+    assert isinstance(idx.json()["plugins"], list)
+    assert all(p.get("name") != "@deepseek-ai/dsh-nexus-host" for p in idx.json()["plugins"])
 
 
 def test_chat_completions_streaming_and_non_streaming_tool_calls(tmp_path: Path) -> None:

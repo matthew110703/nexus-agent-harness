@@ -8,6 +8,26 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 
+def select_torch_dtype(torch_mod: Any, precision: Optional[str] = None) -> Any:
+    """
+    Select a hardware-supported dtype without silently picking float16 on CPU.
+    - CPU: float32 by default (bf16 only if explicitly requested and supported).
+    - CUDA: bf16 when supported, otherwise float16 (or explicit override).
+    """
+    cuda = bool(torch_mod.cuda.is_available())
+    if not cuda:
+        if precision == "bf16":
+            return torch_mod.bfloat16
+        return torch_mod.float32
+    if precision == "fp32":
+        return torch_mod.float32
+    if precision == "fp16":
+        return torch_mod.float16
+    if precision == "bf16" or bool(getattr(torch_mod.cuda, "is_bf16_supported", lambda: False)()):
+        return torch_mod.bfloat16
+    return torch_mod.float16
+
+
 class TransformersChatAdapter:
     """Explicit-precision Hugging Face Transformers chat adapter."""
 
@@ -22,7 +42,7 @@ class TransformersChatAdapter:
         import torch  # type: ignore[import-not-found]
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
 
-        dtype = torch.bfloat16 if (precision == "bf16" or (precision is None and torch.cuda.is_available() and torch.cuda.is_bf16_supported())) else torch.float16
+        dtype = select_torch_dtype(torch, precision)
         self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path), local_files_only=True, trust_remote_code=False)
         self.model = AutoModelForCausalLM.from_pretrained(
             str(self.model_path),
@@ -33,17 +53,29 @@ class TransformersChatAdapter:
         )
         self.model.eval()
 
-    def _apply_template(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], enable_thinking: Optional[bool]) -> str:
+    def _apply_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        enable_thinking: Optional[bool],
+        reasoning_effort: Optional[str] = None,
+    ) -> str:
         kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
         if tools:
             kwargs["tools"] = tools
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         try:
             return str(self.tokenizer.apply_chat_template(messages, **kwargs))
         except TypeError:
-            kwargs.pop("enable_thinking", None)
-            return str(self.tokenizer.apply_chat_template(messages, **kwargs))
+            kwargs.pop("reasoning_effort", None)
+            try:
+                return str(self.tokenizer.apply_chat_template(messages, **kwargs))
+            except TypeError:
+                kwargs.pop("enable_thinking", None)
+                return str(self.tokenizer.apply_chat_template(messages, **kwargs))
 
     def generate_stream(self, req: dict[str, Any]) -> Iterator[str]:
         import torch  # type: ignore[import-not-found]
@@ -55,7 +87,8 @@ class TransformersChatAdapter:
         messages = req.get("messages") or []
         tools = req.get("tools") or []
         enable_thinking = req.get("enable_thinking")
-        prompt = self._apply_template(messages, tools, enable_thinking)
+        reasoning_effort = req.get("reasoning_effort")
+        prompt = self._apply_template(messages, tools, enable_thinking, reasoning_effort)
         inputs = self.tokenizer(prompt, return_tensors="pt")
         device = next(self.model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}

@@ -1,15 +1,16 @@
 /**
  * Nexus Host plugin: registers the `nexus_generate_image` tool (backed by
- * `ctx.attachments.saveImage`) and the authenticated same-origin
- * `/api/nexus.runtime-progress` proxy to the loopback Nexus gateway.
+ * `ctx.attachments.saveImage`), profile-level image-model persistence, and
+ * authenticated same-origin Host proxies to the loopback Nexus gateway.
  * @module @deepseek-ai/dsh-nexus-host
  */
 
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import type {} from '@deepseek-ai/dsh-host-webserver'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
@@ -20,8 +21,9 @@ export const inject = ['tools', 'attachments', 'connection']
 
 /** Maximum image response size accepted from the loopback Nexus gateway (24 MiB). */
 const MAX_IMAGE_RESPONSE_BYTES = 24 * 1024 * 1024
-/** Maximum progress snapshot size relayed to the browser (256 KiB). */
-const MAX_PROGRESS_RESPONSE_BYTES = 256 * 1024
+/** Maximum JSON proxy snapshot size relayed to the browser (256 KiB). */
+const MAX_PROXY_RESPONSE_BYTES = 256 * 1024
+const IMAGE_SELECTION_FILENAME = 'nexus-image-selection.json'
 
 /** Validated configuration for the Nexus Host plugin. */
 export interface Config {
@@ -31,7 +33,7 @@ export interface Config {
   apiKeyEnv: string
   /** Timeout in milliseconds for image generation calls. */
   imageTimeoutMs: number
-  /** Timeout in milliseconds for runtime progress proxy calls. */
+  /** Timeout in milliseconds for runtime/progress proxy calls. */
   progressTimeoutMs: number
 }
 
@@ -39,7 +41,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   gatewayUrl: z.string().default('http://127.0.0.1:7861'),
   apiKeyEnv: z.string().default('NEXUS_API_KEY'),
-  imageTimeoutMs: z.natural().min(1000).default(300_000),
+  imageTimeoutMs: z.natural().min(1000).default(900_000),
   progressTimeoutMs: z.natural().min(500).default(5000),
 })
 
@@ -54,6 +56,44 @@ export function assertLoopbackGatewayUrl(rawUrl: string): URL {
     throw new Error(`Nexus gateway URL must be loopback-only, got ${parsed.hostname}`)
   }
   return parsed
+}
+
+interface ImageSelectionRecord {
+  selectedModelId: string | null
+  updatedAt: string
+}
+
+/** Resolve the profile-level persistence file path (profileDir -> DSH_HOME -> cwd). */
+export function resolveImageSelectionPath(ctx: Context): string {
+  const profileCtx = ctx.get('profileContext') as { readonly profileDir?: string } | undefined
+  const baseDir = profileCtx?.profileDir || process.env.DSH_HOME || process.cwd()
+  return join(baseDir, IMAGE_SELECTION_FILENAME)
+}
+
+/** Read the persisted profile-level selected image model ID, or null when unset. */
+export function readSelectedImageModel(selectionPath: string): string | null {
+  try {
+    const raw = readFileSync(selectionPath, 'utf8')
+    const parsed = JSON.parse(raw) as Partial<ImageSelectionRecord>
+    return typeof parsed.selectedModelId === 'string' && parsed.selectedModelId.trim().length > 0
+      ? parsed.selectedModelId.trim()
+      : null
+  } catch {
+    return null
+  }
+}
+
+/** Atomically persist the profile-level selected image model ID. */
+export function writeSelectedImageModel(selectionPath: string, modelId: string | null): void {
+  const dir = dirname(selectionPath)
+  mkdirSync(dir, { recursive: true })
+  const record: ImageSelectionRecord = {
+    selectedModelId: modelId,
+    updatedAt: new Date().toISOString(),
+  }
+  const tmpPath = `${selectionPath}.${process.pid}.tmp`
+  writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+  renameSync(tmpPath, selectionPath)
 }
 
 interface GatewayImagePayload {
@@ -71,25 +111,36 @@ interface GatewayImagePayload {
   b64_png?: string
 }
 
+function isImageAttachmentRef(value: unknown): value is ImageAttachmentRef {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const rec = value as Record<string, unknown>
+  return typeof rec.attachmentId === 'string'
+    && typeof rec.mediaType === 'string'
+    && typeof rec.bytes === 'number'
+    && typeof rec.width === 'number'
+    && typeof rec.height === 'number'
+}
+
 /**
  * Create the `nexus_generate_image` tool definition bound to the Host's
- * attachment store and loopback Nexus gateway.
+ * attachment store, profile-persisted image model selection, and loopback gateway.
  */
 export function createNexusGenerateImageTool(
   ctx: Context,
   config: Config,
   fetchImpl: typeof fetch = fetch,
+  selectionPath: string = resolveImageSelectionPath(ctx),
 ): ToolDefinition {
   const baseUrl = assertLoopbackGatewayUrl(config.gatewayUrl)
 
   return defineTool({
     name: 'nexus_generate_image',
     description:
-      'Generate an image using a local Nexus Diffusers (FLUX.2) pipeline independent of the active chat model '
+      'Generate 1 image using the selected local Nexus Diffusers (FLUX.2) pipeline independent of the active chat model '
       + 'and attach it durably to the conversation while saving a PNG master copy to Google Drive.',
     parameters: {
       prompt: { type: 'string', description: 'Text prompt describing the image to generate.', required: true },
-      model: { type: 'string', description: 'Optional Nexus image model ID from /v1/image-models.' },
+      model: { type: 'string', description: 'Optional per-call image model override; defaults to the profile-selected image model.' },
       quality: {
         type: 'string',
         enum: ['normal', 'detailed', 'maximum'],
@@ -151,6 +202,14 @@ export function createNexusGenerateImageTool(
       if (!apiKey) {
         throw new Error(`Missing Nexus gateway bearer token in env var ${config.apiKeyEnv}`)
       }
+      const chosenModel = (typeof args.model === 'string' && args.model.trim().length > 0)
+        ? args.model.trim()
+        : readSelectedImageModel(selectionPath)
+      if (!chosenModel) {
+        throw new Error(
+          'No image model selected. Choose an image model in the Nexus runtime selector or pass the model argument explicitly.',
+        )
+      }
       const endpoint = new URL('/v1/images/generations', baseUrl)
       const timeoutSignal = AbortSignal.timeout(config.imageTimeoutMs)
       const signal = AbortSignal.any([exec.signal, timeoutSignal])
@@ -162,12 +221,13 @@ export function createNexusGenerateImageTool(
         },
         body: JSON.stringify({
           prompt: args.prompt,
-          model: args.model,
+          model: chosenModel,
           quality: args.quality,
           width: args.width,
           height: args.height,
           steps: args.steps,
           seed: args.seed,
+          num_images: 1,
         }),
         signal,
       })
@@ -199,7 +259,7 @@ export function createNexusGenerateImageTool(
       }
       return {
         attachmentId: String(ref.attachmentId),
-        model: payload.model ?? args.model ?? 'flux',
+        model: payload.model ?? chosenModel,
         quality: payload.quality ?? args.quality ?? 'detailed',
         filename: payload.filename,
         width: payload.width ?? ref.width,
@@ -213,91 +273,36 @@ export function createNexusGenerateImageTool(
   })
 }
 
-function isImageAttachmentRef(value: unknown): value is ImageAttachmentRef {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
-  const rec = value as Record<string, unknown>
-  return typeof rec.attachmentId === 'string'
-    && typeof rec.mediaType === 'string'
-    && typeof rec.bytes === 'number'
-    && typeof rec.width === 'number'
-    && typeof rec.height === 'number'
+async function fetchGatewayJson(
+  config: Config,
+  baseUrl: URL,
+  upstreamPath: string,
+  method: 'GET' | 'POST',
+  signal: AbortSignal,
+  body?: unknown,
+): Promise<{ status: number; body: string }> {
+  const apiKey = process.env[config.apiKeyEnv] ?? ''
+  if (!apiKey) {
+    return { status: 503, body: JSON.stringify({ error: 'Nexus gateway token not configured on Host' }) }
+  }
+  const endpoint = new URL(upstreamPath, baseUrl)
+  const upstream = await fetch(endpoint, {
+    method,
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal,
+  })
+  const text = await upstream.text()
+  if (text.length > MAX_PROXY_RESPONSE_BYTES) {
+    return { status: 502, body: JSON.stringify({ error: 'Upstream payload too large' }) }
+  }
+  return { status: upstream.status, body: text }
 }
 
-/** Compact expandable client-side progress & resource pill injected when webServer is active. */
-const COMPACT_PROGRESS_PILL_SCRIPT = `(function(){
-  if (globalThis.__NEXUS_PROGRESS_PILL__) return;
-  globalThis.__NEXUS_PROGRESS_PILL__ = true;
-  var root = document.createElement('div');
-  root.id = 'nexus-runtime-pill';
-  root.style.cssText = 'position:fixed;bottom:14px;right:14px;z-index:9999;font:12px/1.4 system-ui,sans-serif;color:#e5e7eb;';
-  var btn = document.createElement('button');
-  btn.type = 'button';
-  btn.textContent = 'Nexus · Idle';
-  btn.style.cssText = 'background:#18181b;border:1px solid #3f3f46;color:#e5e7eb;border-radius:999px;padding:5px 12px;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.35);';
-  var panel = document.createElement('div');
-  panel.style.cssText = 'display:none;margin-bottom:6px;background:#18181b;border:1px solid #3f3f46;border-radius:10px;padding:10px 12px;width:300px;box-shadow:0 8px 24px rgba(0,0,0,.45);white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
-  var expanded = false;
-  btn.onclick = function(){
-    expanded = !expanded;
-    panel.style.display = expanded ? 'block' : 'none';
-    if (expanded) poll();
-  };
-  root.appendChild(panel);
-  root.appendChild(btn);
-  function mount(){ if (document.body && !root.parentNode) document.body.appendChild(root); }
-  document.addEventListener('DOMContentLoaded', mount);
-  mount();
-  function fmtGiB(b){ return typeof b === 'number' && b > 0 ? (b / (1024*1024*1024)).toFixed(1) + ' GiB' : '0 GiB'; }
-  async function poll(){
-    if (document.hidden) return;
-    try {
-      var r = await fetch('/api/nexus.runtime-progress', { credentials: 'same-origin' });
-      if (!r.ok) return;
-      var d = await r.json();
-      var ops = Array.isArray(d.operations) ? d.operations : [];
-      var active = ops.slice().reverse().find(function(o){ return o && (o.status === 'running' || o.status === 'queued'); });
-      var worker = d.worker || {};
-      if (active) {
-        var pct = active.indeterminate ? '' : (' — ' + Math.round(active.progress || 0) + '%');
-        btn.textContent = (active.phase || active.kind) + ' ' + (active.model || '') + pct;
-      } else if (worker.active_model_id) {
-        btn.textContent = 'Nexus · ' + worker.active_model_id;
-      } else {
-        btn.textContent = 'Nexus · Ready';
-      }
-      if (!expanded) return;
-      var lines = [];
-      lines.push('Worker: ' + (worker.alive ? ('PID ' + worker.pid) : 'Idle (on-demand)'));
-      lines.push('Active: ' + (worker.active_model_id || 'None') + (worker.active_kind ? (' (' + worker.active_kind + ')') : ''));
-      if (worker.cuda_allocated_bytes) lines.push('VRAM Alloc: ' + fmtGiB(worker.cuda_allocated_bytes));
-      if (active) {
-        lines.push('---');
-        lines.push('Op: ' + (active.operation_id || ''));
-        lines.push('Stage: ' + (active.phase || '') + ' (' + (active.status || '') + ')');
-        if (active.total_bytes) lines.push('Bytes: ' + fmtGiB(active.bytes_copied) + ' / ' + fmtGiB(active.total_bytes));
-        if (active.steps_total) lines.push('Steps: ' + active.step + ' / ' + active.steps_total);
-        if (active.message) lines.push('Status: ' + active.message);
-        if (active.error) lines.push('Error: ' + active.error);
-      }
-      try {
-        var rt = await fetch('/api/nexus.runtime', { credentials: 'same-origin' });
-        if (rt.ok) {
-          var rd = await rt.json();
-          var hw = rd.hardware || {};
-          if (hw.gpus && hw.gpus.length) {
-            lines.push('---');
-            lines.push('GPU: ' + hw.gpus[0].name + ' (' + fmtGiB(hw.free_vram_bytes) + ' free / ' + fmtGiB(hw.total_vram_bytes) + ')');
-          }
-        }
-      } catch (_) {}
-      panel.textContent = lines.join('\\n');
-    } catch (_) {}
-  }
-  setInterval(poll, 3000);
-  poll();
-})();`
-
-function registerGatewayProxy(
+function registerGatewayGetProxy(
   ctx: Context,
   config: Config,
   baseUrl: URL,
@@ -309,30 +314,11 @@ function registerGatewayProxy(
     methods: ['GET'],
     requestBody: 'buffered',
     async fetch(request) {
-      const apiKey = process.env[config.apiKeyEnv] ?? ''
-      if (!apiKey) {
-        return new Response(
-          JSON.stringify({ error: 'Nexus gateway token not configured on Host' }),
-          { status: 503, headers: { 'content-type': 'application/json' } },
-        )
-      }
-      const endpoint = new URL(upstreamPath, baseUrl)
       const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
       try {
-        const upstream = await fetch(endpoint, {
-          method: 'GET',
-          headers: { authorization: `Bearer ${apiKey}` },
-          signal,
-        })
-        const body = await upstream.text()
-        if (body.length > MAX_PROGRESS_RESPONSE_BYTES) {
-          return new Response(
-            JSON.stringify({ error: 'Upstream payload too large' }),
-            { status: 502, headers: { 'content-type': 'application/json' } },
-          )
-        }
-        return new Response(body, {
-          status: upstream.status,
+        const res = await fetchGatewayJson(config, baseUrl, upstreamPath, 'GET', signal)
+        return new Response(res.body, {
+          status: res.status,
           headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
         })
       } catch {
@@ -346,30 +332,140 @@ function registerGatewayProxy(
 }
 
 /**
- * Register the `nexus_generate_image` tool and same-origin Host proxies
- * for runtime progress, hardware/worker status, and independent image models.
+ * Register the `nexus_generate_image` tool and authenticated same-origin Host
+ * endpoints for progress, runtime status, load/unload, and profile image selection.
  */
 export function apply(ctx: Context, config: Config): void {
   const baseUrl = assertLoopbackGatewayUrl(config.gatewayUrl)
+  const selectionPath = resolveImageSelectionPath(ctx)
 
-  const tool = createNexusGenerateImageTool(ctx, config)
+  const tool = createNexusGenerateImageTool(ctx, config, fetch, selectionPath)
   ctx.effect(() => ctx.tools.register(tool), 'nexus-host: nexus_generate_image tool')
 
   ctx.effect(
-    () => registerGatewayProxy(ctx, config, baseUrl, '/api/nexus.runtime-progress', '/v1/progress'),
+    () => registerGatewayGetProxy(ctx, config, baseUrl, '/api/nexus.runtime-progress', '/v1/progress'),
     'nexus-host: /api/nexus.runtime-progress proxy',
   )
   ctx.effect(
-    () => registerGatewayProxy(ctx, config, baseUrl, '/api/nexus.runtime', '/v1/runtime'),
+    () => registerGatewayGetProxy(ctx, config, baseUrl, '/api/nexus.runtime', '/v1/runtime'),
     'nexus-host: /api/nexus.runtime proxy',
   )
+
+  // GET /api/nexus.image-models: combines live Gateway image catalog with profile selection.
   ctx.effect(
-    () => registerGatewayProxy(ctx, config, baseUrl, '/api/nexus.image-models', '/v1/image-models'),
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/nexus.image-models',
+        methods: ['GET'],
+        requestBody: 'buffered',
+        async fetch(request) {
+          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
+          try {
+            const res = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal)
+            if (res.status !== 200) {
+              return new Response(res.body, { status: res.status, headers: { 'content-type': 'application/json' } })
+            }
+            const parsed = JSON.parse(res.body) as { data?: Array<{ id: string }>; quality_profiles?: string[] }
+            const selectedModelId = readSelectedImageModel(selectionPath)
+            return new Response(
+              JSON.stringify({
+                models: parsed.data ?? [],
+                qualityProfiles: parsed.quality_profiles ?? ['normal', 'detailed', 'maximum'],
+                selectedModelId,
+              }),
+              { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } },
+            )
+          } catch {
+            return new Response(
+              JSON.stringify({ error: 'Nexus gateway unavailable' }),
+              { status: 502, headers: { 'content-type': 'application/json' } },
+            )
+          }
+        },
+      }),
     'nexus-host: /api/nexus.image-models proxy',
   )
-  ctx.inject(['webServer'], (webCtx) => {
-    webCtx.on('webserver/index-inject', (table) => {
-      table.push({ kind: 'script', placement: 'head', text: COMPACT_PROGRESS_PILL_SCRIPT })
-    })
-  })
+
+  // POST /api/nexus.image-model: validates modelId against live Gateway catalog and persists to profile.
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/nexus.image-model',
+        methods: ['POST'],
+        requestBody: 'buffered',
+        async fetch(request) {
+          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
+          let body: { modelId?: string | null }
+          try {
+            body = JSON.parse(await request.text()) as { modelId?: string | null }
+          } catch {
+            return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'content-type': 'application/json' } })
+          }
+          const rawId = body.modelId
+          if (rawId === null || rawId === '') {
+            writeSelectedImageModel(selectionPath, null)
+            return new Response(JSON.stringify({ selectedModelId: null }), { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (typeof rawId !== 'string') {
+            return new Response(JSON.stringify({ error: 'modelId must be a string or null' }), { status: 400, headers: { 'content-type': 'application/json' } })
+          }
+          const catalogRes = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal)
+          if (catalogRes.status !== 200) {
+            return new Response(catalogRes.body, { status: catalogRes.status, headers: { 'content-type': 'application/json' } })
+          }
+          const parsed = JSON.parse(catalogRes.body) as { data?: Array<{ id: string }> }
+          const valid = (parsed.data ?? []).some(m => m.id === rawId)
+          if (!valid) {
+            return new Response(
+              JSON.stringify({ error: `Image model "${rawId}" is not available in the Nexus catalog` }),
+              { status: 400, headers: { 'content-type': 'application/json' } },
+            )
+          }
+          writeSelectedImageModel(selectionPath, rawId)
+          return new Response(JSON.stringify({ selectedModelId: rawId }), { status: 200, headers: { 'content-type': 'application/json' } })
+        },
+      }),
+    'nexus-host: /api/nexus.image-model endpoint',
+  )
+
+  // POST /api/nexus.runtime-load & /api/nexus.runtime-unload
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/nexus.runtime-load',
+        methods: ['POST'],
+        requestBody: 'buffered',
+        async fetch(request) {
+          let body: { model?: string; kind?: 'chat' | 'diffusion' }
+          try {
+            body = JSON.parse(await request.text()) as { model?: string; kind?: 'chat' | 'diffusion' }
+          } catch {
+            return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'content-type': 'application/json' } })
+          }
+          if (typeof body.model !== 'string' || body.model.trim().length === 0) {
+            return new Response(JSON.stringify({ error: 'model is required' }), { status: 400, headers: { 'content-type': 'application/json' } })
+          }
+          const kind = body.kind === 'diffusion' ? 'diffusion' : 'chat'
+          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.imageTimeoutMs)])
+          const res = await fetchGatewayJson(config, baseUrl, '/v1/runtime/load', 'POST', signal, { model: body.model.trim(), kind })
+          return new Response(res.body, { status: res.status, headers: { 'content-type': 'application/json' } })
+        },
+      }),
+    'nexus-host: /api/nexus.runtime-load proxy',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
+        path: '/api/nexus.runtime-unload',
+        methods: ['POST'],
+        requestBody: 'buffered',
+        async fetch(request) {
+          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)])
+          const res = await fetchGatewayJson(config, baseUrl, '/v1/runtime/unload', 'POST', signal, {})
+          return new Response(res.body, { status: res.status, headers: { 'content-type': 'application/json' } })
+        },
+      }),
+    'nexus-host: /api/nexus.runtime-unload proxy',
+  )
 }

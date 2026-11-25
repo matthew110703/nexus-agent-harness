@@ -4,7 +4,7 @@
     "en": "Nexus Curated Plugins"
   },
   "description": {
-    "en": "First-party native Nexus and Harness plugin bundles verified for Google Colab runtimes (no MCP required)."
+    "en": "Curated Nexus plugin index for Google Colab. Core monorepo workspace packages (such as @deepseek-ai/dsh-nexus-host) are preinstalled in the Colab overlay and omitted here until packaged as independently installable dsh.bundle releases."
   },
   "metadata": {
     "categories": {
@@ -19,98 +19,5 @@
     },
     "sortKeys": {}
   },
-  "plugins": [
-    {
-      "name": "@deepseek-ai/dsh-nexus-host",
-      "title": { "en": "Nexus Host & Image Generation" },
-      "description": { "en": "Native Nexus image generation tool (independent Diffusers/FLUX.2 selection and quality profiles) plus authenticated runtime and progress proxies." },
-      "author": "Nexus",
-      "metadata": {
-        "category": "creative",
-        "labels": ["colab", "native"],
-        "keywords": ["nexus", "flux", "diffusers", "image-generation", "progress"]
-      },
-      "versions": [
-        {
-          "version": "1.0.0",
-          "publishTimestamp": 1795550000,
-          "source": {
-            "type": "git",
-            "url": "https://github.com/matthew110703/nexus-agent-harness.git",
-            "commit": "ac3b564d5ee456e3c056e502a989fd9aebb889cc",
-            "path": "packages/experimental/nexus-host"
-          }
-        }
-      ]
-    },
-    {
-      "name": "@deepseek-ai/dsh-experimental-terminal-bundle",
-      "title": { "en": "Persistent Terminal Bundle" },
-      "description": { "en": "Sandboxed persistent terminal and interactive shell panel for Colab development workflows." },
-      "author": "Nexus",
-      "metadata": {
-        "category": "development",
-        "labels": ["colab", "native"],
-        "keywords": ["terminal", "shell", "development"]
-      },
-      "versions": [
-        {
-          "version": "1.0.0",
-          "publishTimestamp": 1795550000,
-          "source": {
-            "type": "git",
-            "url": "https://github.com/matthew110703/nexus-agent-harness.git",
-            "commit": "ac3b564d5ee456e3c056e502a989fd9aebb889cc",
-            "path": "packages/experimental/terminal-bundle"
-          }
-        }
-      ]
-    },
-    {
-      "name": "@deepseek-ai/dsh-experimental-session-search",
-      "title": { "en": "Session Search & Knowledge Retrieval" },
-      "description": { "en": "Search previous Harness sessions and project context without duplicating session persistence." },
-      "author": "Nexus",
-      "metadata": {
-        "category": "research",
-        "labels": ["colab", "native"],
-        "keywords": ["search", "memory", "sessions", "research"]
-      },
-      "versions": [
-        {
-          "version": "1.0.0",
-          "publishTimestamp": 1795550000,
-          "source": {
-            "type": "git",
-            "url": "https://github.com/matthew110703/nexus-agent-harness.git",
-            "commit": "ac3b564d5ee456e3c056e502a989fd9aebb889cc",
-            "path": "packages/experimental/session-search"
-          }
-        }
-      ]
-    },
-    {
-      "name": "@deepseek-ai/dsh-experimental-voice-input-bundle",
-      "title": { "en": "Voice Input Bundle" },
-      "description": { "en": "Native speech-to-text voice input for the Harness Web UI." },
-      "author": "Nexus",
-      "metadata": {
-        "category": "utilities",
-        "labels": ["colab", "native"],
-        "keywords": ["voice", "speech", "audio"]
-      },
-      "versions": [
-        {
-          "version": "1.0.0",
-          "publishTimestamp": 1795550000,
-          "source": {
-            "type": "git",
-            "url": "https://github.com/matthew110703/nexus-agent-harness.git",
-            "commit": "ac3b564d5ee456e3c056e502a989fd9aebb889cc",
-            "path": "packages/experimental/voice-input-bundle"
-          }
-        }
-      ]
-    }
-  ]
+  "plugins": []
 }
