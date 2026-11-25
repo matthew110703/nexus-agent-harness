@@ -223,23 +223,31 @@ function isImageAttachmentRef(value: unknown): value is ImageAttachmentRef {
     && typeof rec.height === 'number'
 }
 
-/** Compact expandable client-side progress pill script injected when webServer is active. */
+/** Compact expandable client-side progress & resource pill injected when webServer is active. */
 const COMPACT_PROGRESS_PILL_SCRIPT = `(function(){
   if (globalThis.__NEXUS_PROGRESS_PILL__) return;
   globalThis.__NEXUS_PROGRESS_PILL__ = true;
   var root = document.createElement('div');
   root.id = 'nexus-runtime-pill';
-  root.style.cssText = 'position:fixed;bottom:14px;right:14px;z-index:9999;font:12px/1.35 system-ui,sans-serif;color:#e5e7eb;display:none;';
+  root.style.cssText = 'position:fixed;bottom:14px;right:14px;z-index:9999;font:12px/1.4 system-ui,sans-serif;color:#e5e7eb;';
   var btn = document.createElement('button');
   btn.type = 'button';
-  btn.style.cssText = 'background:#18181b;border:1px solid #3f3f46;color:#e5e7eb;border-radius:999px;padding:5px 11px;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.35);';
+  btn.textContent = 'Nexus · Idle';
+  btn.style.cssText = 'background:#18181b;border:1px solid #3f3f46;color:#e5e7eb;border-radius:999px;padding:5px 12px;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.35);';
   var panel = document.createElement('div');
-  panel.style.cssText = 'display:none;margin-bottom:6px;background:#18181b;border:1px solid #3f3f46;border-radius:10px;padding:10px 12px;width:290px;box-shadow:0 8px 24px rgba(0,0,0,.45);white-space:pre-wrap;';
-  btn.onclick = function(){ panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; };
+  panel.style.cssText = 'display:none;margin-bottom:6px;background:#18181b;border:1px solid #3f3f46;border-radius:10px;padding:10px 12px;width:300px;box-shadow:0 8px 24px rgba(0,0,0,.45);white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:11px;';
+  var expanded = false;
+  btn.onclick = function(){
+    expanded = !expanded;
+    panel.style.display = expanded ? 'block' : 'none';
+    if (expanded) poll();
+  };
   root.appendChild(panel);
   root.appendChild(btn);
-  document.addEventListener('DOMContentLoaded', function(){ document.body.appendChild(root); });
-  if (document.body) document.body.appendChild(root);
+  function mount(){ if (document.body && !root.parentNode) document.body.appendChild(root); }
+  document.addEventListener('DOMContentLoaded', mount);
+  mount();
+  function fmtGiB(b){ return typeof b === 'number' && b > 0 ? (b / (1024*1024*1024)).toFixed(1) + ' GiB' : '0 GiB'; }
   async function poll(){
     if (document.hidden) return;
     try {
@@ -248,21 +256,45 @@ const COMPACT_PROGRESS_PILL_SCRIPT = `(function(){
       var d = await r.json();
       var ops = Array.isArray(d.operations) ? d.operations : [];
       var active = ops.slice().reverse().find(function(o){ return o && (o.status === 'running' || o.status === 'queued'); });
-      if (!active) { root.style.display = 'none'; return; }
-      root.style.display = 'block';
-      var pct = active.indeterminate ? '' : (' — ' + Math.round(active.progress || 0) + '%');
-      btn.textContent = (active.phase || active.kind) + ' ' + (active.model || '') + pct;
-      panel.textContent =
-        'Operation: ' + (active.operation_id || '') + '\\n' +
-        'Model: ' + (active.model || '') + '\\n' +
-        'Stage: ' + (active.phase || '') + ' (' + (active.status || '') + ')\\n' +
-        (active.total_bytes ? ('Bytes: ' + active.bytes_copied + ' / ' + active.total_bytes + '\\n') : '') +
-        (active.steps_total ? ('Steps: ' + active.step + ' / ' + active.steps_total + '\\n') : '') +
-        (active.message ? ('Status: ' + active.message + '\\n') : '') +
-        (active.error ? ('Error: ' + active.error) : '');
+      var worker = d.worker || {};
+      if (active) {
+        var pct = active.indeterminate ? '' : (' — ' + Math.round(active.progress || 0) + '%');
+        btn.textContent = (active.phase || active.kind) + ' ' + (active.model || '') + pct;
+      } else if (worker.active_model_id) {
+        btn.textContent = 'Nexus · ' + worker.active_model_id;
+      } else {
+        btn.textContent = 'Nexus · Ready';
+      }
+      if (!expanded) return;
+      var lines = [];
+      lines.push('Worker: ' + (worker.alive ? ('PID ' + worker.pid) : 'Idle (on-demand)'));
+      lines.push('Active: ' + (worker.active_model_id || 'None') + (worker.active_kind ? (' (' + worker.active_kind + ')') : ''));
+      if (worker.cuda_allocated_bytes) lines.push('VRAM Alloc: ' + fmtGiB(worker.cuda_allocated_bytes));
+      if (active) {
+        lines.push('---');
+        lines.push('Op: ' + (active.operation_id || ''));
+        lines.push('Stage: ' + (active.phase || '') + ' (' + (active.status || '') + ')');
+        if (active.total_bytes) lines.push('Bytes: ' + fmtGiB(active.bytes_copied) + ' / ' + fmtGiB(active.total_bytes));
+        if (active.steps_total) lines.push('Steps: ' + active.step + ' / ' + active.steps_total);
+        if (active.message) lines.push('Status: ' + active.message);
+        if (active.error) lines.push('Error: ' + active.error);
+      }
+      try {
+        var rt = await fetch('/api/nexus.runtime', { credentials: 'same-origin' });
+        if (rt.ok) {
+          var rd = await rt.json();
+          var hw = rd.hardware || {};
+          if (hw.gpus && hw.gpus.length) {
+            lines.push('---');
+            lines.push('GPU: ' + hw.gpus[0].name + ' (' + fmtGiB(hw.free_vram_bytes) + ' free / ' + fmtGiB(hw.total_vram_bytes) + ')');
+          }
+        }
+      } catch (_) {}
+      panel.textContent = lines.join('\\n');
     } catch (_) {}
   }
   setInterval(poll, 3000);
+  poll();
 })();`
 
 function registerGatewayProxy(

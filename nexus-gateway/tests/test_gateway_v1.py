@@ -100,6 +100,16 @@ def _build_fixture_env(tmp_path: Path) -> tuple[TestClient, FakeWorkerManager, s
     flux.mkdir(parents=True)
     (flux / "model_index.json").write_text(json.dumps({"_class_name": "Flux2KleinPipeline"}))
 
+    # Non-chat video & text-encoder checkpoints must never leak into /v1/models
+    for non_chat, cfg_body in [
+        ("HunyuanVideo-1.5", {"model_type": "hunyuan_video"}),
+        ("Wan2.2-TI2V-5B", {"model_type": "wan"}),
+        ("byt5-small", {"model_type": "t5", "architectures": ["T5ForConditionalGeneration"]}),
+    ]:
+        d = models_root / non_chat
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(json.dumps(cfg_body))
+
     sidecar = tmp_path / "Nexus" / "colab-src" / "config" / "model-capabilities.json"
     sidecar.parent.mkdir(parents=True)
     sidecar.write_text(

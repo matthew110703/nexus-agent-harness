@@ -31,6 +31,27 @@ VLM_MODEL_TYPES = frozenset({
     "internvl_chat",
     "pixtral",
 })
+NON_CHAT_MODEL_TYPES = frozenset({
+    "t5",
+    "byt5",
+    "umt5",
+    "mt5",
+    "clip",
+    "clip_text_model",
+    "siglip",
+    "bert",
+    "roberta",
+    "autoencoder",
+    "vae",
+    "wan",
+    "hunyuan_video",
+    "hunyuanvideo",
+    "ltx_video",
+    "ltx",
+    "cogvideox",
+    "mochi",
+})
+VIDEO_OR_ENCODER_NAME_HINTS = ("hunyuanvideo", "wan2", "ltx-", "byt5", "umt5", "t5-v1", "video")
 
 
 @dataclass
@@ -268,6 +289,30 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
         model_type = str(config.get("model_type") or "unknown").lower()
         archs = config.get("architectures") or []
         arch = str(archs[0]) if isinstance(archs, list) and archs else model_type
+        low_id = model_id.lower()
+        low_arch = arch.lower()
+        is_non_chat = (
+            model_type in NON_CHAT_MODEL_TYPES
+            or any(hint in low_id for hint in VIDEO_OR_ENCODER_NAME_HINTS)
+            or any(tag in low_arch for tag in ("video", "t5encoder", "cliptext", "autoencoder", "vae", "transformer3d"))
+        )
+        if is_non_chat:
+            return DiscoveredModel(
+                id=model_id,
+                display_name=model_id,
+                source_path=str(hf_root),
+                source_type="hf_directory",
+                category="other",
+                architecture=arch,
+                loader_family="unsupported",
+                modalities=[],
+                tool_template_compatible="no",
+                validation_status="unsupported",
+                validation_reason=f"Non-chat video or encoder checkpoint ({model_type}/{arch})",
+                is_chat_model=False,
+                is_image_model=False,
+                reasoning=ReasoningCapability(status="unsupported", mode="none", source="non_chat", confidence="verified"),
+            )
         is_vlm = model_type in VLM_MODEL_TYPES or "vision_config" in config
         text_cfg = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
         ctx_len = config.get("max_position_embeddings") or text_cfg.get("max_position_embeddings")
@@ -280,7 +325,7 @@ def inspect_model_directory(model_dir: Path, override: Optional[dict[str, Any]] 
             category="vlm" if is_vlm else "chat",
             architecture=arch,
             loader_family="transformers",
-            tool_parser_family="qwen" if "qwen" in model_type or "qwen" in arch.lower() else "generic_json",
+            tool_parser_family="qwen" if "qwen" in model_type or "qwen" in low_arch else "generic_json",
             modalities=["text", "image"] if is_vlm else ["text"],
             tool_template_compatible=tool_compat,
             tool_template_reason=tool_reason,
