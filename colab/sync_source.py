@@ -54,15 +54,14 @@ EXPLICIT_FILE_MAP: dict[str, str] = {
     "supervisor/supervisor.mjs": "colab/supervisor.mjs",
     "scripts/sync_source.py": "colab/sync_source.py",
     "scripts/harness_home_snapshot.py": "colab/harness_home_snapshot.py",
+    "scripts/model_inventory.py": "colab/model_inventory.py",
+    "scripts/staging.py": "colab/staging.py",
     "config/colab.overlay.yml": "apps/cli/config/examples/colab.overlay.yml",
     "config/plugin-index.json": "colab/plugin-index.json",
-    "config/model-capabilities.example.json": "colab/model-capabilities.example.json",
 }
 
-# Drive-native runtime files consumed directly from Drive (never copied into apps/cli/config/examples/).
-DRIVE_NATIVE_FILES: dict[str, RestartTarget] = {
-    "config/model-capabilities.json": "gateway_api",
-}
+# Drive-native runtime files consumed directly from Drive.
+DRIVE_NATIVE_FILES: dict[str, RestartTarget] = {}
 
 IGNORED_NAMES: frozenset[str] = frozenset({
     "__pycache__",
@@ -119,7 +118,7 @@ def classify_restart_target(runtime_rel_path: str) -> RestartTarget:
     norm = runtime_rel_path.replace("\\", "/")
     if norm.endswith(("requirements.txt", "pyproject.toml", "package.json", "pnpm-lock.yaml")):
         return "dependencies"
-    if norm.startswith("nexus-gateway/src/workers/") or norm.startswith("nexus-gateway/src/adapters/"):
+    if norm.startswith(("nexus-gateway/src/workers/", "nexus-gateway/src/adapters/", "nexus-gateway/src/models/")):
         return "model_worker"
     if norm.startswith("nexus-gateway/") or norm == "colab/plugin-index.json":
         return "gateway_api"
@@ -690,9 +689,7 @@ def apply_sync(
                 report.errors.append(f"Python syntax error in {action.source_path}: {exc}")
         elif src.suffix == ".json":
             try:
-                parsed = json.loads(src.read_text(encoding="utf-8"))
-                if action.source_path == "config/model-capabilities.json":
-                    report.errors.extend(validate_capabilities_sidecar(parsed))
+                json.loads(src.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 report.errors.append(f"Invalid JSON in {action.source_path}: {exc}")
     if report.errors:

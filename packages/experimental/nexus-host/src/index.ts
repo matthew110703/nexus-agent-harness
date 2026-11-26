@@ -1,12 +1,12 @@
 /**
- * Nexus Host plugin: registers the `nexus_generate_image` tool (backed by
- * `ctx.attachments.saveImage`), profile-level image-model persistence, and
- * authenticated same-origin Host proxies to the loopback Nexus gateway.
+ * Nexus Host plugin (v1.1.0 — Single-Model Lock):
+ * Registers the `nexus_generate_image` tool (backed by `ctx.attachments.saveImage`)
+ * and read-only authenticated same-origin Host proxies for live Gateway runtime
+ * status and operation progress. Model selection, staging, and loading are owned
+ * exclusively by Colab bootstrap.
  * @module @deepseek-ai/dsh-nexus-host
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -23,7 +23,7 @@ export const inject = ['tools', 'attachments', 'connection']
 const MAX_IMAGE_RESPONSE_BYTES = 24 * 1024 * 1024
 /** Maximum JSON proxy snapshot size relayed to the browser (256 KiB). */
 const MAX_PROXY_RESPONSE_BYTES = 256 * 1024
-const IMAGE_SELECTION_FILENAME = 'nexus-image-selection.json'
+const OPERATION_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/
 
 /** Validated configuration for the Nexus Host plugin. */
 export interface Config {
@@ -58,44 +58,6 @@ export function assertLoopbackGatewayUrl(rawUrl: string): URL {
   return parsed
 }
 
-interface ImageSelectionRecord {
-  selectedModelId: string | null
-  updatedAt: string
-}
-
-/** Resolve the profile-level persistence file path (profileDir -> DSH_HOME -> cwd). */
-export function resolveImageSelectionPath(ctx: Context): string {
-  const profileCtx = ctx.get('profileContext') as { readonly profileDir?: string } | undefined
-  const baseDir = profileCtx?.profileDir || process.env.DSH_HOME || process.cwd()
-  return join(baseDir, IMAGE_SELECTION_FILENAME)
-}
-
-/** Read the persisted profile-level selected image model ID, or null when unset. */
-export function readSelectedImageModel(selectionPath: string): string | null {
-  try {
-    const raw = readFileSync(selectionPath, 'utf8')
-    const parsed = JSON.parse(raw) as Partial<ImageSelectionRecord>
-    return typeof parsed.selectedModelId === 'string' && parsed.selectedModelId.trim().length > 0
-      ? parsed.selectedModelId.trim()
-      : null
-  } catch {
-    return null
-  }
-}
-
-/** Atomically persist the profile-level selected image model ID. */
-export function writeSelectedImageModel(selectionPath: string, modelId: string | null): void {
-  const dir = dirname(selectionPath)
-  mkdirSync(dir, { recursive: true })
-  const record: ImageSelectionRecord = {
-    selectedModelId: modelId,
-    updatedAt: new Date().toISOString(),
-  }
-  const tmpPath = `${selectionPath}.${process.pid}.tmp`
-  writeFileSync(tmpPath, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
-  renameSync(tmpPath, selectionPath)
-}
-
 interface GatewayImagePayload {
   operation_id?: string
   artifact_id?: string
@@ -122,25 +84,23 @@ function isImageAttachmentRef(value: unknown): value is ImageAttachmentRef {
 }
 
 /**
- * Create the `nexus_generate_image` tool definition bound to the Host's
- * attachment store, profile-persisted image model selection, and loopback gateway.
+ * Create the `nexus_generate_image` tool bound to the single Colab-configured
+ * image model on the loopback Nexus gateway and the Host attachment store.
  */
 export function createNexusGenerateImageTool(
   ctx: Context,
   config: Config,
   fetchImpl: typeof fetch = fetch,
-  selectionPath: string = resolveImageSelectionPath(ctx),
 ): ToolDefinition {
   const baseUrl = assertLoopbackGatewayUrl(config.gatewayUrl)
 
   return defineTool({
     name: 'nexus_generate_image',
     description:
-      'Generate 1 image using the selected local Nexus Diffusers (FLUX.2) pipeline independent of the active chat model '
-      + 'and attach it durably to the conversation while saving a PNG master copy to Google Drive.',
+      'Generate 1 image using the Colab-selected local Nexus Diffusers pipeline, '
+      + 'attach it durably to the conversation, and save a PNG master copy to Google Drive.',
     parameters: {
       prompt: { type: 'string', description: 'Text prompt describing the image to generate.', required: true },
-      model: { type: 'string', description: 'Optional per-call image model override; defaults to the profile-selected image model.' },
       quality: {
         type: 'string',
         enum: ['normal', 'detailed', 'maximum'],
@@ -202,14 +162,6 @@ export function createNexusGenerateImageTool(
       if (!apiKey) {
         throw new Error(`Missing Nexus gateway bearer token in env var ${config.apiKeyEnv}`)
       }
-      const chosenModel = (typeof args.model === 'string' && args.model.trim().length > 0)
-        ? args.model.trim()
-        : readSelectedImageModel(selectionPath)
-      if (!chosenModel) {
-        throw new Error(
-          'No image model selected. Choose an image model in the Nexus runtime selector or pass the model argument explicitly.',
-        )
-      }
       const endpoint = new URL('/v1/images/generations', baseUrl)
       const timeoutSignal = AbortSignal.timeout(config.imageTimeoutMs)
       const signal = AbortSignal.any([exec.signal, timeoutSignal])
@@ -221,7 +173,6 @@ export function createNexusGenerateImageTool(
         },
         body: JSON.stringify({
           prompt: args.prompt,
-          model: chosenModel,
           quality: args.quality,
           width: args.width,
           height: args.height,
@@ -232,7 +183,7 @@ export function createNexusGenerateImageTool(
         signal,
       })
       if (!response.ok) {
-        const text = (await response.text()).slice(0, 500)
+        const text = redactSecrets((await response.text()).slice(0, 500), apiKey)
         throw new Error(`Nexus image generation failed (HTTP ${response.status}): ${text}`)
       }
       const rawText = await response.text()
@@ -259,7 +210,7 @@ export function createNexusGenerateImageTool(
       }
       return {
         attachmentId: String(ref.attachmentId),
-        model: payload.model ?? chosenModel,
+        model: payload.model ?? 'configured-image-model',
         quality: payload.quality ?? args.quality ?? 'detailed',
         filename: payload.filename,
         width: payload.width ?? ref.width,
@@ -272,8 +223,6 @@ export function createNexusGenerateImageTool(
     },
   })
 }
-
-const OPERATION_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/
 
 function redactSecrets(text: string, apiKey: string): string {
   let out = text
@@ -326,9 +275,7 @@ async function fetchGatewayJson(
   config: Config,
   baseUrl: URL,
   upstreamPath: string,
-  method: 'GET' | 'POST',
   signal: AbortSignal,
-  body?: unknown,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ status: number; body: string }> {
   const apiKey = process.env[config.apiKeyEnv] ?? ''
@@ -337,12 +284,8 @@ async function fetchGatewayJson(
   }
   const endpoint = new URL(upstreamPath, baseUrl)
   const upstream = await fetchImpl(endpoint, {
-    method,
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    method: 'GET',
+    headers: { authorization: `Bearer ${apiKey}` },
     signal,
   })
   const text = await upstream.text()
@@ -355,53 +298,20 @@ async function fetchGatewayJson(
   return { status: upstream.status, body: redactSecrets(text, apiKey) }
 }
 
-function registerGatewayGetProxy(
-  ctx: Context,
-  config: Config,
-  baseUrl: URL,
-  publicPath: string,
-  upstreamPath: string,
-  fetchImpl: typeof fetch = fetch,
-): () => void {
-  return ctx.connection.fetch.register({
-    path: publicPath,
-    methods: ['GET'],
-    requestBody: 'buffered',
-    async fetch(request) {
-      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
-      try {
-        const res = await fetchGatewayJson(config, baseUrl, upstreamPath, 'GET', signal, undefined, fetchImpl)
-        return new Response(res.body, {
-          status: res.status,
-          headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
-        })
-      } catch (err) {
-        const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
-        return new Response(
-          JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
-          { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
-        )
-      }
-    },
-  })
-}
-
 /**
- * Register the `nexus_generate_image` tool and authenticated same-origin Host
- * endpoints for progress, runtime status, load/unload, and profile image selection.
+ * Register the `nexus_generate_image` tool and read-only same-origin Host
+ * endpoints for live Gateway runtime status and operation progress.
  */
 export function apply(
   ctx: Context,
   config: Config,
   fetchImpl: typeof fetch = fetch,
-  selectionPath: string = resolveImageSelectionPath(ctx),
 ): void {
   const baseUrl = assertLoopbackGatewayUrl(config.gatewayUrl)
 
-  const tool = createNexusGenerateImageTool(ctx, config, fetchImpl, selectionPath)
+  const tool = createNexusGenerateImageTool(ctx, config, fetchImpl)
   ctx.effect(() => ctx.tools.register(tool), 'nexus-host: nexus_generate_image tool')
 
-  // GET /api/nexus.runtime-progress (supports optional ?operation_id=<op_id>)
   ctx.effect(
     () =>
       ctx.connection.fetch.register({
@@ -423,7 +333,7 @@ export function apply(
           }
           const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
           try {
-            const res = await fetchGatewayJson(config, baseUrl, upstreamPath, 'GET', signal, undefined, fetchImpl)
+            const res = await fetchGatewayJson(config, baseUrl, upstreamPath, signal, fetchImpl)
             return new Response(res.body, {
               status: res.status,
               headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
@@ -441,137 +351,15 @@ export function apply(
   )
 
   ctx.effect(
-    () => registerGatewayGetProxy(ctx, config, baseUrl, '/api/nexus.runtime', '/v1/runtime', fetchImpl),
-    'nexus-host: /api/nexus.runtime proxy',
-  )
-
-  // GET /api/nexus.image-models: combines live Gateway image catalog with profile selection.
-  ctx.effect(
     () =>
       ctx.connection.fetch.register({
-        path: '/api/nexus.image-models',
+        path: '/api/nexus.runtime',
         methods: ['GET'],
         requestBody: 'buffered',
         async fetch(request) {
           const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
           try {
-            const res = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal, undefined, fetchImpl)
-            if (res.status !== 200) {
-              return new Response(res.body, { status: res.status, headers: { 'content-type': 'application/json' } })
-            }
-            const parsed = JSON.parse(res.body) as { data?: Array<{ id: string }>; quality_profiles?: string[] }
-            const selectedModelId = readSelectedImageModel(selectionPath)
-            return new Response(
-              JSON.stringify({
-                models: parsed.data ?? [],
-                qualityProfiles: parsed.quality_profiles ?? ['normal', 'detailed', 'maximum'],
-                selectedModelId,
-              }),
-              { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } },
-            )
-          } catch (err) {
-            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
-            return new Response(
-              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
-              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
-            )
-          }
-        },
-      }),
-    'nexus-host: /api/nexus.image-models proxy',
-  )
-
-  // POST /api/nexus.image-model: validates modelId against live Gateway catalog and persists to profile.
-  ctx.effect(
-    () =>
-      ctx.connection.fetch.register({
-        path: '/api/nexus.image-model',
-        methods: ['POST'],
-        requestBody: 'buffered',
-        async fetch(request) {
-          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.progressTimeoutMs)])
-          let body: { modelId?: string | null }
-          try {
-            body = JSON.parse(await request.text()) as { modelId?: string | null }
-          } catch {
-            return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'content-type': 'application/json' } })
-          }
-          const rawId = body.modelId
-          let models: Array<{ id: string }> = []
-          let qualityProfiles: string[] = ['normal', 'detailed', 'maximum']
-          try {
-            const catalogRes = await fetchGatewayJson(config, baseUrl, '/v1/image-models', 'GET', signal, undefined, fetchImpl)
-            if (catalogRes.status !== 200) {
-              return new Response(catalogRes.body, { status: catalogRes.status, headers: { 'content-type': 'application/json' } })
-            }
-            const parsed = JSON.parse(catalogRes.body) as { data?: Array<{ id: string }>; quality_profiles?: string[] }
-            models = parsed.data ?? []
-            qualityProfiles = parsed.quality_profiles ?? qualityProfiles
-          } catch (err) {
-            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
-            return new Response(
-              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
-              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
-            )
-          }
-          if (rawId === null || rawId === '') {
-            writeSelectedImageModel(selectionPath, null)
-            return new Response(
-              JSON.stringify({ selectedModelId: null, models, qualityProfiles }),
-              { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } },
-            )
-          }
-          if (typeof rawId !== 'string') {
-            return new Response(JSON.stringify({ error: 'modelId must be a string or null' }), { status: 400, headers: { 'content-type': 'application/json' } })
-          }
-          const valid = models.some(m => m.id === rawId)
-          if (!valid) {
-            return new Response(
-              JSON.stringify({ error: `Image model "${rawId}" is not available in the Nexus catalog` }),
-              { status: 400, headers: { 'content-type': 'application/json' } },
-            )
-          }
-          writeSelectedImageModel(selectionPath, rawId)
-          return new Response(
-            JSON.stringify({ selectedModelId: rawId, models, qualityProfiles }),
-            { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } },
-          )
-        },
-      }),
-    'nexus-host: /api/nexus.image-model endpoint',
-  )
-
-  // POST /api/nexus.runtime-load & /api/nexus.runtime-unload
-  ctx.effect(
-    () =>
-      ctx.connection.fetch.register({
-        path: '/api/nexus.runtime-load',
-        methods: ['POST'],
-        requestBody: 'buffered',
-        async fetch(request) {
-          let body: { model?: string; kind?: 'chat' | 'diffusion'; async?: boolean }
-          try {
-            body = JSON.parse(await request.text()) as { model?: string; kind?: 'chat' | 'diffusion'; async?: boolean }
-          } catch {
-            return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { 'content-type': 'application/json' } })
-          }
-          if (typeof body.model !== 'string' || body.model.trim().length === 0) {
-            return new Response(JSON.stringify({ error: 'model is required' }), { status: 400, headers: { 'content-type': 'application/json' } })
-          }
-          const kind = body.kind === 'diffusion' ? 'diffusion' : 'chat'
-          const asyncMode = Boolean(body.async)
-          const timeoutMs = asyncMode ? Math.max(config.progressTimeoutMs, 15_000) : config.imageTimeoutMs
-          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)])
-          try {
-            const res = await fetchGatewayJson(
-              config,
-              baseUrl,
-              '/v1/runtime/load',
-              'POST',
-              signal,
-              { model: body.model.trim(), kind, async: asyncMode },
-              fetchImpl,
-            )
+            const res = await fetchGatewayJson(config, baseUrl, '/v1/runtime', signal, fetchImpl)
             return new Response(res.body, {
               status: res.status,
               headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
@@ -585,32 +373,6 @@ export function apply(
           }
         },
       }),
-    'nexus-host: /api/nexus.runtime-load proxy',
-  )
-
-  ctx.effect(
-    () =>
-      ctx.connection.fetch.register({
-        path: '/api/nexus.runtime-unload',
-        methods: ['POST'],
-        requestBody: 'buffered',
-        async fetch(request) {
-          const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)])
-          try {
-            const res = await fetchGatewayJson(config, baseUrl, '/v1/runtime/unload', 'POST', signal, {}, fetchImpl)
-            return new Response(res.body, {
-              status: res.status,
-              headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
-            })
-          } catch (err) {
-            const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
-            return new Response(
-              JSON.stringify({ error: isTimeout ? 'Gateway request timed out' : 'Nexus gateway unavailable' }),
-              { status: isTimeout ? 504 : 502, headers: { 'content-type': 'application/json' } },
-            )
-          }
-        },
-      }),
-    'nexus-host: /api/nexus.runtime-unload proxy',
+    'nexus-host: /api/nexus.runtime proxy',
   )
 }

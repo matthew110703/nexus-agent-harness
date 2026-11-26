@@ -1,58 +1,14 @@
-# Nexus Harness Colab Runbook
+# Nexus AI Lab Colab Runbook (v1.1.0)
 
-Run Nexus Harness on Google Colab with loopback-only model serving (`127.0.0.1:7861`), authenticated Cloudflare quick tunnel (`127.0.0.1:3080`), and constrained workspace browsing.
+Run Nexus AI Lab on Google Colab (`L4 24 GB`, `A100 40 GB`, or `A100 80 GB`) using the single-active-model workflow.
 
-## Cell 1: Mount Drive & prepare directories
+## Workflow Summary
 
-```python
-from google.colab import drive
-import os, secrets
-
-drive.mount('/content/drive')
-os.makedirs('/content/nexus-harness-workspace', exist_ok=True)
-os.makedirs('/content/nexus_staged_models', exist_ok=True)
-os.makedirs('/content/drive/MyDrive/Nexus/outputs/generated_images', exist_ok=True)
-
-# Generate per-session bearer token (never printed)
-os.environ['NEXUS_API_KEY'] = secrets.token_urlsafe(32)
-os.environ['NEXUS_WORKSPACE_ROOT'] = '/content/nexus-harness-workspace'
-os.environ['NEXUS_GATEWAY_URL'] = 'http://127.0.0.1:7861/v1'
-print('Environment initialized.')
-```
-
-## Cell 2: Install Node >=24.22.3, pnpm, cloudflared, and build Nexus Harness
-
-```bash
-%%bash
-set -euo pipefail
-git clone https://github.com/matthew110703/nexus-agent-harness.git /content/nexus-harness || (cd /content/nexus-harness && git pull)
-cd /content/nexus-harness
-corepack enable
-pnpm install
-pnpm run build:artifacts
-pip install -q -e ./nexus-gateway
-```
-
-## Cell 3: Start Nexus Gateway (loopback-only `127.0.0.1:7861`)
-
-Run the FastAPI gateway bound strictly to `127.0.0.1:7861` using `os.environ['NEXUS_API_KEY']`. Do **not** expose port `7861` via Cloudflare.
-
-## Cell 4: Start Supervised Nexus Harness + Cloudflare Quick Tunnel
-
-```bash
-%%bash
-cd /content/nexus-harness
-node colab/supervisor.mjs
-```
-
-The supervisor will:
-1. Verify `http://127.0.0.1:7861/health` and `NEXUS_API_KEY` (never printing the token).
-2. Launch `cloudflared tunnel --url http://127.0.0.1:3080` and parse the exact `trycloudflare.com` hostname.
-3. Launch `dsh web --patch apps/cli/config/examples/colab.overlay.yml --public-url https://<host> --trusted-host <host> --no-open`.
-4. Print the one-time authenticated Harness launch URL once.
-
-## Rollback & Upstream Rebase
-
-- Core patches are isolated to two small, opt-in flags: `trustForwardedProto` in `packages/host/authentication-token` and `allowedRoots` in `packages/host/directory-picker-browse`.
-- All Nexus-specific code lives in additive directories (`nexus-gateway/`, `packages/experimental/nexus-host/`, `colab/`, `apps/cli/config/examples/colab.overlay.yml`, `docs/nexus/`).
-- To revert to stock upstream behavior, omit `--patch apps/cli/config/examples/colab.overlay.yml`.
+1. **Section 1 (Paths & Env):** Generates per-session `NEXUS_API_KEY` (server-side only) and sets local SSD paths (`DSH_HOME`, `HF_HOME`, `/content/nexus-staged-models`).
+2. **Section 2 (Mount Drive, Checkout & Inventory):** Mounts `/content/drive`, syncs `colab-src/`, inspects your live GPU VRAM, and prints tables of runnable language and image models in `MyDrive/Nexus/models/` with GPU fit badges.
+3. **Section 3 (Pre-Run Selection):** Paste **one** `SELECTED_LANGUAGE_MODEL` name and **one** `SELECTED_IMAGE_MODEL` name (or `""` to disable image generation). Validates checkpoint completeness, GPU VRAM fit, and local SSD staging space.
+4. **Section 4 (Dependencies & Build):** Verifies PyTorch/CUDA, pinned Node `24.22.3`, pinned `pnpm`, SHA-256-verified `cloudflared`, and fingerprint-cached `build:artifacts`.
+5. **Section 5 (Stage & Warm Load):** Stages both selected models from Drive to `/content/nexus-staged-models/` (SHA-256 verified, skipping `.cache/`), writes `session-runtime.json`, starts Gateway (`127.0.0.1:7861`), warm-loads `SELECTED_LANGUAGE_MODEL`, and verifies live GPU readiness.
+6. **Section 6 (Start Locked Harness):** Restores the latest verified non-secret Drive snapshot and runs `node colab/supervisor.mjs`, which verifies Gateway live readiness and launches `dsh web` locked to the single selected model.
+7. **Section 7 (Live Acceptance Suite):** Verifies live readiness, single-model lock (HTTP 409 on second model), live chat completion, and image swap + automatic LLM restore.
+8. **Section 8 (Shutdown & Snapshot):** Terminates the isolated GPU worker, supervisor, and Gateway, then saves a verified non-secret snapshot to `MyDrive/Nexus/harness-home/snapshots/`.

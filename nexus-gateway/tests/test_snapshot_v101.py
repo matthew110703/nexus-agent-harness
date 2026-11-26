@@ -21,7 +21,6 @@ def test_snapshot_excludes_secrets_and_restores_verified_state(tmp_path: Path) -
     (home / "sessions" / "ws1" / "session.v4.jsonl").write_text('{"seq":1}\n', encoding="utf-8")
     (home / "attachments").mkdir(parents=True)
     (home / "attachments" / "img1.png").write_bytes(b"\x89PNG\r\n\x1a\n1234")
-    (home / "nexus-image-selection.json").write_text('{"selectedImageModel":"sdxl-base-1.0"}\n', encoding="utf-8")
 
     # Excluded secrets / credentials
     (home / "credentials").mkdir(parents=True)
@@ -31,7 +30,7 @@ def test_snapshot_excludes_secrets_and_restores_verified_state(tmp_path: Path) -
     (home / "auth-state.json").write_text("secret", encoding="utf-8")
 
     result = hhs.create_snapshot(home, backup)
-    assert result["file_count"] == 3
+    assert result["file_count"] == 2
     snap_dir = Path(result["snapshot_dir"])
     assert not (snap_dir / "credentials").exists()
     assert not (snap_dir / "sessions" / "api_token.txt").exists()
@@ -42,10 +41,9 @@ def test_snapshot_excludes_secrets_and_restores_verified_state(tmp_path: Path) -
     restored_home = tmp_path / "restored-home"
     restored = hhs.restore_latest_snapshot(backup, restored_home)
     assert restored["restored"] is True
-    assert restored["file_count"] == 3
+    assert restored["file_count"] == 2
     assert (restored_home / "sessions" / "ws1" / "session.v4.jsonl").read_text(encoding="utf-8") == '{"seq":1}\n'
     assert (restored_home / "attachments" / "img1.png").read_bytes() == b"\x89PNG\r\n\x1a\n1234"
-    assert (restored_home / "nexus-image-selection.json").is_file()
     assert not (restored_home / "credentials").exists()
 
 

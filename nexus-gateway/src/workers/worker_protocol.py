@@ -1,11 +1,11 @@
-"""Typed protocol messages between Nexus Gateway API and the isolated GPU model worker."""
+"""Typed protocol messages between Nexus Gateway API and the isolated GPU model worker (v1.1.0)."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional
 
-WorkerKind = Literal["chat", "diffusion"]
+WorkerKind = Literal["language", "image"]
 ImageQualityProfile = Literal["normal", "detailed", "maximum"]
 
 
@@ -14,9 +14,8 @@ class WorkerLoadRequest:
     kind: WorkerKind
     model_id: str
     model_path: str
+    implementation: str
     architecture: str = "unknown"
-    loader_family: str = "transformers"
-    adapter_family: str = "transformers_causal"
     precision: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -31,7 +30,7 @@ class WorkerGenerateRequest:
     tool_choice: Any = "auto"
     temperature: float = 0.7
     top_p: float = 0.9
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     reasoning_effort: Optional[str] = None
     enable_thinking: Optional[bool] = None
     stream: bool = False

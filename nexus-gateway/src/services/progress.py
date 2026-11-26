@@ -1,4 +1,4 @@
-"""First-class runtime progress tracking for discovery, staging, loading, and denoising."""
+"""First-class runtime progress tracking for bootstrap, chat, image generation, and GPU swaps."""
 
 from __future__ import annotations
 
@@ -9,25 +9,24 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 OperationKind = Literal[
-    "chat_model_load",
+    "language_model_load",
     "chat_generation",
-    "diffusion_pipeline_load",
+    "image_model_load",
     "image_generation",
-    "model_staging",
+    "gpu_swap",
 ]
 OperationStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 OperationPhase = Literal[
     "resolving",
-    "discovery",
-    "staging",
-    "checkpoint_validation",
     "processor_init",
     "weight_loading",
     "placement",
     "ready",
     "generating",
+    "swapping_to_image",
     "denoising",
     "saving",
+    "restoring_language_model",
 ]
 
 
@@ -71,7 +70,7 @@ class ProgressService:
         self,
         kind: OperationKind,
         model: str,
-        phase: OperationPhase = "discovery",
+        phase: OperationPhase = "resolving",
         *,
         operation_id: Optional[str] = None,
         indeterminate: bool = False,
@@ -135,8 +134,6 @@ class ProgressService:
                 record.steps_total = steps_total
             if progress is not None:
                 record.progress = max(0.0, min(100.0, float(progress)))
-            elif record.total_bytes > 0 and record.phase == "staging":
-                record.progress = min(100.0, round(record.bytes_copied / record.total_bytes * 100.0, 2))
             elif record.steps_total > 0 and record.phase == "denoising":
                 record.progress = min(100.0, round(record.step / record.steps_total * 100.0, 2))
             if message is not None:
@@ -168,11 +165,11 @@ class ProgressService:
         with self._lock:
             records = [r.to_dict() for r in self._records.values()]
         latest_chat = next(
-            (r for r in reversed(records) if r["kind"] in ("chat_model_load", "chat_generation", "model_staging")),
+            (r for r in reversed(records) if r["kind"] in ("language_model_load", "chat_generation")),
             None,
         )
         latest_diffusion = next(
-            (r for r in reversed(records) if r["kind"] in ("diffusion_pipeline_load", "image_generation")),
+            (r for r in reversed(records) if r["kind"] in ("image_model_load", "image_generation", "gpu_swap")),
             None,
         )
         return {"chat": latest_chat, "diffusion": latest_diffusion, "operations": records[-16:]}

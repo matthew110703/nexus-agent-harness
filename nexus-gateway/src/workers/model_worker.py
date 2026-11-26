@@ -1,4 +1,4 @@
-"""Isolated GPU model worker subprocess owning CUDA context, weights, inference, and cancellation."""
+"""Isolated GPU model worker subprocess owning CUDA context, dedicated model runtime, and cancellation."""
 
 from __future__ import annotations
 
@@ -21,20 +21,22 @@ _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from adapters.diffusers import DiffusersImageAdapter, GenerationCancelledError  # noqa: E402
-from adapters.qwen_vl import QwenVLChatAdapter  # noqa: E402
-from adapters.transformers import TransformersChatAdapter  # noqa: E402
 from api.middleware.auth import assert_loopback_host, make_auth_dependency  # noqa: E402
+from models.base import (  # noqa: E402
+    GenerationCancelledError,
+    load_dedicated_image_runtime,
+    load_dedicated_language_runtime,
+)
 
 
 class ModelWorkerState:
-    """Owns the single active CUDA model or diffusion pipeline inside this worker process."""
+    """Owns the single active CUDA model (language OR image) inside this isolated process."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.active_kind: Optional[str] = None
         self.active_model_id: Optional[str] = None
-        self.adapter: Any = None
+        self.runtime: Any = None
         self.last_error: Optional[str] = None
         self._cancel_lock = threading.Lock()
         self._cancel_events: dict[str, threading.Event] = {}
@@ -87,13 +89,13 @@ class ModelWorkerState:
             self._unload_unlocked()
 
     def _unload_unlocked(self) -> None:
-        adapter = self.adapter
-        self.adapter = None
+        rt = self.runtime
+        self.runtime = None
         self.active_kind = None
         self.active_model_id = None
-        if adapter is not None:
+        if rt is not None:
             try:
-                adapter.unload()
+                rt.unload()
             except Exception:
                 pass
         gc.collect()
@@ -110,35 +112,47 @@ class ModelWorkerState:
         kind = payload.get("kind")
         model_id = str(payload.get("model_id") or "")
         model_path = Path(str(payload.get("model_path") or ""))
-        architecture = str(payload.get("architecture") or "")
-        adapter_family = str(payload.get("adapter_family") or "")
-        if kind not in ("chat", "diffusion") or not model_id or not model_path.exists():
-            raise HTTPException(status_code=400, detail="Valid kind, model_id, and existing model_path are required")
+        implementation = str(payload.get("implementation") or "")
+        architecture = str(payload.get("architecture") or "unknown")
+        if kind not in ("language", "image") or not model_id or not implementation or not model_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="Valid kind ('language'|'image'), model_id, implementation, and existing staged model_path are required",
+            )
 
         with self.lock:
-            if self.active_kind == kind and self.active_model_id == model_id and self.adapter is not None:
+            if self.active_kind == kind and self.active_model_id == model_id and self.runtime is not None:
                 return {"status": "ready", "reused": True, **self.status()}
             self._unload_unlocked()
             try:
-                if adapter_family == "diffusers":
-                    adapter: Any = DiffusersImageAdapter(model_id=model_id, model_path=model_path, architecture=architecture)
-                elif adapter_family == "qwen_vl":
-                    adapter = QwenVLChatAdapter(model_id=model_id, model_path=model_path, architecture=architecture)
-                elif adapter_family == "transformers_causal":
-                    adapter = TransformersChatAdapter(model_id=model_id, model_path=model_path, architecture=architecture)
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unsupported adapter_family {adapter_family!r} for model {model_id}",
+                if kind == "language":
+                    runtime: Any = load_dedicated_language_runtime(
+                        implementation=implementation,
+                        model_id=model_id,
+                        model_path=model_path,
+                        architecture=architecture,
                     )
-                adapter.load(precision=payload.get("precision"))
-                self.adapter = adapter
+                else:
+                    runtime = load_dedicated_image_runtime(
+                        implementation=implementation,
+                        model_id=model_id,
+                        model_path=model_path,
+                        architecture=architecture,
+                    )
+                runtime.load(precision=payload.get("precision"))
+                if not runtime.is_ready():
+                    raise RuntimeError(f"Dedicated runtime for {model_id} did not report ready after load")
+                self.runtime = runtime
                 self.active_kind = kind
                 self.active_model_id = model_id
                 self.last_error = None
                 return {"status": "ready", "reused": False, **self.status()}
             except HTTPException:
                 raise
+            except ValueError as exc:
+                self.last_error = str(exc)
+                self._unload_unlocked()
+                raise HTTPException(status_code=400, detail=self.last_error) from exc
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 self._unload_unlocked()
@@ -146,7 +160,7 @@ class ModelWorkerState:
 
 
 def create_worker_app(secret_token: str) -> FastAPI:
-    app = FastAPI(title="Nexus Isolated Model Worker", version="1.0.1")
+    app = FastAPI(title="Nexus Isolated Model Worker", version="1.1.0")
     state = ModelWorkerState()
     require_auth = make_auth_dependency(secret_token)
 
@@ -171,13 +185,13 @@ def create_worker_app(secret_token: str) -> FastAPI:
 
     @app.post("/worker/generate")
     def worker_generate(body: dict[str, Any], _auth: None = Depends(require_auth)) -> Any:
-        if state.active_kind != "chat" or state.adapter is None:
-            raise HTTPException(status_code=409, detail="No chat model loaded in worker")
+        if state.active_kind != "language" or state.runtime is None:
+            raise HTTPException(status_code=409, detail="No language model loaded in worker")
         stream = bool(body.get("stream", False))
         if not stream:
             with state.lock:
                 try:
-                    text = "".join(state.adapter.generate_stream(body))
+                    text = "".join(state.runtime.generate_stream(body))
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
             return {"text": text, "model_id": state.active_model_id}
@@ -185,7 +199,7 @@ def create_worker_app(secret_token: str) -> FastAPI:
         def event_stream():
             state.lock.acquire()
             try:
-                for chunk in state.adapter.generate_stream(body):
+                for chunk in state.runtime.generate_stream(body):
                     if chunk:
                         yield json.dumps({"chunk": chunk}, ensure_ascii=False) + "\n"
             finally:
@@ -195,8 +209,8 @@ def create_worker_app(secret_token: str) -> FastAPI:
 
     @app.post("/worker/generate-image")
     def worker_generate_image(body: dict[str, Any], _auth: None = Depends(require_auth)) -> Any:
-        if state.active_kind != "diffusion" or state.adapter is None:
-            raise HTTPException(status_code=409, detail="No diffusion pipeline loaded in worker")
+        if state.active_kind != "image" or state.runtime is None:
+            raise HTTPException(status_code=409, detail="No image pipeline loaded in worker")
         op_id = str(body.get("operation_id") or "img_op")
         cancel_event = state.register_cancel_event(op_id)
         ev_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue()
@@ -207,7 +221,7 @@ def create_worker_app(secret_token: str) -> FastAPI:
         def _run_generation() -> None:
             with state.lock:
                 try:
-                    result = state.adapter.generate(body, on_progress=_on_progress, cancel_event=cancel_event)
+                    result = state.runtime.generate(body, on_progress=_on_progress, cancel_event=cancel_event)
                     ev_queue.put({"type": "result", "operation_id": op_id, "data": result})
                 except GenerationCancelledError as exc:
                     ev_queue.put({"type": "cancelled", "operation_id": op_id, "message": str(exc)})

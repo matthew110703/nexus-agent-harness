@@ -1,6 +1,7 @@
 /**
- * Compact Nexus runtime & independent image-model control mounted in the
- * composer's `conversation.input.right` slot.
+ * Read-only Nexus single-model runtime status, VRAM, and live progress control
+ * mounted in the composer's `conversation.input.right` slot (v1.1.0).
+ * Model selection, staging, and loading are owned strictly by Colab startup.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -22,13 +23,6 @@ export class NexusApiError extends Error {
   }
 }
 
-/** Per-session selected chat model info resolved from ModelDirectoryResolver. */
-export interface SelectedChatModelInfo {
-  readonly provider: string
-  readonly modelId: string
-  readonly displayName?: string
-}
-
 /** Single Gateway progress record returned by `/v1/progress` or `/v1/progress/{id}`. */
 export interface NexusOperationRecord {
   readonly operation_id: string
@@ -38,8 +32,6 @@ export interface NexusOperationRecord {
   readonly phase: string
   readonly progress: number
   readonly indeterminate: boolean
-  readonly bytes_copied?: number
-  readonly total_bytes?: number
   readonly step?: number
   readonly steps_total?: number
   readonly message?: string
@@ -50,7 +42,7 @@ export interface NexusOperationRecord {
 export interface NexusWorkerPayload {
   readonly pid: number
   readonly alive: boolean
-  readonly active_kind?: 'chat' | 'diffusion' | null
+  readonly active_kind?: 'language' | 'image' | null
   readonly active_model_id?: string | null
   readonly cuda_allocated_bytes?: number
   readonly cuda_reserved_bytes?: number
@@ -67,6 +59,13 @@ export interface NexusHardwarePayload {
   readonly gpus?: ReadonlyArray<{ readonly name?: string; readonly total_vram_bytes?: number; readonly free_vram_bytes?: number }>
 }
 
+/** Locked model descriptor returned by `/v1/runtime`. */
+export interface NexusLockedModelInfo {
+  readonly id: string
+  readonly display_name?: string | null
+  readonly implementation?: string | null
+}
+
 /** Progress snapshot returned by `GET /api/nexus.runtime-progress`. */
 export interface NexusProgressSnapshot {
   readonly chat?: NexusOperationRecord | null
@@ -77,52 +76,21 @@ export interface NexusProgressSnapshot {
 
 /** Runtime status snapshot returned by `GET /api/nexus.runtime`. */
 export interface NexusRuntimePayload {
+  readonly version?: string
+  readonly ready?: boolean
+  readonly state?: string
+  readonly busy?: boolean
+  readonly swapping?: boolean
   readonly hardware?: NexusHardwarePayload | null
   readonly worker?: NexusWorkerPayload | null
-  readonly busy?: boolean
-  readonly active_model?: string | null
-  readonly active_kind?: 'chat' | 'diffusion' | null
+  readonly language_model?: NexusLockedModelInfo | null
+  readonly image_model?: NexusLockedModelInfo | null
 }
 
-/** Response from `POST /api/nexus.runtime-load`. */
-export interface NexusLoadResponse {
-  readonly status: 'loading' | 'loaded'
-  readonly operation_id?: string | null
-  readonly model: string
-  readonly kind: 'chat' | 'diffusion'
-  readonly worker?: NexusWorkerPayload | null
-}
-
-/** Image model catalog item returned by `/api/nexus.image-models`. */
-export interface NexusImageModelOption {
-  readonly id: string
-  readonly display_name?: string | null
-  readonly adapter_family?: string | null
-}
-
-/** Image model catalog + profile selection returned by `/api/nexus.image-models` & `POST /api/nexus.image-model`. */
-export interface NexusImageModelsPayload {
-  readonly selectedModelId: string | null
-  readonly models: readonly NexusImageModelOption[]
-  readonly qualityProfiles?: readonly string[]
-}
-
-/** Injected data and HTTP callbacks for NexusRuntimeControl. */
+/** Injected read-only HTTP callbacks for NexusRuntimeControl. */
 export interface NexusRuntimeControlProps {
-  readonly getSelectedChatModel: () => SelectedChatModelInfo | null
-  readonly subscribeSelectedChatModel: (listener: () => void) => () => void
   readonly fetchProgress: (signal?: AbortSignal) => Promise<NexusProgressSnapshot>
-  readonly fetchOperationProgress: (operationId: string, signal?: AbortSignal) => Promise<NexusOperationRecord | null>
   readonly fetchRuntime: (signal?: AbortSignal) => Promise<NexusRuntimePayload>
-  readonly fetchImageModels: (signal?: AbortSignal) => Promise<NexusImageModelsPayload>
-  readonly saveImageModel: (modelId: string | null) => Promise<NexusImageModelsPayload>
-  readonly loadModel: (modelId: string) => Promise<NexusLoadResponse>
-  readonly unloadModel: () => Promise<void>
-}
-
-interface ScopedErrorState {
-  readonly message: string
-  readonly diagnostic?: string | undefined
 }
 
 interface PopoverCoords {
@@ -132,16 +100,15 @@ interface PopoverCoords {
 
 const PHASE_LABELS: Record<string, string> = {
   resolving: 'Resolving model',
-  discovery: 'Scanning model files',
-  checkpoint_validation: 'Checking model files',
-  staging: 'Staging model files',
   processor_init: 'Loading tokenizer & processor',
   weight_loading: 'Loading model weights',
-  placement: 'Preparing GPU placement',
+  placement: 'Verifying GPU placement',
   ready: 'Ready',
   generating: 'Generating response',
+  swapping_to_image: 'Swapping GPU to image model',
   denoising: 'Generating image',
-  saving: 'Saving output',
+  saving: 'Saving image to Drive',
+  restoring_language_model: 'Restoring language model',
 }
 
 function formatPhaseLabel(op: NexusOperationRecord): string {
@@ -160,7 +127,7 @@ function formatGpuMemory(runtime: NexusRuntimePayload | null): string {
   if (!hw) return 'Checking…'
   if (!hw.cuda_available || !hw.total_vram_bytes) return 'CPU only'
   const total = hw.total_vram_bytes
-  const allocated = runtime?.worker?.alive ? (runtime.worker.cuda_allocated_bytes ?? 0) : 0
+  const allocated = runtime.worker?.alive ? (runtime.worker.cuda_allocated_bytes ?? 0) : 0
   const used = allocated > 0
     ? allocated
     : Math.max(0, total - (hw.free_vram_bytes ?? total))
@@ -169,72 +136,27 @@ function formatGpuMemory(runtime: NexusRuntimePayload | null): string {
   return gpuName ? `${gpuName} · ${memText}` : memText
 }
 
-function formatScopedError(err: unknown, context?: { modelId?: string; operationId?: string }): ScopedErrorState {
-  if (err instanceof NexusApiError) {
-    const diagParts = [
-      err.status ? `HTTP ${err.status}` : null,
-      err.operationId || context?.operationId ? `op=${err.operationId ?? context?.operationId}` : null,
-      context?.modelId ? `model=${context.modelId}` : null,
-      err.details ? err.details : null,
-    ].filter(Boolean)
-    return {
-      message: err.message,
-      diagnostic: diagParts.length > 0 ? diagParts.join('\n') : undefined,
-    }
-  }
-  const message = err instanceof Error ? err.message : String(err)
-  return { message }
-}
-
-function pickActiveOperation(
-  trackedOp: NexusOperationRecord | null,
-  snapshot: NexusProgressSnapshot | null,
-): NexusOperationRecord | null {
-  if (trackedOp && (trackedOp.status === 'queued' || trackedOp.status === 'running')) {
-    return trackedOp
-  }
-  const chatOp = snapshot?.chat ?? null
-  if (chatOp && (chatOp.status === 'queued' || chatOp.status === 'running')) return chatOp
+function pickActiveOperation(snapshot: NexusProgressSnapshot | null): NexusOperationRecord | null {
   const diffOp = snapshot?.diffusion ?? null
   if (diffOp && (diffOp.status === 'queued' || diffOp.status === 'running')) return diffOp
+  const chatOp = snapshot?.chat ?? null
+  if (chatOp && (chatOp.status === 'queued' || chatOp.status === 'running')) return chatOp
   return null
 }
 
 /**
- * Render the compact Nexus runtime badge and portaled status/image-model popover.
- * @param props - reactive model-directory selector and Host API callbacks.
+ * Render the read-only Nexus single-model status badge and portaled diagnostics popover.
+ * @param props - read-only Host API callbacks.
  * @returns the composer trigger button and, when open, a portaled popover dialog.
  */
 export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
-  const {
-    getSelectedChatModel,
-    subscribeSelectedChatModel,
-    fetchProgress,
-    fetchOperationProgress,
-    fetchRuntime,
-    fetchImageModels,
-    saveImageModel,
-    loadModel,
-    unloadModel,
-  } = props
+  const { fetchProgress, fetchRuntime } = props
 
-  const [selectedChat, setSelectedChat] = useState<SelectedChatModelInfo | null>(() => getSelectedChatModel())
   const [open, setOpen] = useState(false)
   const [coords, setCoords] = useState<PopoverCoords | null>(null)
   const [runtime, setRuntime] = useState<NexusRuntimePayload | null>(null)
   const [progressSnap, setProgressSnap] = useState<NexusProgressSnapshot | null>(null)
-  const [trackedOpId, setTrackedOpId] = useState<string | null>(null)
-  const [trackedOp, setTrackedOp] = useState<NexusOperationRecord | null>(null)
-  const [imageState, setImageState] = useState<NexusImageModelsPayload | null>(null)
-
-  const [submittingLoad, setSubmittingLoad] = useState(false)
-  const [unloading, setUnloading] = useState(false)
-  const [savingImage, setSavingImage] = useState(false)
-
-  const [chatLoadError, setChatLoadError] = useState<ScopedErrorState | null>(null)
-  const [imageError, setImageError] = useState<ScopedErrorState | null>(null)
-  const [statusError, setStatusError] = useState<ScopedErrorState | null>(null)
-  const [showChatDiag, setShowChatDiag] = useState(false)
+  const [statusError, setStatusError] = useState<string | null>(null)
 
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const popoverRef = useRef<HTMLDivElement | null>(null)
@@ -250,13 +172,6 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
     }
   }, [])
 
-  useEffect(() => {
-    setSelectedChat(getSelectedChatModel())
-    return subscribeSelectedChatModel(() => {
-      setSelectedChat(getSelectedChatModel())
-    })
-  }, [getSelectedChatModel, subscribeSelectedChatModel])
-
   const closePopover = useCallback((restoreFocus: boolean) => {
     setOpen(false)
     if (restoreFocus) {
@@ -264,63 +179,36 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
     }
   }, [])
 
-  const pollNow = useCallback(async (explicitOpId?: string | null) => {
+  const pollNow = useCallback(async () => {
     if (pollInFlightRef.current || !mountedRef.current) return
     pollInFlightRef.current = true
     const controller = new AbortController()
     activeAbortRef.current = controller
-    const opIdToCheck = explicitOpId !== undefined ? explicitOpId : trackedOpId
     try {
-      const [rtResult, progResult, opResult] = await Promise.allSettled([
+      const [rtResult, progResult] = await Promise.allSettled([
         fetchRuntime(controller.signal),
         fetchProgress(controller.signal),
-        opIdToCheck ? fetchOperationProgress(opIdToCheck, controller.signal) : Promise.resolve(null),
       ])
-      if (!mountedRef.current || controller.signal.aborted) return
+      if (controller.signal.aborted) return
 
       if (rtResult.status === 'fulfilled') {
         setRuntime(rtResult.value)
         setStatusError(null)
       } else {
-        setStatusError(formatScopedError(rtResult.reason))
+        const err: unknown = rtResult.reason
+        setStatusError(err instanceof Error ? err.message : String(err))
       }
 
       if (progResult.status === 'fulfilled') {
         setProgressSnap(progResult.value)
       }
-
-      if (opIdToCheck && opResult.status === 'fulfilled') {
-        const rec = opResult.value
-        if (rec === null) {
-          // Operation expired on Gateway; clear tracking and rely on live runtime snapshot.
-          setTrackedOpId(null)
-          setTrackedOp(null)
-        } else {
-          setTrackedOp(rec)
-          if (rec.status === 'completed') {
-            setTrackedOpId(null)
-            setChatLoadError(null)
-            // Refresh runtime immediately after terminal completion so Ready reflects worker truth.
-            const freshRt = await fetchRuntime(controller.signal).catch(() => null)
-            if (mountedRef.current && freshRt) setRuntime(freshRt)
-          } else if (rec.status === 'failed' || rec.status === 'cancelled') {
-            setTrackedOpId(null)
-            if (rec.status === 'failed') {
-              setChatLoadError({
-                message: rec.error || rec.message || 'Model loading failed',
-                diagnostic: `op=${rec.operation_id}\nmodel=${rec.model}\nphase=${rec.phase}`,
-              })
-            }
-          }
-        }
-      }
     } finally {
       pollInFlightRef.current = false
     }
-  }, [fetchOperationProgress, fetchProgress, fetchRuntime, trackedOpId])
+  }, [fetchProgress, fetchRuntime])
 
-  const activeOp = pickActiveOperation(trackedOp, progressSnap)
-  const isOpRunning = Boolean(activeOp) || submittingLoad
+  const activeOp = pickActiveOperation(progressSnap)
+  const isOpRunning = Boolean(activeOp) || Boolean(runtime?.swapping)
 
   useEffect(() => {
     void pollNow()
@@ -332,24 +220,6 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
       window.clearInterval(timer)
     }
   }, [isOpRunning, open, pollNow])
-
-  useEffect(() => {
-    if (!open) return
-    const controller = new AbortController()
-    void fetchImageModels(controller.signal)
-      .then((data) => {
-        if (mountedRef.current) {
-          setImageState(data)
-          setImageError(null)
-        }
-      })
-      .catch((err) => {
-        if (mountedRef.current && !controller.signal.aborted) {
-          setImageError(formatScopedError(err))
-        }
-      })
-    return () => controller.abort()
-  }, [open, fetchImageModels])
 
   useEffect(() => {
     if (!open) return
@@ -388,133 +258,52 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
     }
   }, [open, closePopover])
 
-  const selectedModelId = selectedChat?.modelId ?? null
-  const isNexusProvider = selectedChat !== null && selectedChat.provider === 'nexus'
-  const selectedFullName = selectedModelId ? resolveModelDisplayName(selectedModelId, selectedChat?.displayName) : null
-  const selectedCompactName = selectedModelId ? resolveCompactModelName(selectedModelId, selectedChat?.displayName) : null
+  const langInfo = runtime?.language_model ?? null
+  const imgInfo = runtime?.image_model ?? null
+  const langFullName = langInfo ? resolveModelDisplayName(langInfo.id, langInfo.display_name) : null
+  const langCompactName = langInfo ? resolveCompactModelName(langInfo.id, langInfo.display_name) : null
+  const imgFullName = imgInfo ? resolveModelDisplayName(imgInfo.id, imgInfo.display_name) : null
 
-  const workerAlive = Boolean(runtime?.worker?.alive)
-  const loadedModelId = workerAlive ? (runtime?.worker?.active_model_id ?? null) : null
-  const loadedFullName = loadedModelId ? resolveModelDisplayName(loadedModelId) : null
-  const loadedCompactName = loadedModelId ? resolveCompactModelName(loadedModelId) : null
-  const isSelectedAlreadyLoaded = Boolean(selectedModelId && loadedModelId && selectedModelId === loadedModelId)
+  const isReady = Boolean(runtime?.ready && runtime.worker?.alive)
+  const isSwapping = Boolean(runtime?.swapping)
 
-  const handleLoad = useCallback(async () => {
-    if (!selectedModelId || !isNexusProvider || isOpRunning || unloading) return
-    setSubmittingLoad(true)
-    setChatLoadError(null)
-    setShowChatDiag(false)
-    try {
-      const res = await loadModel(selectedModelId)
-      if (!mountedRef.current) return
-      if (res.status === 'loading' && res.operation_id) {
-        setTrackedOpId(res.operation_id)
-        setTrackedOp({
-          operation_id: res.operation_id,
-          kind: 'chat_model_load',
-          model: selectedModelId,
-          status: 'running',
-          phase: 'resolving',
-          progress: 0,
-          indeterminate: true,
-          message: `Starting load for ${selectedCompactName ?? selectedModelId}`,
-        })
-        void pollNow(res.operation_id)
-      } else {
-        setTrackedOpId(null)
-        setTrackedOp(null)
-        void pollNow(null)
-      }
-    } catch (err) {
-      if (!mountedRef.current) return
-      setChatLoadError(formatScopedError(err, { modelId: selectedModelId }))
-    } finally {
-      if (mountedRef.current) setSubmittingLoad(false)
-    }
-  }, [isNexusProvider, isOpRunning, loadModel, pollNow, selectedCompactName, selectedModelId, unloading])
-
-  const handleUnload = useCallback(async () => {
-    if (!loadedModelId || isOpRunning || unloading) return
-    setUnloading(true)
-    setChatLoadError(null)
-    try {
-      await unloadModel()
-      if (!mountedRef.current) return
-      setTrackedOpId(null)
-      setTrackedOp(null)
-      void pollNow(null)
-    } catch (err) {
-      if (!mountedRef.current) return
-      setChatLoadError(formatScopedError(err, { modelId: loadedModelId }))
-    } finally {
-      if (mountedRef.current) setUnloading(false)
-    }
-  }, [isOpRunning, loadedModelId, pollNow, unloadModel, unloading])
-
-  const handleImageModelChange = useCallback(async (nextValue: string) => {
-    setSavingImage(true)
-    setImageError(null)
-    try {
-      const updated = await saveImageModel(nextValue === '' ? null : nextValue)
-      if (mountedRef.current) setImageState(updated)
-    } catch (err) {
-      if (mountedRef.current) setImageError(formatScopedError(err))
-    } finally {
-      if (mountedRef.current) setSavingImage(false)
-    }
-  }, [saveImageModel])
-
-  // Derive state-aware composer badge (truthful to worker/operation state, never raw technical ID).
   let badgeText = 'Runtime off'
   let dotClass = ''
   if (activeOp) {
     dotClass = css.dotRunning ?? ''
-    if (activeOp.kind === 'image_generation' || activeOp.phase === 'denoising') {
+    if (activeOp.phase === 'restoring_language_model') {
+      badgeText = langCompactName ? `Restoring · ${langCompactName}` : 'Restoring model'
+    } else if (activeOp.phase === 'swapping_to_image') {
+      badgeText = 'Swapping GPU'
+    } else if (activeOp.kind === 'image_generation' || activeOp.phase === 'denoising') {
       const pct = !activeOp.indeterminate && activeOp.progress > 0 ? ` · ${Math.round(activeOp.progress)}%` : ''
       badgeText = `Generating${pct}`
     } else if (activeOp.kind === 'chat_generation') {
       badgeText = 'Generating'
     } else {
-      const targetName = resolveCompactModelName(activeOp.model) || activeOp.model
-      badgeText = `Loading · ${targetName}`
+      badgeText = langCompactName ? `Loading · ${langCompactName}` : 'Loading'
     }
-  } else if (submittingLoad && selectedCompactName) {
+  } else if (isSwapping) {
     dotClass = css.dotRunning ?? ''
-    badgeText = `Loading · ${selectedCompactName}`
-  } else if (chatLoadError || statusError) {
+    badgeText = 'Swapping GPU'
+  } else if (statusError || runtime?.state === 'degraded') {
     dotClass = css.dotError ?? ''
     badgeText = 'Runtime error'
-  } else if (loadedCompactName) {
+  } else if (isReady && langCompactName) {
     dotClass = css.dotReady ?? ''
-    badgeText = `Ready · ${loadedCompactName}`
+    badgeText = `Ready · ${langCompactName}`
   }
 
-  // Dynamic model-aware primary action button label.
-  const compactTarget = selectedCompactName ?? selectedModelId ?? ''
-  let loadButtonLabel = 'Select a Nexus model'
-  if (!selectedModelId) {
-    loadButtonLabel = 'Select a chat model'
-  } else if (!isNexusProvider) {
-    loadButtonLabel = 'External provider'
-  } else if (submittingLoad || (activeOp && activeOp.kind === 'chat_model_load')) {
-    loadButtonLabel = `Loading ${compactTarget}…`
-  } else if (isSelectedAlreadyLoaded) {
-    loadButtonLabel = 'Loaded'
-  } else if (loadedModelId) {
-    loadButtonLabel = `Switch to ${compactTarget}`
-  } else {
-    loadButtonLabel = `Load ${compactTarget}`
-  }
+  const runtimeStateText = isSwapping
+    ? 'Swapping GPU'
+    : activeOp
+      ? formatPhaseLabel(activeOp)
+      : isReady
+        ? 'Ready'
+        : runtime?.state === 'degraded'
+          ? 'Degraded'
+          : 'Not loaded'
 
-  const canClickLoad = Boolean(
-    selectedModelId
-    && isNexusProvider
-    && !isSelectedAlreadyLoaded
-    && !isOpRunning
-    && !unloading,
-  )
-  const canClickUnload = Boolean(loadedModelId && !isOpRunning && !unloading)
-  const runtimeStateText = isOpRunning ? 'Loading' : loadedModelId ? 'Ready' : 'Not loaded'
   const gpuMemoryText = formatGpuMemory(runtime)
 
   const popoverNode = open && coords && typeof document !== 'undefined'
@@ -537,7 +326,7 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
           <button
             type="button"
             className={css.closeBtn}
-            onClick={() => closePopover(true)}
+            onClick={() => { closePopover(true) }}
             aria-label="Close Nexus runtime panel"
           >
             ✕
@@ -546,15 +335,15 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
 
         <div className={css.section}>
           <div className={css.row}>
-            <span className={css.label}>Chat model</span>
-            <span className={css.value} title={selectedModelId ?? 'None selected'}>
-              {selectedFullName ?? 'None selected'}
+            <span className={css.label}>Language model</span>
+            <span className={css.value} title={langInfo?.id ?? 'Unavailable'}>
+              {langFullName ?? 'Unavailable'}
             </span>
           </div>
           <div className={css.row}>
-            <span className={css.label}>Runtime</span>
-            <span className={css.value} title={loadedModelId ?? 'Not loaded'}>
-              {loadedFullName ?? 'Not loaded'}
+            <span className={css.label}>Image generator</span>
+            <span className={css.value} title={imgInfo?.id ?? 'Disabled'}>
+              {imgFullName ?? 'Disabled'}
             </span>
           </div>
           <div className={css.row}>
@@ -563,49 +352,9 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
               {gpuMemoryText}
             </span>
           </div>
-
-          {!isNexusProvider && selectedModelId && (
-            <div className={css.helper}>
-              Selected model uses an external provider; Nexus GPU loading applies to Nexus models only.
-            </div>
-          )}
-
-          <div className={css.actions}>
-            <button
-              type="button"
-              className={css.primaryBtn}
-              disabled={!canClickLoad}
-              onClick={() => void handleLoad()}
-            >
-              {loadButtonLabel}
-            </button>
-            <button
-              type="button"
-              className={css.secondaryBtn}
-              disabled={!canClickUnload}
-              onClick={() => void handleUnload()}
-            >
-              {unloading ? 'Unloading…' : 'Unload'}
-            </button>
+          <div className={css.helper}>
+            Models are locked by Colab startup. Edit Section 3 in Colab to change models.
           </div>
-
-          {chatLoadError && (
-            <div className={css.errorBox} role="alert" data-error-scope="chat-load">
-              <div>{chatLoadError.message}</div>
-              {chatLoadError.diagnostic && (
-                <>
-                  <button
-                    type="button"
-                    className={css.detailsToggle}
-                    onClick={() => setShowChatDiag(prev => !prev)}
-                  >
-                    {showChatDiag ? 'Hide details' : 'Technical details'}
-                  </button>
-                  {showChatDiag && <pre className={css.detailsPre}>{chatLoadError.diagnostic}</pre>}
-                </>
-              )}
-            </div>
-          )}
         </div>
 
         {activeOp && (
@@ -631,35 +380,9 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
           </div>
         )}
 
-        <div className={css.section} data-section="image-generator">
-          <label className={css.label} htmlFor="nexus-image-model-select">
-            Image generator
-          </label>
-          <select
-            id="nexus-image-model-select"
-            className={css.select}
-            value={imageState?.selectedModelId ?? ''}
-            disabled={savingImage}
-            onChange={event => void handleImageModelChange(event.target.value)}
-          >
-            <option value="">Choose an image model</option>
-            {(imageState?.models ?? []).map(item => (
-              <option key={item.id} value={item.id}>
-                {resolveModelDisplayName(item.id, item.display_name)}
-              </option>
-            ))}
-          </select>
-          <div className={css.helper}>Required for image generation only.</div>
-          {imageError && (
-            <div className={css.errorBox} role="alert" data-error-scope="image-selection">
-              {imageError.message}
-            </div>
-          )}
-        </div>
-
         {statusError && (
           <div className={css.errorBox} role="alert" data-error-scope="runtime-status">
-            {statusError.message}
+            {statusError}
           </div>
         )}
       </div>,
@@ -673,10 +396,10 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
         ref={triggerRef}
         type="button"
         className={css.trigger}
-        onClick={() => setOpen(prev => !prev)}
+        onClick={() => { setOpen(prev => !prev) }}
         aria-expanded={open}
         aria-haspopup="dialog"
-        title={loadedModelId ? `Loaded: ${loadedModelId}` : selectedModelId ? `Selected: ${selectedModelId}` : 'Nexus runtime'}
+        title={langInfo ? `Locked model: ${langInfo.id}` : 'Nexus runtime'}
       >
         <span className={`${css.dot} ${dotClass}`} />
         <span className={css.triggerLabel}>{badgeText}</span>

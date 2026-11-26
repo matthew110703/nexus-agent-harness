@@ -1,51 +1,57 @@
-# Nexus Gateway (v1.0.0)
+# Nexus Gateway (v1.1.0 — Single-Model Runtime)
 
-Loopback-only (`127.0.0.1:7861`) OpenAI-compatible inference, Diffusers image-generation, capability-discovery, and isolated GPU worker gateway for **Nexus Harness**.
+Loopback-only (`127.0.0.1:7861`) OpenAI-compatible inference and Diffusers image-generation gateway for **Nexus AI Lab** on Google Colab.
+
+Model discovery, selection, and local SSD staging happen strictly during initial Colab bootstrap (`colab/model_inventory.py` + `colab/staging.py`), which writes a locked `session-runtime.json` manifest consumed by the Gateway.
 
 ## Architecture
 
 ```text
 nexus-gateway/src/
-├── main.py                      # Loopback-only uvicorn entrypoint
+├── main.py                       # Loopback-only uvicorn entrypoint reading session-runtime.json
 ├── api/
-│   ├── app.py                   # FastAPI app & all /v1/* + /health routes
-│   └── middleware/auth.py       # Constant-time Bearer auth + loopback enforcement
+│   ├── app.py                    # FastAPI app: single-model lock, bootstrap, swap-and-restore image gen
+│   └── middleware/auth.py        # Constant-time Bearer auth + loopback enforcement
 ├── core/
-│   ├── hardware_detector.py     # Dynamic GPU/VRAM/CUDA/RAM/disk detection (L4 baseline -> A100/H100)
-│   ├── model_registry.py        # Drive models/adapters/upscalers + adaptive Effort & sidecar overrides
-│   ├── model_staging.py         # Manifest-backed 4 MiB chunk staging with SHA-256 integrity & resume
-│   ├── resource_manager.py      # Non-thread-owned Lock serializing single active GPU workload
-│   └── worker_manager.py        # Subprocess lifecycle, health, graceful unload, forced VRAM release
+│   ├── hardware_detector.py      # Dynamic GPU/VRAM/CUDA/RAM/disk detection (L4 / A100-40GB / A100-80GB)
+│   ├── resource_manager.py       # Exclusive single-GPU Lock serializing inference & image swaps
+│   └── worker_manager.py         # Isolated subprocess lifecycle, live status, forced VRAM release
 ├── workers/
-│   ├── model_worker.py          # Isolated GPU worker subprocess owning CUDA context & weights
-│   └── worker_protocol.py       # Typed worker RPC schemas
+│   ├── model_worker.py           # Isolated GPU worker lazy-importing only the selected model module
+│   └── worker_protocol.py        # Typed worker RPC schemas
+├── models/
+│   ├── base.py                   # SessionRuntimeConfig, minimal runtime protocols, lazy importlib loader
+│   ├── language/
+│   │   ├── common.py             # Authorized data:image/* decoder & tool-call argument dict normalization
+│   │   ├── qwen3_vl.py           # Dedicated Qwen3-VL runtime (4B/8B/Heretic)
+│   │   ├── qwen3_5.py            # Dedicated Qwen3.5 / Qwen3.6 VLM + Thinking runtime
+│   │   └── gpt_oss.py            # Dedicated GPT-OSS Harmony runtime
+│   └── image/
+│       ├── flux2_klein.py        # Dedicated FLUX.2-klein (4B/9B) Diffusers runtime
+│       └── sdxl.py               # Dedicated SDXL Diffusers runtime
 ├── adapters/
-│   ├── transformers.py          # Transformers chat adapter (explicit precision, enable_thinking)
-│   ├── qwen_vl.py               # Qwen2.5-VL / Qwen3-VL multimodal adapter
-│   ├── tool_calls.py            # Incremental native <tool_call> streaming parser + JSON schema validator
-│   └── diffusers.py             # Independent Diffusers/FLUX.2 adapter with explicit quality profiles
+│   └── tool_calls.py             # Qwen JSON, Qwen3.5 XML+Think, and GPT-OSS Harmony stream parsers
 └── services/
-    ├── progress.py              # Bounded operation progress registry
-    ├── conversation.py          # Message normalization & model-aware reasoning control resolution
-    └── image_generation.py      # Atomic PNG + JSON metadata sidecar persistence to Google Drive
+    ├── progress.py               # Bounded operation progress registry (including GPU swap phases)
+    ├── conversation.py           # Message normalization & model-aware reasoning control resolution
+    └── image_generation.py       # Atomic PNG + JSON metadata sidecar persistence to Google Drive
 ```
 
 ## Endpoints
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `GET /health` | None | Gateway uptime, worker status, discovered model counts |
-| `GET /v1/models` | Bearer | Chat/VLM models with `modalities`, `context_window`, `reasoning`, `reasoning_efforts` |
-| `GET /v1/image-models` | Bearer | Independent Diffusers/FLUX.2 image models and quality profiles (`normal`, `detailed`, `maximum`) |
-| `POST /v1/chat/completions` | Bearer | OpenAI-compatible streaming SSE & non-streaming chat with native tool calls & adaptive Effort |
-| `POST /v1/images/generations` | Bearer | Independent image generation with explicit quality profiles & Drive PNG + JSON persistence |
-| `GET /v1/runtime` | Bearer | Live hardware snapshot, worker status, active workload, adapters, upscalers, diagnostics |
-| `POST /v1/runtime/load` | Bearer | Explicit model staging + worker load |
-| `POST /v1/runtime/unload` | Bearer | Graceful unload (with optional `force_terminate: true` to release CUDA context) |
-| `GET /v1/progress` | Bearer | Compact progress snapshot for Harness UI |
+| `GET /health` | None | Live worker readiness (`ready`, `state`), locked model IDs, uptime |
+| `GET /v1/models` | Bearer | Single-element list containing the locked Colab language model |
+| `GET /v1/runtime` | Bearer | Live hardware, worker status, locked language/image specs, VRAM |
+| `POST /v1/runtime/bootstrap` | Bearer | Colab-only warm load of the locked language model (HTTP 409 on any other model) |
+| `POST /v1/runtime/unload` | Bearer | Graceful unload / `force_terminate` worker cleanup for Colab shutdown |
+| `POST /v1/runtime/cancel` | Bearer | Cancel an in-flight image generation operation |
+| `POST /v1/chat/completions` | Bearer | Streaming SSE & non-streaming chat with native tool calls & reasoning (HTTP 503 if not ready) |
+| `POST /v1/images/generations` | Bearer | Atomic GPU swap (Unload LLM → Load pre-staged Image → Denoise & Save → Reload LLM) |
+| `GET /v1/progress` | Bearer | Compact progress snapshot for Harness read-only UI |
 | `GET /v1/progress/{operation_id}` | Bearer | Individual operation progress |
-| `POST /v1/tools/parse` | Bearer | Structured native tool-call parse & schema validation |
-| `GET /v1/plugin-index.json` | Loopback | Curated format-1 Nexus plugin index for Harness **Plugins → Discover** |
+| `GET /v1/plugin-index.json` | Loopback | Curated format-1 Nexus plugin index |
 
 ## Running Tests
 

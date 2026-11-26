@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Nexus Harness Colab Supervisor
+ * Nexus Harness Colab Supervisor (v1.1.0 — Single-Model Lock)
  *
- * Launches `cloudflared` (quick tunnel -> 127.0.0.1:3080) and `dsh web` with
- * exact `--public-url` and `--trusted-host` flags, streams all child logs
- * continuously, redacts `NEXUS_API_KEY`, verifies TCP/HTTP readiness, and
- * cleans up only child processes it spawned.
+ * Verifies live Gateway readiness and the single Colab-loaded language model
+ * via `/v1/runtime`, locks Harness `llm-pi-ai` and `agent-default-model` to
+ * that single model, launches `cloudflared` (quick tunnel -> 127.0.0.1:3080)
+ * and `dsh web`, redacts `NEXUS_API_KEY`, and cleans up only managed children.
  */
 
 import { spawn } from 'node:child_process'
@@ -13,7 +13,7 @@ import net from 'node:net'
 import process from 'node:process'
 
 const HARNESS_PORT = Number(process.env.NEXUS_HARNESS_PORT || 3080)
-const GATEWAY_URL = process.env.NEXUS_GATEWAY_URL || 'http://127.0.0.1:7861'
+const GATEWAY_ROOT_URL = process.env.NEXUS_GATEWAY_ROOT_URL || 'http://127.0.0.1:7861'
 const OVERLAY_PATHS = [
   process.env.NEXUS_OVERLAY || 'apps/cli/config/examples/colab.overlay.yml',
   process.env.NEXUS_EXTRA_OVERLAY || '',
@@ -23,46 +23,27 @@ const API_KEY = process.env.NEXUS_API_KEY || ''
 const TRYCLOUDFLARE_RE = /https:\/\/([a-z0-9-]+\.trycloudflare\.com)/i
 const LAUNCH_URL_RE = /(https?:\/\/[^\s]+?\?token=[A-Za-z0-9_-]+)/
 
-/**
- * Check compatibility with the repository's Node engine:
- *   ^24.22.3 || >=26.13.1
- */
+/** Check compatibility with the repository's Node engine: ^24.22.3 || >=26.13.1 */
 export function isNodeVersionCompatible(versionString) {
   const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(versionString || '')
-
-  if (!match) {
-    return false
-  }
-
+  if (!match) return false
   const version = match.slice(1, 4).map(Number)
   const [major] = version
-
   const compare = (a, b) => {
     for (let i = 0; i < 3; i++) {
-      if (a[i] !== b[i]) {
-        return a[i] > b[i] ? 1 : -1
-      }
+      if (a[i] !== b[i]) return a[i] > b[i] ? 1 : -1
     }
     return 0
   }
-
-  if (major === 24) {
-    return compare(version, [24, 22, 3]) >= 0
-  }
-
-  if (major >= 26) {
-    return compare(version, [26, 13, 1]) >= 0
-  }
-
+  if (major === 24) return compare(version, [24, 22, 3]) >= 0
+  if (major >= 26) return compare(version, [26, 13, 1]) >= 0
   return false
 }
 
 /** Enforce the repository's Node.js engine requirement. */
 export function assertMinNodeVersion(versionString = process.versions.node) {
   if (!isNodeVersionCompatible(versionString)) {
-    throw new Error(
-      `Node.js ^24.22.3 || >=26.13.1 is required (found ${versionString})`,
-    )
+    throw new Error(`Node.js ^24.22.3 || >=26.13.1 is required (found ${versionString})`)
   }
 }
 
@@ -117,105 +98,78 @@ async function waitForPort(port, timeoutMs = 30_000) {
   return false
 }
 
-/** Convert an OpenAI `/v1/models` payload into `llm-pi-ai` model profile entries. */
-export function parseDiscoveredModels(payload) {
-  const list = Array.isArray(payload?.data) ? payload.data : []
-  const seen = new Set()
-  const models = []
-  for (const item of list) {
-    if (typeof item?.id !== 'string' || item.id.trim().length === 0) continue
-    const id = item.id.trim()
-    if (seen.has(id)) continue
-    seen.add(id)
-    const entry = {
-      id,
-      name: typeof item.display_name === 'string' && item.display_name.trim().length > 0
-        ? item.display_name.trim()
-        : typeof item.name === 'string' && item.name.trim().length > 0
-          ? item.name.trim()
-          : id,
-    }
-    const rawModalities = Array.isArray(item.input)
-      ? item.input
-      : Array.isArray(item.modalities)
-        ? item.modalities
-        : undefined
-    if (rawModalities !== undefined) {
-      const input = rawModalities.filter((m) => m === 'text' || m === 'image')
-      if (input.length > 0) entry.input = input
-    }
-    const contextWindow = item.context_window ?? item.context_length ?? item.contextWindow
-    if (typeof contextWindow === 'number' && Number.isInteger(contextWindow) && contextWindow >= 1) {
-      entry.contextWindow = contextWindow
-    }
-    const maxTokens = item.max_output_tokens ?? item.max_tokens ?? item.maxTokens
-    if (typeof maxTokens === 'number' && Number.isInteger(maxTokens) && maxTokens >= 1) {
-      entry.maxTokens = maxTokens
-    }
-    // Preserve model-specific reasoning Efforts without inventing fake levels.
-    const rawEfforts = item.reasoning_efforts ?? item.reasoningEfforts
-    if (rawEfforts === false) {
-      entry.reasoningEfforts = false
-    } else if (rawEfforts && typeof rawEfforts === 'object' && !Array.isArray(rawEfforts)) {
-      const cleaned = {}
-      for (const [level, wire] of Object.entries(rawEfforts)) {
-        if (wire === null || typeof wire === 'string') {
-          cleaned[level] = wire
-        }
-      }
-      if (Object.keys(cleaned).length > 0) {
-        entry.reasoningEfforts = cleaned
-      }
-    }
-    models.push(entry)
+/** Convert Gateway's single `language_model` record into a 1-element `llm-pi-ai` model profile. */
+export function buildLockedModelProfile(item) {
+  if (!item || typeof item.id !== 'string' || item.id.trim().length === 0) {
+    throw new Error('Gateway /v1/runtime did not return a valid locked language_model')
   }
-  return models
+  const id = item.id.trim()
+  const entry = {
+    id,
+    name: typeof item.display_name === 'string' && item.display_name.trim().length > 0
+      ? item.display_name.trim()
+      : id,
+  }
+  const rawModalities = Array.isArray(item.modalities) ? item.modalities : ['text']
+  const input = rawModalities.filter((m) => m === 'text' || m === 'image')
+  if (input.length > 0) entry.input = input
+  if (typeof item.context_window === 'number' && Number.isInteger(item.context_window) && item.context_window >= 1) {
+    entry.contextWindow = item.context_window
+  }
+  if (typeof item.max_output_tokens === 'number' && Number.isInteger(item.max_output_tokens) && item.max_output_tokens >= 1) {
+    entry.maxTokens = item.max_output_tokens
+  }
+  const rawEfforts = item.reasoning_efforts
+  if (rawEfforts === false) {
+    entry.reasoningEfforts = false
+  } else if (rawEfforts && typeof rawEfforts === 'object' && !Array.isArray(rawEfforts)) {
+    const cleaned = {}
+    for (const [level, wire] of Object.entries(rawEfforts)) {
+      if (wire === null || typeof wire === 'string') cleaned[level] = wire
+    }
+    if (Object.keys(cleaned).length > 0) entry.reasoningEfforts = cleaned
+  }
+  return entry
 }
 
-async function discoverGatewayModels() {
-  try {
-    const modelsUrl = new URL('/v1/models', GATEWAY_URL)
-    const res = await fetch(modelsUrl, {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-      signal: AbortSignal.timeout(5000),
-    })
-    if (!res.ok) {
-      console.warn(`[supervisor] Warning: gateway /v1/models returned HTTP ${res.status}; starting with empty model list.`)
-      return []
-    }
-    const payload = await res.json()
-    return parseDiscoveredModels(payload)
-  } catch (err) {
-    console.warn(`[supervisor] Warning: could not fetch /v1/models (${redactSecrets(String(err))}); starting with empty model list.`)
-    return []
-  }
-}
-
-async function verifyGatewayHealth() {
+/** Verify Gateway live readiness and return the single locked language model profile. */
+async function verifyGatewaySessionReady() {
   if (!API_KEY) {
     throw new Error('NEXUS_API_KEY is not set in the environment')
   }
-  const healthUrl = new URL('/health', GATEWAY_URL)
-  const res = await fetch(healthUrl, { signal: AbortSignal.timeout(5000) })
+  const runtimeUrl = new URL('/v1/runtime', GATEWAY_ROOT_URL)
+  const res = await fetch(runtimeUrl, {
+    headers: { Authorization: `Bearer ${API_KEY}` },
+    signal: AbortSignal.timeout(8000),
+  })
   if (!res.ok) {
-    throw new Error(`Nexus gateway health check failed (HTTP ${res.status})`)
+    throw new Error(`Nexus gateway /v1/runtime check failed (HTTP ${res.status})`)
+  }
+  const payload = await res.json()
+  const worker = payload?.worker ?? {}
+  const lang = payload?.language_model
+  if (!payload?.ready || !worker.alive || worker.active_model_id !== lang?.id) {
+    throw new Error(
+      `Nexus gateway is not ready (ready=${payload?.ready}, state=${payload?.state}, `
+      + `worker.alive=${worker.alive}, active_model=${worker.active_model_id ?? 'none'}). `
+      + 'Run the Colab model bootstrap cell before starting Harness.',
+    )
+  }
+  return {
+    lockedModel: buildLockedModelProfile(lang),
+    imageModelId: payload?.image_model?.id ?? null,
   }
 }
 
 async function main() {
   assertMinNodeVersion()
   console.log(`[supervisor] Node ${process.versions.node} verified.`)
-  console.log('[supervisor] Verifying independent Nexus gateway health (127.0.0.1:7861)...')
-  await verifyGatewayHealth()
-
-  const discoveredModels = process.env.NEXUS_DISCOVERED_MODELS
-    ? undefined
-    : await discoverGatewayModels()
-  if (discoveredModels !== undefined) {
-    const names = discoveredModels.map((m) => m.id).join(', ')
-    const suffix = discoveredModels.length > 0 ? `: ${names}` : ''
-    console.log(`[supervisor] Discovered ${discoveredModels.length} model(s) from Nexus gateway${suffix}.`)
-  }
+  console.log('[supervisor] Verifying live Nexus gateway readiness and single loaded model...')
+  const { lockedModel, imageModelId } = await verifyGatewaySessionReady()
+  console.log(
+    `[supervisor] Locked language model ready: ${lockedModel.id}`
+    + (imageModelId ? ` | Image model: ${imageModelId}` : ' | Image model: disabled'),
+  )
 
   if (await isPortOpen(HARNESS_PORT)) {
     throw new Error(
@@ -286,10 +240,11 @@ async function main() {
     trustedHost: tunnelHost,
     port: HARNESS_PORT,
   })
-  console.log(`[supervisor] Starting Nexus Harness (${publicUrl})...`)
+  console.log(`[supervisor] Starting locked Nexus Harness (${publicUrl})...`)
   const harnessEnv = {
     ...process.env,
-    ...(discoveredModels !== undefined ? { NEXUS_DISCOVERED_MODELS: JSON.stringify(discoveredModels) } : {}),
+    NEXUS_DISCOVERED_MODELS: JSON.stringify([lockedModel]),
+    NEXUS_SELECTED_LANGUAGE_MODEL: lockedModel.id,
   }
   const harness = spawn('pnpm', dshArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],

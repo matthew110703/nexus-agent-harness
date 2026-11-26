@@ -1,4 +1,4 @@
-# Nexus Harness 1.0.0 Colab overlay:
+# Nexus Harness v1.1.0 Colab overlay (Single-Model Lock):
 #   dsh web --patch apps/cli/config/examples/colab.overlay.yml \
 #     --public-url https://<tunnel>.trycloudflare.com \
 #     --trusted-host <tunnel>.trycloudflare.com \
@@ -6,11 +6,12 @@
 #
 # Architecture & security defaults:
 # - Loopback-only Nexus gateway (http://127.0.0.1:7861/v1) with Host-only NEXUS_API_KEY
+# - Single Colab-selected language model locked in llm-pi-ai and agent-default-model
+# - External DeepSeek routes and Models settings page disabled (no mid-session model switching)
 # - Trust X-Forwarded-Proto: https only from loopback proxy peers (cloudflared)
 # - Constrain directory picker to approved persistent Drive + Colab workspace roots
-# - Native Nexus Host plugin (independent image generation + progress/runtime proxies)
-# - Native Plugin Marketplace (Installed + Discover tabs) backed by Nexus curated index
-# - Zero MCP integrations
+# - Native Nexus Host plugin (single-model image generation + read-only runtime/progress proxies)
+# - Read-only Nexus Runtime UI status badge & live progress popover
 
 - id: authentication-token
   config:
@@ -22,6 +23,20 @@
       - !!js process.env.NEXUS_WORKSPACE_ROOT || '/content/drive/MyDrive/Nexus/workspaces/projects'
       - !!js process.env.NEXUS_SHARED_WORKSPACE_ROOT || '/content/drive/MyDrive/Nexus/workspaces/shared'
       - !!js process.env.NEXUS_OUTPUTS_ROOT || '/content/drive/MyDrive/Nexus/outputs'
+
+- id: agent-default-model
+  config:
+    provider: nexus
+    model: !!js process.env.NEXUS_SELECTED_LANGUAGE_MODEL || ''
+
+- id: llm-deepseek
+  disabled: true
+
+- id: llm-deepseek-account
+  disabled: true
+
+- id: ui-settings-models
+  disabled: true
 
 - id: llm-pi-ai
   config:

@@ -121,20 +121,12 @@ def test_7_and_8_new_file_and_drive_deletion_preserves_runtime(tmp_path: Path) -
     assert (rt / "nexus-gateway" / "src" / "extra.py").is_file()
 
 
-def test_9_and_10_plugin_index_mapping_and_capability_sidecar_handling(tmp_path: Path) -> None:
+def test_9_and_10_plugin_index_and_colab_script_mappings() -> None:
     assert sync_source.map_drive_to_runtime_rel("config/plugin-index.json") == "colab/plugin-index.json"
     assert sync_source.map_drive_to_runtime_rel("config/colab.overlay.yml") == "apps/cli/config/examples/colab.overlay.yml"
-    assert sync_source.map_drive_to_runtime_rel("config/model-capabilities.json") is None
-
-    drive_cfg = tmp_path / "drive" / "colab-src" / "config"
-    canonical = _REPO_ROOT / "colab" / "model-capabilities.example.json"
-    init_res = sync_source.ensure_capabilities_sidecar(drive_cfg, canonical)
-    assert init_res["created"] is True
-    assert init_res["loaded"] is True
-    # Canonical example must NOT default tool_behavior_verified to True.
-    parsed = json.loads((drive_cfg / "model-capabilities.json").read_text(encoding="utf-8"))
-    for model_cfg in parsed["models"].values():
-        assert model_cfg.get("tool_behavior_verified") is not True
+    assert sync_source.map_drive_to_runtime_rel("scripts/model_inventory.py") == "colab/model_inventory.py"
+    assert sync_source.map_drive_to_runtime_rel("scripts/staging.py") == "colab/staging.py"
+    assert sync_source.classify_restart_target("nexus-gateway/src/models/language/qwen3_vl.py") == "model_worker"
 
 
 def test_11_and_12_invalid_syntax_rejected_and_multi_file_rollback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

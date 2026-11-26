@@ -17,7 +17,7 @@ SNAPSHOT_FORMAT_VERSION = 1
 
 # Only non-secret durable session/profile state is copied to Drive snapshots.
 ALLOWED_TOP_LEVEL_DIRS = ("sessions", "attachments")
-ALLOWED_FILENAMES = ("nexus-image-selection.json",)
+ALLOWED_FILENAMES: tuple[str, ...] = ()
 
 SECRET_DIR_NAMES = frozenset({"credentials", ".ssh", ".gnupg"})
 SECRET_FILE_PATTERNS = (

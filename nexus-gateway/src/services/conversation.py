@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from core.model_registry import DiscoveredModel
+from models.base import SelectedLanguageSpec
 
 
 def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -35,38 +35,43 @@ def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def resolve_reasoning_controls(
-    model: DiscoveredModel,
+    spec: SelectedLanguageSpec,
     requested_effort: Optional[str],
     requested_enable_thinking: Optional[bool] = None,
 ) -> tuple[Optional[str], Optional[bool]]:
     """
     Resolve model-specific reasoning controls without inventing unsupported levels.
-    Keeps max output tokens completely separate from reasoning Effort.
+    Honors explicit `off` wire values so disabling thinking in Harness actually disables it.
     """
-    cap = model.reasoning
-    if cap.status != "supported":
+    mode = spec.reasoning_mode
+    if mode == "none":
         return None, None
 
-    if cap.mode == "binary_toggle":
+    efforts = spec.reasoning_efforts if isinstance(spec.reasoning_efforts, dict) else {}
+
+    if mode == "binary_toggle":
         if requested_enable_thinking is not None:
-            return ("high" if requested_enable_thinking else None), bool(requested_enable_thinking)
+            return ("high" if requested_enable_thinking else "off"), bool(requested_enable_thinking)
         if requested_effort in (None, "", "auto"):
-            default_on = cap.default not in (None, "off")
-            return (cap.default if default_on else None), default_on
-        if requested_effort == "off":
-            return None, False
-        if requested_effort in cap.levels:
-            return cap.levels[requested_effort], True
+            default_on = spec.default_reasoning_effort not in (None, "off")
+            return (spec.default_reasoning_effort if default_on else "off"), default_on
+        if requested_effort in ("off", "none"):
+            return "off", False
+        if requested_effort in efforts:
+            wire = efforts[requested_effort]
+            return (str(wire) if wire else "high"), True
         return None, None
 
-    if cap.mode == "effort_levels":
+    if mode == "effort_levels":
         if requested_effort in (None, "", "auto"):
-            return cap.default, (cap.default not in (None, "off"))
-        if requested_effort == "off":
-            return None, False
-        if requested_effort in cap.levels:
-            wire = cap.levels[requested_effort]
-            return wire, (wire is not None)
-        return cap.default, (cap.default not in (None, "off"))
+            default_lvl = spec.default_reasoning_effort or "medium"
+            return default_lvl, (default_lvl != "off")
+        if requested_effort in ("off", "none"):
+            return "low", False
+        if requested_effort in efforts:
+            wire = efforts[requested_effort]
+            return (str(wire) if wire else spec.default_reasoning_effort or "medium"), True
+        default_lvl = spec.default_reasoning_effort or "medium"
+        return default_lvl, True
 
     return None, None

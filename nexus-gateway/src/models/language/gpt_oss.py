@@ -1,4 +1,4 @@
-"""Transformers chat model adapter running inside the isolated GPU worker."""
+"""Dedicated GPT-OSS Harmony language model runtime (GPT-OSS-20B-Abliterated)."""
 
 from __future__ import annotations
 
@@ -7,36 +7,29 @@ import threading
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from models.base import select_torch_dtype
+from models.language.common import deserialize_tool_call_arguments
 
-def select_torch_dtype(torch_mod: Any, precision: Optional[str] = None) -> Any:
+
+class GptOssLanguageModel:
     """
-    Select a hardware-supported dtype without silently picking float16 on CPU.
-    - CPU: float32 by default (bf16 only if explicitly requested and supported).
-    - CUDA: bf16 when supported, otherwise float16 (or explicit override).
+    Dedicated runtime for GPT-OSS checkpoints (`GptOssForCausalLM`, Harmony chat template).
+    - Text-only causal LM (`AutoModelForCausalLM` + `AutoTokenizer`).
+    - Deserializes `tool_calls[].function.arguments` into dicts before `|tojson`.
+    - Passes `reasoning_effort` (`low` | `medium` | `high`) directly to `apply_chat_template`.
     """
-    cuda = bool(torch_mod.cuda.is_available())
-    if not cuda:
-        if precision == "bf16":
-            return torch_mod.bfloat16
-        return torch_mod.float32
-    if precision == "fp32":
-        return torch_mod.float32
-    if precision == "fp16":
-        return torch_mod.float16
-    if precision == "bf16" or bool(getattr(torch_mod.cuda, "is_bf16_supported", lambda: False)()):
-        return torch_mod.bfloat16
-    return torch_mod.float16
 
+    implementation = "gpt_oss"
 
-class TransformersChatAdapter:
-    """Explicit-precision Hugging Face Transformers chat adapter."""
-
-    def __init__(self, *, model_id: str, model_path: Path, architecture: str = "unknown") -> None:
+    def __init__(self, *, model_id: str, model_path: Path, architecture: str = "GptOssForCausalLM") -> None:
         self.model_id = model_id
         self.model_path = model_path
         self.architecture = architecture
         self.model: Any = None
         self.tokenizer: Any = None
+
+    def is_ready(self) -> bool:
+        return self.model is not None and self.tokenizer is not None
 
     def load(self, *, precision: Optional[str] = None) -> None:
         import torch  # type: ignore[import-not-found]
@@ -53,54 +46,57 @@ class TransformersChatAdapter:
         )
         self.model.eval()
 
-    def _apply_template(
+    def _format_prompt(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        enable_thinking: Optional[bool],
-        reasoning_effort: Optional[str] = None,
+        reasoning_effort: Optional[str],
     ) -> str:
-        kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        prepared = deserialize_tool_call_arguments(messages)
+        # Flatten list content blocks to text for text-only Harmony template.
+        flat_messages: list[dict[str, Any]] = []
+        for msg in prepared:
+            copied = dict(msg)
+            content = copied.get("content")
+            if isinstance(content, list):
+                copied["content"] = "\n".join(
+                    str(b.get("text") or "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+            flat_messages.append(copied)
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "reasoning_effort": reasoning_effort or "medium",
+        }
         if tools:
             kwargs["tools"] = tools
-        if enable_thinking is not None:
-            kwargs["enable_thinking"] = enable_thinking
-        if reasoning_effort is not None:
-            kwargs["reasoning_effort"] = reasoning_effort
-        try:
-            return str(self.tokenizer.apply_chat_template(messages, **kwargs))
-        except TypeError:
-            kwargs.pop("reasoning_effort", None)
-            try:
-                return str(self.tokenizer.apply_chat_template(messages, **kwargs))
-            except TypeError:
-                kwargs.pop("enable_thinking", None)
-                return str(self.tokenizer.apply_chat_template(messages, **kwargs))
+        return str(self.tokenizer.apply_chat_template(flat_messages, **kwargs))
 
     def generate_stream(self, req: dict[str, Any]) -> Iterator[str]:
         import torch  # type: ignore[import-not-found]
         from transformers import TextIteratorStreamer  # type: ignore[import-not-found]
 
-        if self.model is None or self.tokenizer is None:
-            raise RuntimeError("TransformersChatAdapter is not loaded")
+        if not self.is_ready():
+            raise RuntimeError(f"GptOssLanguageModel ({self.model_id}) is not loaded")
 
         messages = req.get("messages") or []
         tools = req.get("tools") or []
-        enable_thinking = req.get("enable_thinking")
         reasoning_effort = req.get("reasoning_effort")
-        prompt = self._apply_template(messages, tools, enable_thinking, reasoning_effort)
+        prompt = self._format_prompt(messages, tools, reasoning_effort)
+
         inputs = self.tokenizer(prompt, return_tensors="pt")
         device = next(self.model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=False)
+        temperature = float(req.get("temperature", 0.7))
         gen_kwargs: dict[str, Any] = {
             **inputs,
             "streamer": streamer,
-            "max_new_tokens": int(req.get("max_tokens") or 2048),
-            "do_sample": float(req.get("temperature") or 0.7) > 0,
-            "temperature": max(0.01, float(req.get("temperature") or 0.7)),
-            "top_p": float(req.get("top_p") or 0.9),
+            "max_new_tokens": int(req.get("max_tokens") or 4096),
+            "do_sample": temperature > 0,
+            "temperature": max(0.01, temperature),
+            "top_p": float(req.get("top_p", 0.9)),
         }
 
         exc_holder: list[BaseException] = []
