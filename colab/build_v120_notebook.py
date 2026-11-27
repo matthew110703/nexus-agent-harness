@@ -28,14 +28,13 @@ def build_v120_notebook() -> dict[str, Any]:
 
 Colab-first, single-active-model runtime connecting **Google Drive Inventory → Pre-Run Model Selection → Local SSD Staging → Loopback Nexus Gateway (`127.0.0.1:7861`) → Isolated GPU Worker (Dedicated Lazy-Imported Model Modules) → Locked Single-Model Nexus Harness (`127.0.0.1:3080`)**.
 
-### What's New in v1.2.0:
-- **Comprehensive Model Support**: All 8 Drive models supported dynamically:
+- **What's New in v1.2.0**:
   - **GGUF Models (`llama-server`)**: `Qwen3.5-9B-Defiant-Fable-Uncensored`, `Gemma4-26B-A4B-QAT-Uncensored-MTP`, `DeepSeek-V4-Pro-Qwen3.5-9B-Uncensored`.
-  - **Safetensors Large Language / VLM Models**: `Qwen3.5-4B`, `Gemma-3-12B-IT` (4-bit NF4 auto-fit), `DeepSeek-VL2-Small` (4-bit NF4 auto-fit), `DeepSeek-VL-7B-Chat`, `GPT-OSS-20B-Abliterated` (4-bit NF4 auto-fit).
-  - **Diffusers & Monolithic SDXL**: Fixed `shootstuff/LUSTIFY-v2.0` fp16 component variant loading & monolithic single-file fallback.
-- **Drive Workspace Persistence**: Harness working directory defaults to `/content/drive/MyDrive/Nexus/workspaces/projects/default-workspace`. All generated images route into `<active_workspace>/generated_images/` on Drive.
-- **Durable Storage Backup**: Harness snapshots persist `storages/`, preserving custom workspace names, order, and pins across Colab restarts.
-- **Inline Gallery Rendering**: Inline image tool views with durable attachment support.
+  - **Safetensors Language / VLM Models**: `Qwen3.5-4B`, `Gemma-3-12B-IT` (auto 4-bit NF4 on L4), `DeepSeek-VL2-Small` (auto 4-bit NF4 on L4), `DeepSeek-VL-7B-Chat`, `GPT-OSS-20B-Abliterated` (auto 4-bit NF4 on L4).
+  - **SDXL FP16 & Single-File Fix**: Resolves `shootstuff/LUSTIFY-v2.0` (`variant="fp16"` + monolithic `.safetensors` fallback).
+  - **Workspace-Scoped Image Persistence**: Generated images save into `<active_workspace>/generated_images/` on Drive, and Harness snapshots preserve `storages/` across Colab resets.
+- **Two-cell selection flow**: Run **Section 2** to mount Drive, inspect your GPU, and list all runnable language & image models in `MyDrive/Nexus/models/`, then paste **one** language model and **one** image model into **Section 3**.
+- **No mid-session model switching**: Harness is locked to the single selected language model and single selected image model. To change models, update **Section 3** and re-run from Section 3 (or restart the runtime).
 """
         ),
         _md("## 1. Configuration and paths"),
@@ -83,83 +82,129 @@ os.environ["NEXUS_GATEWAY_HOST"] = NEXUS_GATEWAY_HOST
 os.environ["NEXUS_GATEWAY_PORT"] = str(NEXUS_GATEWAY_PORT)
 os.environ["NEXUS_GATEWAY_ROOT_URL"] = NEXUS_GATEWAY_ROOT_URL
 os.environ["NEXUS_GATEWAY_URL"] = NEXUS_GATEWAY_URL
-os.environ["NEXUS_HARNESS_HOME"] = str(NEXUS_HARNESS_HOME)
+os.environ["NEXUS_HARNESS_PORT"] = str(NEXUS_HARNESS_PORT)
+os.environ["NEXUS_PLUGIN_INDEX_URL"] = f"{NEXUS_GATEWAY_ROOT_URL}/v1/plugin-index.json"
 os.environ["HF_HOME"] = str(NEXUS_HF_CACHE_DIR)
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-os.environ["PYTHONPATH"] = (
-    f"{NEXUS_HARNESS_DIR / 'colab'}:{NEXUS_HARNESS_DIR / 'nexus-gateway' / 'src'}:"
-    f"{NEXUS_COLAB_SRC_DIR}:{os.environ.get('PYTHONPATH', '')}".rstrip(":")
-)
+os.environ["DSH_HOME"] = str(NEXUS_HARNESS_HOME)
 
-for p in (
-    NEXUS_STAGE_DIR,
-    NEXUS_WORKSPACE_ROOT / "default-workspace",
-    NEXUS_SHARED_WORKSPACE_ROOT,
-    NEXUS_IMAGE_OUTPUT_DIR,
-    NEXUS_HARNESS_HOME,
-    NEXUS_HARNESS_HOME_DRIVE_BACKUP,
-    NEXUS_HF_CACHE_DIR,
-    NEXUS_COLAB_SRC_DIR,
-    NEXUS_RUNTIME_MANIFEST_DIR,
-):
-    p.mkdir(parents=True, exist_ok=True)
-
-print("[OK] Paths and environment configured for Nexus v1.2.0.")
+NEXUS_MANAGED_PIDS = {}
+print("[CONFIG] Nexus v1.2.0 paths configured.")
 """
         ),
-        _md("## 2. Sync Repository / Colab-Src & Inspect Google Drive Models"),
+        _md("## 2. Mount Drive, Checkout Harness, Detect GPU & List Available Models"),
+        _code(
+            """
+# @title
+import importlib
+import json
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from google.colab import drive
+
+drive.mount("/content/drive", force_remount=False)
+assert NEXUS_DRIVE_ROOT.is_dir(), f"Expected Drive directory not found: {NEXUS_DRIVE_ROOT}"
+
+for rel in (
+    "colab-src/nexus-gateway",
+    "colab-src/supervisor",
+    "colab-src/scripts",
+    "colab-src/config",
+    "workspaces/projects/default-workspace",
+    "workspaces/shared",
+    "harness-home/snapshots",
+    "runtime-manifests/source",
+    "runtime-manifests/staging",
+    "runtime-manifests/runtime",
+):
+    (NEXUS_DRIVE_ROOT / rel).mkdir(parents=True, exist_ok=True)
+for local_dir in (NEXUS_IMAGE_OUTPUT_DIR, NEXUS_STAGE_DIR, NEXUS_HARNESS_HOME, NEXUS_HF_CACHE_DIR):
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+# Clone or fast-forward Harness checkout (refuse dirty tree).
+if not NEXUS_HARNESS_DIR.exists():
+    subprocess.run(
+        ["git", "clone", "--branch", "main", "--single-branch", NEXUS_HARNESS_REPO_URL, str(NEXUS_HARNESS_DIR)],
+        check=True,
+    )
+else:
+    dirty = subprocess.check_output(["git", "-C", str(NEXUS_HARNESS_DIR), "status", "--porcelain"], text=True).strip()
+    if dirty:
+        raise RuntimeError("Refusing to overwrite dirty runtime checkout:\\n" + dirty)
+subprocess.run(["git", "-C", str(NEXUS_HARNESS_DIR), "fetch", "origin", "main"], check=True)
+target_ref = NEXUS_HARNESS_GIT_REF.strip() if NEXUS_HARNESS_GIT_REF.strip() else "origin/main"
+resolved_sha = subprocess.check_output(["git", "-C", str(NEXUS_HARNESS_DIR), "rev-parse", target_ref], text=True).strip()
+subprocess.run(["git", "-C", str(NEXUS_HARNESS_DIR), "checkout", "--detach", resolved_sha], check=True)
+NEXUS_ACTIVE_COMMIT = resolved_sha
+print(f"[GIT] Checked out {target_ref} -> {NEXUS_ACTIVE_COMMIT}")
+
+# Sync Drive colab-src/ before running inventory.
+for p in (NEXUS_HARNESS_DIR / "colab", NEXUS_HARNESS_DIR / "nexus-gateway" / "src"):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
+import sync_source
+sync_source = importlib.reload(sync_source)
+sync_source.seed_drive_baseline(
+    NEXUS_HARNESS_DIR,
+    NEXUS_COLAB_SRC_DIR,
+    NEXUS_SYNC_MANIFEST,
+    git_commit=NEXUS_ACTIVE_COMMIT,
+    rel_pairs=[
+        ("supervisor/supervisor.mjs", "colab/supervisor.mjs"),
+        ("scripts/sync_source.py", "colab/sync_source.py"),
+        ("scripts/harness_home_snapshot.py", "colab/harness_home_snapshot.py"),
+        ("scripts/model_inventory.py", "colab/model_inventory.py"),
+        ("scripts/runtime_deps.py", "colab/runtime_deps.py"),
+        ("scripts/staging.py", "colab/staging.py"),
+        ("config/colab.overlay.yml", "apps/cli/config/examples/colab.overlay.yml"),
+        ("config/plugin-index.json", "colab/plugin-index.json"),
+    ],
+)
+sync_report = sync_source.apply_sync(
+    NEXUS_COLAB_SRC_DIR,
+    NEXUS_HARNESS_DIR,
+    NEXUS_SYNC_MANIFEST,
+    git_commit=NEXUS_ACTIVE_COMMIT,
+    dry_run=False,
+)
+if sync_report.errors:
+    raise RuntimeError("Source sync halted:\\n" + "\\n".join(sync_report.errors))
+
+from core.hardware_detector import detect_hardware
+import model_inventory
+model_inventory = importlib.reload(model_inventory)
+
+NEXUS_HARDWARE = detect_hardware(Path("/content"))
+gpu_label = (
+    f"{NEXUS_HARDWARE.gpus[0].name} ({NEXUS_HARDWARE.total_vram_bytes / (1024**3):.1f} GiB VRAM, tier={NEXUS_HARDWARE.tier})"
+    if NEXUS_HARDWARE.gpus
+    else "CPU only (no CUDA GPU detected)"
+)
+NEXUS_INVENTORY = model_inventory.inspect_drive_models(
+    NEXUS_DRIVE_ROOT / "models",
+    total_vram_bytes=NEXUS_HARDWARE.total_vram_bytes,
+)
+print(model_inventory.format_inventory_report(NEXUS_INVENTORY, gpu_summary=gpu_label))
+print(f"\\n[DISK] Local /content free: {shutil.disk_usage('/content').free / (1024**3):.1f} GiB")
+"""
+        ),
+        _md(
+            """
+## 3. Select Your Single Language Model & Single Image Model
+
+Copy **one** language model name and **one** image model name (or leave `SELECTED_IMAGE_MODEL = ""` to disable image generation) from the inventory output above, then run this cell to validate VRAM and disk fit and install model-specific dependencies before staging.
+"""
+        ),
         _code(
             """
 # @title
 import importlib
 import shutil
-import sys
-from pathlib import Path
 
-# Clone or update deepseek-harness repository
-if not (NEXUS_HARNESS_DIR / ".git").is_dir():
-    import subprocess
-    print(f"[GIT] Cloning {NEXUS_HARNESS_REPO_URL} -> {NEXUS_HARNESS_DIR}...")
-    subprocess.run(["git", "clone", NEXUS_HARNESS_REPO_URL, str(NEXUS_HARNESS_DIR)], check=True)
-else:
-    import subprocess
-    subprocess.run(["git", "-C", str(NEXUS_HARNESS_DIR), "fetch", "origin"], check=False)
-    ref = NEXUS_HARNESS_GIT_REF or "origin/main"
-    subprocess.run(["git", "-C", str(NEXUS_HARNESS_DIR), "checkout", ref], check=False)
-
-if str(NEXUS_HARNESS_DIR / "colab") not in sys.path:
-    sys.path.insert(0, str(NEXUS_HARNESS_DIR / "colab"))
-if str(NEXUS_HARNESS_DIR / "nexus-gateway" / "src") not in sys.path:
-    sys.path.insert(0, str(NEXUS_HARNESS_DIR / "nexus-gateway" / "src"))
-
-import sync_source
-sync_source = importlib.reload(sync_source)
-
-# Two-way sync with Drive colab-src
-sync_report = sync_source.sync_colab_source(NEXUS_HARNESS_DIR, NEXUS_COLAB_SRC_DIR)
-print(f"[SYNC] Source sync status: {sync_report['status']} ({len(sync_report.get('synced_files', []))} files updated).")
-
-import model_inventory
-model_inventory = importlib.reload(model_inventory)
-
-NEXUS_HARDWARE = model_inventory.detect_hardware_profile()
-print(f"[HARDWARE] {NEXUS_HARDWARE.summary}")
-
-DRIVE_MODELS_ROOT = NEXUS_DRIVE_ROOT / "models"
-NEXUS_INVENTORY = model_inventory.inspect_drive_models(
-    DRIVE_MODELS_ROOT,
-    total_vram_bytes=NEXUS_HARDWARE.total_vram_bytes,
-)
-print("\\n" + model_inventory.format_inventory_report(NEXUS_INVENTORY, gpu_summary=NEXUS_HARDWARE.summary))
-"""
-        ),
-        _md("## 3. Pre-Run Model Selection (Select Exactly 1 Language Model + 1 Image Model)"),
-        _code(
-            """
-# @title
-import shutil
-import model_inventory
 import runtime_deps
+runtime_deps = importlib.reload(runtime_deps)
 
 SELECTED_LANGUAGE_MODEL = "Qwen-3-VL-8B-Instruct-heretic"  # @param {type:"string"}
 SELECTED_IMAGE_MODEL = "FLUX.2-klein-4B"  # @param {type:"string"}
@@ -264,118 +309,84 @@ NODE_BIN = NODE_ROOT / f"node-v{NODE_VERSION}-linux-x64" / "bin"
 if not (NODE_BIN / "node").is_file():
     shasums = _download_with_retry(f"https://nodejs.org/dist/v{NODE_VERSION}/SHASUMS256.txt", NODE_ROOT / "SHASUMS256.txt")
     expected_sha = next((ln.split()[0] for ln in shasums.read_text("utf-8").splitlines() if len(ln.split()) == 2 and ln.split()[1] == NODE_ARCHIVE), None)
+    assert expected_sha, f"SHA-256 missing for {NODE_ARCHIVE}"
     archive = _download_with_retry(f"https://nodejs.org/dist/v{NODE_VERSION}/{NODE_ARCHIVE}", NODE_ROOT / NODE_ARCHIVE)
-    if expected_sha and _sha256_file(archive) != expected_sha:
-        archive.unlink()
-        raise RuntimeError("Node archive SHA-256 mismatch")
+    assert _sha256_file(archive) == expected_sha, "Node SHA-256 mismatch"
     subprocess.run(["tar", "-xJf", str(archive), "-C", str(NODE_ROOT)], check=True)
-    print(f"[NODE] Installed Node {NODE_VERSION}.")
+    archive.unlink(missing_ok=True)
+os.environ["PATH"] = f"{NODE_BIN}:{os.environ['PATH']}"
 
-os.environ["PATH"] = f"{NODE_BIN}:{os.environ.get('PATH', '')}"
+root_pkg = json.loads((NEXUS_HARNESS_DIR / "package.json").read_text("utf-8"))
+pkg_manager = str(root_pkg.get("packageManager", "pnpm@11.28.5"))
+pinned_pnpm = pkg_manager.split("@", 1)[1] if pkg_manager.startswith("pnpm@") else "11.28.5"
+cur_pnpm = subprocess.check_output(["pnpm", "--version"], text=True).strip() if shutil.which("pnpm") else ""
+if cur_pnpm != pinned_pnpm:
+    subprocess.run(["npm", "install", "-g", f"pnpm@{pinned_pnpm}"], check=True)
 
-PNPM_VERSION = "10.6.1"
-pnpm_path = shutil.which("pnpm")
-if not pnpm_path:
-    subprocess.run(["npm", "install", "-g", f"pnpm@{PNPM_VERSION}"], check=True)
-    print(f"[PNPM] Installed pnpm {PNPM_VERSION}.")
+cf_path = Path("/usr/local/bin/cloudflared")
+if shutil.which("cloudflared") is None or not cf_path.is_file() or cf_path.stat().st_size == 0:
+    meta_path = Path("/content/cloudflared-release.json")
+    _download_with_retry("https://api.github.com/repos/cloudflare/cloudflared/releases/latest", meta_path, timeout=30)
+    rel_meta = json.loads(meta_path.read_text("utf-8"))
+    asset = next((a for a in rel_meta.get("assets", []) if a.get("name") == "cloudflared-linux-amd64"), None)
+    assert asset is not None, "cloudflared-linux-amd64 asset missing"
+    digest_field = str(asset.get("digest") or "")
+    expected_cf = digest_field.split(":", 1)[1].strip().lower() if digest_field.startswith("sha256:") else None
+    if not expected_cf:
+        m = re.search(r"cloudflared-linux-amd64[^\\n]*?([0-9a-fA-F]{64})", str(rel_meta.get("body") or ""))
+        expected_cf = m.group(1).lower() if m else None
+    assert expected_cf, "Missing official SHA-256 for cloudflared-linux-amd64"
+    _download_with_retry(asset["browser_download_url"], cf_path, timeout=60)
+    if _sha256_file(cf_path).lower() != expected_cf:
+        cf_path.unlink(missing_ok=True)
+        raise RuntimeError("cloudflared SHA-256 mismatch")
+    cf_path.chmod(0o755)
+    meta_path.unlink(missing_ok=True)
 
-CF_PATH = Path("/usr/local/bin/cloudflared")
-if not CF_PATH.is_file():
-    _download_with_retry("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", CF_PATH)
-    CF_PATH.chmod(0o755)
-    print("[TUNNEL] cloudflared binary verified.")
-
-# Install pnpm workspace dependencies & build if artifacts missing
-build_marker = NEXUS_HARNESS_DIR / "packages" / "experimental" / "nexus-host" / "lib" / "index.js"
-if not build_marker.is_file():
-    print("[BUILD] Installing harness workspace dependencies (frozen lockfile)...")
-    subprocess.run(["pnpm", "install", "--frozen-lockfile"], cwd=str(NEXUS_HARNESS_DIR), check=True)
-    print("[BUILD] Building artifacts...")
-    subprocess.run(["pnpm", "run", "build:artifacts"], cwd=str(NEXUS_HARNESS_DIR), check=True)
-    print("[BUILD] Harness build complete.")
-else:
-    print("[BUILD] Reusing verified build artifacts.")
+BUILD_STAMP = Path("/content/nexus-build-fingerprint.txt")
+fp = sync_source.compute_build_fingerprint(NEXUS_HARNESS_DIR, NEXUS_COLAB_SRC_DIR, git_commit=NEXUS_ACTIVE_COMMIT)
+if (BUILD_STAMP.read_text("utf-8").strip() if BUILD_STAMP.is_file() else "") != fp or not (NEXUS_HARNESS_DIR / "node_modules").is_dir():
+    subprocess.run(["pnpm", "install", "--frozen-lockfile"], cwd=NEXUS_HARNESS_DIR, check=True)
+    subprocess.run(["pnpm", "exec", "tsx", "scripts/build.ts", "--scope", "artifacts", "--serial"], cwd=NEXUS_HARNESS_DIR, check=True)
+    BUILD_STAMP.write_text(fp + "\\n", encoding="utf-8")
+print(f"[BUILD] Harness artifacts ready ({fp[:12]}).")
 """
         ),
-        _md("## 5. Stage Selected Models to Local SSD & Launch Loopback Gateway"),
+        _md("## 5. Upfront SSD Staging, Start Gateway & Warm-Load Selected Language Model"),
         _code(
             """
 # @title
+import importlib
 import json
 import os
 import signal
 import subprocess
 import time
 import urllib.request
-from pathlib import Path
 
 import staging
+staging = importlib.reload(staging)
 
-if "NEXUS_MANAGED_PIDS" not in globals():
-    NEXUS_MANAGED_PIDS = {}
-
-# 1. Stage the selected models to local SSD (/content/nexus-staged-models/)
-print(f"[STAGE] Staging selected language model: {NEXUS_SELECTED_LANGUAGE.id}...")
-lang_stage_dir = staging.stage_model_directory(
-    Path(NEXUS_SELECTED_LANGUAGE.source_path),
-    NEXUS_STAGE_DIR,
-    model_id=NEXUS_SELECTED_LANGUAGE.id,
+# 1. Stage both selected models to local SSD & write locked session-runtime.json.
+NEXUS_SESSION_CONFIG = staging.stage_selected_models(
+    local_stage_root=NEXUS_STAGE_DIR,
+    language_candidate=NEXUS_SELECTED_LANGUAGE,
+    image_candidate=NEXUS_SELECTED_IMAGE,
+    manifest_path=NEXUS_SESSION_MANIFEST,
+    drive_manifest_copy=NEXUS_RUNTIME_MANIFEST_DIR / "runtime" / "session-runtime.json",
     on_status=print,
 )
 
-img_stage_dir = None
-if NEXUS_SELECTED_IMAGE is not None:
-    print(f"[STAGE] Staging selected image model: {NEXUS_SELECTED_IMAGE.id}...")
-    img_stage_dir = staging.stage_model_directory(
-        Path(NEXUS_SELECTED_IMAGE.source_path),
-        NEXUS_STAGE_DIR,
-        model_id=NEXUS_SELECTED_IMAGE.id,
-        on_status=print,
-    )
-
-# Write session runtime manifest
-manifest_payload = {
-    "language_model": {
-        "id": NEXUS_SELECTED_LANGUAGE.id,
-        "display_name": NEXUS_SELECTED_LANGUAGE.id,
-        "model_path": str(lang_stage_dir),
-        "implementation": NEXUS_SELECTED_LANGUAGE.implementation,
-        "architecture": NEXUS_SELECTED_LANGUAGE.architecture,
-        "modalities": NEXUS_SELECTED_LANGUAGE.modalities,
-        "context_window": NEXUS_SELECTED_LANGUAGE.context_window,
-        "max_output_tokens": NEXUS_SELECTED_LANGUAGE.max_output_tokens,
-        "reasoning_mode": NEXUS_SELECTED_LANGUAGE.reasoning_mode,
-        "reasoning_efforts": NEXUS_SELECTED_LANGUAGE.reasoning_efforts,
-        "default_reasoning_effort": NEXUS_SELECTED_LANGUAGE.default_reasoning_effort,
-        "min_vram_gib": NEXUS_SELECTED_LANGUAGE.min_vram_gib,
-        "size_bytes": NEXUS_SELECTED_LANGUAGE.size_bytes,
-    },
-    "image_model": {
-        "id": NEXUS_SELECTED_IMAGE.id,
-        "display_name": NEXUS_SELECTED_IMAGE.id,
-        "model_path": str(img_stage_dir),
-        "implementation": NEXUS_SELECTED_IMAGE.implementation,
-        "architecture": NEXUS_SELECTED_IMAGE.architecture,
-        "default_steps": NEXUS_SELECTED_IMAGE.default_steps,
-        "min_vram_gib": NEXUS_SELECTED_IMAGE.min_vram_gib,
-        "size_bytes": NEXUS_SELECTED_IMAGE.size_bytes,
-    } if NEXUS_SELECTED_IMAGE is not None else None,
-}
-NEXUS_SESSION_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-NEXUS_SESSION_MANIFEST.write_text(json.dumps(manifest_payload, indent=2) + "\\n", encoding="utf-8")
-print(f"[STAGE] Session runtime manifest written to {NEXUS_SESSION_MANIFEST}.")
-
-# 2. Launch loopback gateway
+# 2. Restart Gateway bound strictly to loopback 127.0.0.1:7861.
 prev_gw = NEXUS_MANAGED_PIDS.pop("gateway", None)
 if prev_gw is not None:
     try:
         os.kill(prev_gw, signal.SIGTERM)
         time.sleep(1.0)
-    except Exception:
+    except ProcessLookupError:
         pass
 
-gw_log_path = Path("/content/nexus-gateway.log")
-gw_log = open(gw_log_path, "w", encoding="utf-8")
+gw_log = open("/content/nexus-gateway.log", "w", encoding="utf-8")
 gw_proc = subprocess.Popen(
     [
         "python3",
@@ -427,6 +438,7 @@ try:
     alloc_gb = rt["worker"].get("cuda_allocated_bytes", 0) / (1024 ** 3)
     print(f"[READY] Language model '{NEXUS_SELECTED_LANGUAGE.id}' is live in VRAM ({alloc_gb:.2f} GiB allocated).")
 except Exception as exc:
+    # Failed load MUST NOT leave a false-ready gateway running.
     gw_proc.terminate()
     NEXUS_MANAGED_PIDS.pop("gateway", None)
     raise RuntimeError(f"Initial language model load failed; gateway terminated cleanly: {exc}") from exc

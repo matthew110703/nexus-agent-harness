@@ -541,7 +541,7 @@ def validate_selected_pair(
 def format_inventory_report(inv: DriveInventory, *, gpu_summary: str = "Unknown GPU") -> str:
     """Format a copy-pasteable inventory report for the Colab Inventory cell."""
     lines = [
-        f"=== NEXUS AI LAB v1.1.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
+        f"=== NEXUS AI LAB v1.2.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
         "",
         f"Selectable Language Models ({len(inv.language_models)}):",
     ]
