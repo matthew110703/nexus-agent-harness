@@ -56,6 +56,7 @@ def create_app(
     app.state.resources = res_mgr
     app.state.worker = worker_mgr
     app.state.started_at = time.time()
+    app.state.bootstrapped = False
 
     def _live_readiness(ws: WorkerStatus) -> tuple[bool, str]:
         if res_mgr.is_swapping:
@@ -171,6 +172,7 @@ def create_app(
                 if ws.alive and (replace or ws.active_model_id is not None):
                     worker_mgr.unload(terminate_on_failure=True)
                 live_ws = _load_selected_language_unlocked(op.operation_id)
+                app.state.bootstrapped = True
                 prog.complete(op.operation_id, phase="ready", message=f"{lang_spec.id} ready")
                 return {
                     "status": "ready",
@@ -231,13 +233,35 @@ def create_app(
 
         ws = worker_mgr.status()
         if not ws.alive or ws.active_kind != "language" or ws.active_model_id != lang_spec.id:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"Language model '{lang_spec.id}' is not loaded in the GPU worker "
-                    f"(alive={ws.alive}, active={ws.active_model_id}). Run the Colab bootstrap cell."
-                ),
-            )
+            if not app.state.bootstrapped:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Language model '{lang_spec.id}' is not loaded in the GPU worker "
+                        f"(alive={ws.alive}, active={ws.active_model_id}). Run the Colab bootstrap cell."
+                    ),
+                )
+            # Previously bootstrapped: wait for any in-flight GPU swap to unwind and auto-restore if needed.
+            with res_mgr.exclusive():
+                ws = worker_mgr.status()
+                if not ws.alive or ws.active_kind != "language" or ws.active_model_id != lang_spec.id:
+                    rec_op = prog.start(
+                        "language_model_load",
+                        lang_spec.id,
+                        phase="restoring_language_model",
+                        indeterminate=True,
+                        message=f"Recovering {lang_spec.id} after previous failure",
+                    )
+                    try:
+                        worker_mgr.unload(terminate_on_failure=True)
+                        _load_selected_language_unlocked(rec_op.operation_id)
+                        prog.complete(rec_op.operation_id, phase="ready", message=f"{lang_spec.id} recovered")
+                    except Exception as exc:
+                        prog.fail(rec_op.operation_id, str(exc))
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f"Failed to recover language model '{lang_spec.id}': {exc}",
+                        ) from exc
 
         messages = normalize_openai_messages(body.get("messages") or [])
         if not messages:

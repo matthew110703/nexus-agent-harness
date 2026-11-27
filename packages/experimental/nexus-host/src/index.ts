@@ -176,27 +176,48 @@ export function createNexusGenerateImageTool(
         }
       }
 
-      const response = await fetchImpl(endpoint, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          prompt: args.prompt,
-          quality: args.quality,
-          width: args.width,
-          height: args.height,
-          steps: args.steps,
-          seed: args.seed,
-          num_images: 1,
-          workspace: rawWorkspace || undefined,
-        }),
-        signal,
-      })
+      const onAbort = () => {
+        const cancelUrl = new URL('/v1/runtime/cancel', baseUrl)
+        void fetchImpl(cancelUrl, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${apiKey}`,
+          },
+          body: '{}',
+          signal: AbortSignal.timeout(3000),
+        }).catch(() => {
+          // Best-effort cancellation; gateway restores the language model when swap unwinds.
+        })
+      }
+      exec.signal.addEventListener('abort', onAbort, { once: true })
+
+      let response: Response
+      try {
+        response = await fetchImpl(endpoint, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            prompt: args.prompt,
+            quality: args.quality,
+            width: args.width,
+            height: args.height,
+            steps: args.steps,
+            seed: args.seed,
+            num_images: 1,
+            workspace: rawWorkspace || undefined,
+          }),
+          signal,
+        })
+      } finally {
+        exec.signal.removeEventListener('abort', onAbort)
+      }
       if (!response.ok) {
-        const text = redactSecrets((await response.text()).slice(0, 500), apiKey)
-        throw new Error(`Nexus image generation failed (HTTP ${response.status}): ${text}`)
+        const errMsg = normalizeUpstreamError(response.status, await response.text(), apiKey)
+        throw new Error(`Nexus image generation failed (HTTP ${response.status}): ${errMsg}`)
       }
       const rawText = await response.text()
       if (rawText.length > MAX_IMAGE_RESPONSE_BYTES) {

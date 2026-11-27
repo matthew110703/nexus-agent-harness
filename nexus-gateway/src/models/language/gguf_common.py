@@ -235,6 +235,10 @@ class LlamaServerRuntimeBase:
         merged: list[dict[str, Any]] = []
         for msg in prepared:
             role = msg.get("role")
+            if merged and merged[-1].get("role") == "tool" and role == "user":
+                # A cancelled turn after a tool call leaves `tool -> user` with no assistant reply;
+                # insert an assistant separator so Gemma's strict Jinja alternation stays valid.
+                merged.append({"role": "assistant", "content": "(Previous tool turn was cancelled.)"})
             if (
                 merged
                 and role in ("system", "user")
