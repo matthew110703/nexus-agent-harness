@@ -2,40 +2,128 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
+from typing import Optional
+
+FALLBACK_LLAMA_TAG = "b12808"
+LLAMA_INSTALL_DIR = Path("/content/llama-cpp-cuda")
+
+
+def _find_installed_llama_server() -> Optional[Path]:
+    for cand in (
+        shutil.which("llama-server"),
+        "/usr/local/bin/llama-server",
+    ):
+        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
+            return Path(cand).resolve()
+    if LLAMA_INSTALL_DIR.is_dir():
+        for p in sorted(LLAMA_INSTALL_DIR.rglob("llama-server")):
+            if p.is_file() and os.access(p, os.X_OK):
+                return p.resolve()
+    return None
+
+
+def _resolve_latest_llama_cuda_urls() -> tuple[str, str, Optional[str]]:
+    """Resolve the newest official Ubuntu CUDA 12.8 llama.cpp release tarball URLs."""
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10",
+            headers={"User-Agent": "nexus-colab-setup/1.2.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            releases = json.loads(resp.read().decode("utf-8"))
+        for rel in releases:
+            assets = rel.get("assets") or []
+            bin_asset = next(
+                (
+                    a
+                    for a in assets
+                    if a.get("name", "").startswith("llama-")
+                    and a.get("name", "").endswith("-bin-ubuntu-cuda-12.8-x64.tar.gz")
+                ),
+                None,
+            )
+            if bin_asset:
+                tag = str(rel.get("tag_name") or FALLBACK_LLAMA_TAG)
+                cudart_asset = next(
+                    (
+                        a
+                        for a in assets
+                        if a.get("name", "").startswith("cudart-llama-")
+                        and a.get("name", "").endswith("-bin-ubuntu-cuda-12.8-x64.tar.gz")
+                    ),
+                    None,
+                )
+                return (
+                    tag,
+                    str(bin_asset["browser_download_url"]),
+                    str(cudart_asset["browser_download_url"]) if cudart_asset else None,
+                )
+    except Exception as exc:
+        print(f"[DEPS] GitHub API lookup fallback ({exc}); using pinned {FALLBACK_LLAMA_TAG}.")
+
+    base = f"https://github.com/ggml-org/llama.cpp/releases/download/{FALLBACK_LLAMA_TAG}"
+    return (
+        FALLBACK_LLAMA_TAG,
+        f"{base}/llama-{FALLBACK_LLAMA_TAG}-bin-ubuntu-cuda-12.8-x64.tar.gz",
+        f"{base}/cudart-llama-{FALLBACK_LLAMA_TAG}-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    )
 
 
 def ensure_llama_server() -> None:
     """Download and extract pre-built official CUDA llama-server binary if missing."""
-    if shutil.which("llama-server") or list(Path("/content").glob("llama-*-bin-*/build/bin/llama-server")):
+    existing = _find_installed_llama_server()
+    if existing is not None:
+        print(f"[DEPS] llama-server already available: {existing}")
         return
 
-    print("[DEPS] llama-server not found. Downloading llama.cpp CUDA 12.8 binaries...")
-    url = "https://github.com/ggml-org/llama.cpp/releases/download/b4816/llama-b4816-bin-ubuntu-cuda-12.8-x64.tar.gz"
+    tag, bin_url, cudart_url = _resolve_latest_llama_cuda_urls()
+    print(f"[DEPS] llama-server not found. Downloading llama.cpp {tag} CUDA 12.8 binaries...")
+
     tar_path = Path("/content/llama-cuda.tar.gz")
-    dest_dir = Path("/content/llama-b4816-bin-ubuntu-cuda-12.8-x64")
+    cudart_tar_path = Path("/content/llama-cudart.tar.gz")
+    if LLAMA_INSTALL_DIR.exists():
+        shutil.rmtree(LLAMA_INSTALL_DIR)
+    LLAMA_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
 
-    subprocess.run(["curl", "-L", "-o", str(tar_path), url], check=True)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["tar", "-xzf", str(tar_path), "-C", str(dest_dir)], check=True)
+    subprocess.run(["curl", "-fSL", "--retry", "3", "-o", str(tar_path), bin_url], check=True)
+    subprocess.run(["tar", "-xzf", str(tar_path), "-C", str(LLAMA_INSTALL_DIR)], check=True)
+    tar_path.unlink(missing_ok=True)
 
-    binary = dest_dir / "build" / "bin" / "llama-server"
-    if binary.is_file():
-        os.chmod(binary, 0o755)
-        # Symlink to /usr/local/bin for convenience
+    if cudart_url:
         try:
-            target_symlink = Path("/usr/local/bin/llama-server")
-            if not target_symlink.exists():
-                target_symlink.symlink_to(binary)
-        except Exception:
-            pass
-        print(f"[DEPS] Successfully installed llama-server: {binary}")
-    else:
-        print("[DEPS] Warning: llama-server binary extraction did not find build/bin/llama-server")
+            subprocess.run(["curl", "-fSL", "--retry", "3", "-o", str(cudart_tar_path), cudart_url], check=True)
+            subprocess.run(["tar", "-xzf", str(cudart_tar_path), "-C", str(LLAMA_INSTALL_DIR)], check=True)
+            cudart_tar_path.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"[DEPS] Note: optional cudart tarball skipped ({exc}).")
+
+    binary = next((p for p in sorted(LLAMA_INSTALL_DIR.rglob("llama-server")) if p.is_file()), None)
+    if binary is None:
+        raise RuntimeError(f"llama-server binary not found after extracting {bin_url} into {LLAMA_INSTALL_DIR}")
+
+    os.chmod(binary, 0o755)
+    target_symlink = Path("/usr/local/bin/llama-server")
+    try:
+        if target_symlink.exists() or target_symlink.is_symlink():
+            target_symlink.unlink()
+        target_symlink.symlink_to(binary)
+    except Exception:
+        pass
+
+    # Export shared library directories so llama-server finds libllama.so / libggml-cuda.so / libcudart.so
+    lib_dirs = sorted({str(p.parent) for p in LLAMA_INSTALL_DIR.rglob("*.so*") if p.is_file()})
+    if lib_dirs:
+        cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        os.environ["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
+
+    print(f"[DEPS] Successfully installed llama-server ({tag}): {binary}")
 
 
 def ensure_bitsandbytes() -> None:

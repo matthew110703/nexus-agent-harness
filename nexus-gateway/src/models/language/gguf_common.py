@@ -21,14 +21,16 @@ def find_llama_server_binary() -> str:
         shutil.which("llama-server"),
         "/usr/local/bin/llama-server",
         "/usr/bin/llama-server",
-        "/content/llama-b*-bin-ubuntu-cuda-12.8-x64/build/bin/llama-server",
     ):
         if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
-            return str(cand)
-    # Check glob under /content
-    content_matches = sorted(Path("/content").glob("llama-*-bin-*/build/bin/llama-server"))
-    if content_matches and os.access(content_matches[-1], os.X_OK):
-        return str(content_matches[-1])
+            return str(Path(cand).resolve())
+    for search_root in (Path("/content/llama-cpp-cuda"), Path("/content")):
+        if not search_root.is_dir():
+            continue
+        matches = sorted(search_root.rglob("llama-server"))
+        for match in reversed(matches):
+            if match.is_file() and os.access(match, os.X_OK):
+                return str(match.resolve())
     raise RuntimeError(
         "llama-server binary not found. Run Colab runtime setup to download llama.cpp CUDA binaries."
     )
@@ -102,17 +104,36 @@ class LlamaServerRuntimeBase:
             cmd.extend(["--mmproj", str(mmproj_path)])
         cmd.extend(self.extra_args)
 
+        env = os.environ.copy()
+        bin_dir = Path(binary).resolve().parent
+        lib_dirs = [str(bin_dir)]
+        install_root = Path("/content/llama-cpp-cuda")
+        if install_root.is_dir():
+            for so_file in install_root.rglob("*.so*"):
+                if so_file.is_file() and str(so_file.parent) not in lib_dirs:
+                    lib_dirs.append(str(so_file.parent))
+        cur_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
+
+        log_path = Path("/content/nexus-llama-server.log") if Path("/content").is_dir() else Path("nexus-llama-server.log")
+        self._log_file = open(log_path, "w", encoding="utf-8")
         self.process = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
         )
 
         # Wait for server health
         start_t = time.monotonic()
-        while time.monotonic() - start_t < 90:
+        while time.monotonic() - start_t < 180:
             if self.process.poll() is not None:
-                raise RuntimeError(f"llama-server exited prematurely with code {self.process.returncode}")
+                tail = ""
+                try:
+                    tail = log_path.read_text(encoding="utf-8", errors="replace")[-1500:]
+                except Exception:
+                    pass
+                raise RuntimeError(f"llama-server exited prematurely with code {self.process.returncode}:\n{tail}")
             try:
                 with httpx.Client(timeout=1.0) as client:
                     res = client.get(f"{self.base_url}/health")
@@ -123,7 +144,7 @@ class LlamaServerRuntimeBase:
             time.sleep(0.5)
 
         self.stop()
-        raise TimeoutError("llama-server failed to become healthy within 90s")
+        raise TimeoutError("llama-server failed to become healthy within 180s")
 
     def stop(self) -> None:
         if self.process is not None:
@@ -137,6 +158,13 @@ class LlamaServerRuntimeBase:
                 except Exception:
                     pass
             self.process = None
+        log_fh = getattr(self, "_log_file", None)
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+            self._log_file = None
 
     def generate_chat_stream(self, req: dict[str, Any]) -> Iterator[str]:
         if not self.is_ready():
