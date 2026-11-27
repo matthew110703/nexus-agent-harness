@@ -212,9 +212,14 @@ class WorkerManager:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
-                    chunk = json.loads(line).get("chunk")
+                    parsed_line = json.loads(line)
+                    if "error" in parsed_line and parsed_line["error"]:
+                        raise WorkerError(f"Worker stream error: {self._redact(str(parsed_line['error']))}", status_code=502)
+                    chunk = parsed_line.get("chunk")
                     if isinstance(chunk, str) and chunk:
                         yield chunk
+        except WorkerError:
+            raise
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise WorkerError(f"Worker stream error ({exc.code}): {self._redact(body)}", status_code=exc.code) from exc

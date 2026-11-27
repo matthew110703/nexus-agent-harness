@@ -24,13 +24,14 @@ class GgufGemma4Model:
         self.model_id = model_id
         self.model_path = model_path
         self.architecture = architecture
-        # Gemma 4 QAT MTP works well with llama-server
+        # Gemma 4 QAT MTP works well with llama-server; merge consecutive user/system turns for Gemma Jinja alternation.
         self.server = LlamaServerRuntimeBase(
             model_id=model_id,
             model_path=model_path,
             port=port,
             n_ctx=32768,
             n_gpu_layers=999,
+            merge_consecutive_roles=True,
         )
 
     def is_ready(self) -> bool:

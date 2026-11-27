@@ -202,6 +202,8 @@ def create_worker_app(secret_token: str) -> FastAPI:
                 for chunk in state.runtime.generate_stream(body):
                     if chunk:
                         yield json.dumps({"chunk": chunk}, ensure_ascii=False) + "\n"
+            except Exception as exc:
+                yield json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False) + "\n"
             finally:
                 state.lock.release()
 
