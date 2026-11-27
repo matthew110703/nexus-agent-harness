@@ -68,22 +68,26 @@ class Gemma3LanguageModel:
 
         inputs = tokenizer(prompt, return_tensors="pt").to(self.model.device)
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        cancel_event = threading.Event()
+        from models.language.common import make_cancel_stopping_criteria
 
         gen_kwargs = {
             **inputs,
             "streamer": streamer,
+            "stopping_criteria": make_cancel_stopping_criteria(cancel_event),
             "max_new_tokens": req.get("max_tokens") or 4096,
             "temperature": req.get("temperature", 0.7),
             "do_sample": True,
         }
 
-        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs)
+        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs, daemon=True)
         thread.start()
-
-        for chunk in streamer:
-            yield chunk
-
-        thread.join()
+        try:
+            for chunk in streamer:
+                yield chunk
+        finally:
+            cancel_event.set()
+            thread.join(timeout=5.0)
 
     def unload(self) -> None:
         self.model = None

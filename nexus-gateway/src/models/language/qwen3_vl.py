@@ -73,9 +73,13 @@ class Qwen3VLLanguageModel:
 
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=False)
         temperature = float(req.get("temperature", 0.7))
+        cancel_event = threading.Event()
+        from models.language.common import make_cancel_stopping_criteria
+
         gen_kwargs: dict[str, Any] = {
             **inputs,
             "streamer": streamer,
+            "stopping_criteria": make_cancel_stopping_criteria(cancel_event),
             "max_new_tokens": int(req.get("max_tokens") or 4096),
             "do_sample": temperature > 0,
             "temperature": max(0.01, temperature),
@@ -94,10 +98,13 @@ class Qwen3VLLanguageModel:
 
         worker_thread = threading.Thread(target=_run, daemon=True)
         worker_thread.start()
-        for piece in streamer:
-            if piece:
-                yield str(piece)
-        worker_thread.join()
+        try:
+            for piece in streamer:
+                if piece:
+                    yield str(piece)
+        finally:
+            cancel_event.set()
+            worker_thread.join(timeout=5.0)
         if exc_holder:
             raise exc_holder[0]
 

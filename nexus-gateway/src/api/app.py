@@ -452,6 +452,9 @@ def create_app(
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
+            except GeneratorExit:
+                prog.update(gen_op.operation_id, status="cancelled", indeterminate=False, message="Cancelled by client disconnect")
+                raise
             except Exception as exc:
                 prog.fail(gen_op.operation_id, f"{type(exc).__name__}: {exc}")
                 yield "data: " + json.dumps({

@@ -8,7 +8,10 @@ from models.base import SelectedLanguageSpec
 
 
 def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI chat messages (including tool results and multimodal blocks)."""
+    """
+    Normalize OpenAI chat messages (including tool results and multimodal blocks)
+    and repair interrupted/cancelled tool turns for all language model templates.
+    """
     normalized: list[dict[str, Any]] = []
     for msg in messages:
         if not isinstance(msg, dict):
@@ -31,7 +34,45 @@ def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
         if msg.get("name"):
             entry["name"] = str(msg["name"])
         normalized.append(entry)
-    return normalized
+
+    # Repair dangling tool-call / cancelled-turn sequences so no model template stalls or errors:
+    # 1. assistant(tool_calls) -> user (tool execution cancelled before result) => add cancelled tool results + assistant ack
+    # 2. tool -> user (turn cancelled after tool result before assistant reply) => add assistant ack
+    repaired: list[dict[str, Any]] = []
+    pending_call_ids: list[str] = []
+    for entry in normalized:
+        role = entry.get("role")
+        if role == "tool":
+            call_id = str(entry.get("tool_call_id") or "")
+            if call_id in pending_call_ids:
+                pending_call_ids.remove(call_id)
+            repaired.append(entry)
+            continue
+
+        if pending_call_ids and role != "tool":
+            for missing_id in pending_call_ids:
+                repaired.append({
+                    "role": "tool",
+                    "tool_call_id": missing_id,
+                    "content": "Error: tool execution was cancelled by user.",
+                })
+            pending_call_ids.clear()
+
+        if repaired and repaired[-1].get("role") == "tool" and role == "user":
+            repaired.append({
+                "role": "assistant",
+                "content": "The previous tool call did not complete. Continuing with your next message.",
+            })
+
+        if role == "assistant" and isinstance(entry.get("tool_calls"), list):
+            pending_call_ids = [
+                str(tc.get("id"))
+                for tc in entry["tool_calls"]
+                if isinstance(tc, dict) and tc.get("id")
+            ]
+        repaired.append(entry)
+
+    return repaired
 
 
 def resolve_reasoning_controls(

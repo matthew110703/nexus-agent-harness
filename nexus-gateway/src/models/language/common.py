@@ -6,7 +6,19 @@ import base64
 import binascii
 import io
 import json
+import threading
 from typing import Any
+
+
+def make_cancel_stopping_criteria(cancel_event: threading.Event) -> Any:
+    """Build a Transformers StoppingCriteriaList that halts generation as soon as cancel_event is set."""
+    from transformers import StoppingCriteria, StoppingCriteriaList  # type: ignore[import-not-found]
+
+    class _CancelEventCriteria(StoppingCriteria):
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> bool:
+            return cancel_event.is_set()
+
+    return StoppingCriteriaList([_CancelEventCriteria()])
 
 
 def decode_vlm_image_url(url: str) -> Any:
