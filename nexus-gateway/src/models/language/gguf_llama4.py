@@ -39,6 +39,8 @@ class GgufLlama4Model:
             ubatch_size=ubatch_size,
             threads=threads,
             reasoning_format=None,
+            allow_quantized_kv=False,
+            moe_cpu_offload=True,
         )
 
     def is_ready(self) -> bool:

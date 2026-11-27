@@ -5,4 +5,6 @@ import type { Volatile } from '@deepseek-ai/cordis'
 export interface WorkspaceNavigationConfig {
   /** Recently viewed Sessions needing no attention kept loaded besides the main-view Session. */
   recentViewLimit: Volatile<number>
+  /** Whether to show the Archive session action in the 3-dot context menu. */
+  showArchiveMenu?: Volatile<boolean>
 }

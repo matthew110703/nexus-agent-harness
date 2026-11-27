@@ -266,7 +266,10 @@ def inspect_gguf_directory(model_dir: Path) -> GgufDirectoryLayout:
         )
 
     root = _pick_search_root(model_dir)
-    files = sorted(p for p in root.iterdir() if p.is_file())
+    files = sorted(
+        p for p in root.iterdir()
+        if p.is_file() and not p.name.endswith(".copying") and not p.name.startswith(".")
+    )
     mmproj_candidates = [p for p in files if p.name.lower().endswith(".gguf") and "mmproj" in p.name.lower() and p.stat().st_size > 0]
     mmproj_file = mmproj_candidates[0] if mmproj_candidates else None
 

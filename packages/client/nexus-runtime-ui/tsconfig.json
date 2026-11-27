@@ -10,11 +10,15 @@
     { "path": "../../api/session-controller/tsconfig.client.json" },
     { "path": "../../attachment/attachment" },
     { "path": "../store" },
+    { "path": "../ui-chat/tsconfig.client.json" },
+    { "path": "../ui-context-menu" },
     { "path": "../ui-conversation/tsconfig.client.json" },
     { "path": "../ui-model-selection" },
     { "path": "../ui-renderer" },
+    { "path": "../ui-session" },
     { "path": "../ui-slots" },
     { "path": "../ui-tool" },
+    { "path": "../ui-workspace/tsconfig.client.json" },
     { "path": "../../core/session" }
   ]
 }

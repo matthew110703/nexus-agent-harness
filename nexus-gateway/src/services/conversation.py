@@ -7,7 +7,7 @@ from typing import Any, Optional
 from models.base import SelectedLanguageSpec
 
 
-def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def normalize_openai_messages(messages: list[dict[str, Any]], *, allow_images: bool = True) -> list[dict[str, Any]]:
     """
     Normalize OpenAI chat messages (including tool results and multimodal blocks)
     and repair interrupted/cancelled tool turns for all language model templates.
@@ -22,7 +22,23 @@ def normalize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
         content = msg.get("content")
         entry: dict[str, Any] = {"role": role}
         if isinstance(content, list):
-            entry["content"] = content
+            if allow_images:
+                entry["content"] = content
+            else:
+                text_parts: list[str] = []
+                saw_image = False
+                for part in content:
+                    if isinstance(part, dict):
+                        ptype = str(part.get("type") or "")
+                        if ptype == "text" and part.get("text"):
+                            text_parts.append(str(part["text"]))
+                        elif ptype in {"image_url", "input_image", "image"}:
+                            saw_image = True
+                    elif isinstance(part, str) and part:
+                        text_parts.append(part)
+                if saw_image:
+                    text_parts.append("[User attached a reference image; use nexus_generate_image with use_uploaded_image=true to edit or stylize it.]")
+                entry["content"] = "\n".join(text_parts).strip()
         elif content is None:
             entry["content"] = ""
         else:

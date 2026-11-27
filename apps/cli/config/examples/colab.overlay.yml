@@ -17,6 +17,28 @@
   config:
     trustForwardedProto: true
 
+- id: sandbox-policy
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    workspaceRoot: !!js process.env.NEXUS_DEFAULT_WORKSPACE || process.cwd()
+
+- id: approval
+  config:
+    policy: !!js "(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'"
+
+- id: fs-sandbox
+  config:
+    cwd: !!js process.env.NEXUS_DEFAULT_WORKSPACE || process.cwd()
+
+- id: session-query-sqlite
+  config:
+    path: ':memory:'
+    openAt: first-search
+
+- id: web
+  config:
+    searchProvider: nexus-search
+
 - id: directory-picker
   config:
     allowedRoots:
@@ -58,6 +80,10 @@
 
 - id: nexus-runtime-ui
   disabled: false
+
+- id: ui-workspace
+  config:
+    showArchiveMenu: false
 
 - insert:
     - id: nexus-host

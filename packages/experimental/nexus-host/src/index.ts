@@ -7,6 +7,9 @@
  * @module @deepseek-ai/dsh-nexus-host
  */
 
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -14,6 +17,12 @@ import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-working-directory'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import { registerNexusPurgeRoutes } from './purge.ts'
+import {
+  createNexusInspectRuntimeTool,
+  createNexusWebResearchTool,
+  registerNexusWebProvider,
+} from './web-provider.ts'
 
 /** Stable plugin name. */
 export const name = 'nexus-host'
@@ -66,12 +75,61 @@ interface GatewayImagePayload {
   quality?: string
   filename?: string
   master_path?: string
+  drive_path?: string
+  workspace_path?: string
   media_type?: string
   width?: number
   height?: number
   steps?: number
   seed?: number | null
   b64_png?: string
+}
+
+async function resolveLastUploadedImageB64(
+  ctx: Context,
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  if (!sessionId) return undefined
+  const dshHome = process.env.DSH_HOME?.trim() || path.join(os.homedir(), '.dsh')
+  const candidates = [
+    path.join(dshHome, 'sessions', sessionId, 'events.jsonl'),
+    path.join(dshHome, 'sessions', `${sessionId}.jsonl`),
+  ]
+  for (const jsonlPath of candidates) {
+    let raw: string
+    try {
+      raw = await fs.readFile(jsonlPath, 'utf8')
+    } catch {
+      continue
+    }
+    const lines = raw.trim().split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim()
+      if (!line) continue
+      try {
+        const ev = JSON.parse(line) as {
+          type?: string
+          role?: string
+          content?: Array<{ type?: string; attachment?: unknown }>
+        }
+        if (!Array.isArray(ev.content)) continue
+        for (let j = ev.content.length - 1; j >= 0; j--) {
+          const block = ev.content[j]
+          if (block !== undefined && block.type === 'image') {
+            const att = block.attachment ?? block
+            if (isImageAttachmentRef(att)) {
+              const stored = await ctx.attachments.readImage(att, signal)
+              return Buffer.from(stored.data).toString('base64')
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed JSONL lines while scanning backwards
+      }
+    }
+  }
+  return undefined
 }
 
 function isImageAttachmentRef(value: unknown): value is ImageAttachmentRef {
@@ -112,6 +170,18 @@ export function createNexusGenerateImageTool(
       height: { type: 'integer', description: 'Optional image height in pixels (256–1536, aligned to 16).' },
       steps: { type: 'integer', description: 'Optional denoising step count (model-specific default when omitted).' },
       seed: { type: 'integer', description: 'Optional integer RNG seed for reproducibility.' },
+      use_uploaded_image: {
+        type: 'boolean',
+        description: 'Use the most recent image uploaded by the user in this chat as the img2img reference.',
+      },
+      reference_image_path: {
+        type: 'string',
+        description: 'Optional workspace or Drive file path to a reference image for img2img editing.',
+      },
+      strength: {
+        type: 'number',
+        description: 'Img2img denoising strength from 0.1 (subtle edit) to 1.0 (full re-imagining), default 0.75.',
+      },
     },
     output: {
       schema: {
@@ -127,17 +197,23 @@ export function createNexusGenerateImageTool(
           steps: { type: 'integer' },
           operationId: { type: 'string' },
           savedToDrive: { type: 'boolean' },
+          drivePath: { type: 'string' },
+          workspacePath: { type: 'string' },
+          masterPath: { type: 'string' },
           attachment: { type: 'json' },
         },
       },
       render(_args, value) {
+        const pathNote = value.drivePath
+          ? ` Saved to Drive: ${value.drivePath}` + (value.workspacePath ? ` and Workspace: ${value.workspacePath}.` : '.')
+          : ''
         const blocks: Array<{ type: 'text'; text: string } | { type: 'image'; attachment: ImageAttachmentRef }> = [
           {
             type: 'text',
             text:
               `Generated image ${value.filename} (${value.width}x${value.height}, `
               + `${value.steps} steps, quality ${value.quality ?? 'detailed'}, `
-              + `model ${value.model}, attachment ${value.attachmentId}). `
+              + `model ${value.model}, attachment ${value.attachmentId}).${pathNote} `
               + 'The image is already displayed inline in the UI; do not include a Markdown ![]() image link.',
           },
         ]
@@ -157,6 +233,9 @@ export function createNexusGenerateImageTool(
           steps: value.steps ?? 0,
           operationId: value.operationId ?? '',
           savedToDrive: value.savedToDrive ?? false,
+          drivePath: value.drivePath ?? '',
+          workspacePath: value.workspacePath ?? '',
+          masterPath: value.masterPath ?? '',
         }
       },
     },
@@ -194,6 +273,17 @@ export function createNexusGenerateImageTool(
       }
       exec.signal.addEventListener('abort', onAbort, { once: true })
 
+      let referenceImageB64: string | undefined
+      if (typeof args.reference_image_path === 'string' && args.reference_image_path.trim()) {
+        const resolvedRef = path.resolve(rawWorkspace || process.cwd(), args.reference_image_path.trim())
+        const refBytes = await fs.readFile(resolvedRef)
+        referenceImageB64 = refBytes.toString('base64')
+      } else if (args.use_uploaded_image) {
+        const sid = 'sessionId' in exec && typeof exec.sessionId === 'string' ? exec.sessionId : ''
+        referenceImageB64 = await resolveLastUploadedImageB64(ctx, sid, signal)
+      }
+      const sessionId = 'sessionId' in exec && typeof exec.sessionId === 'string' ? exec.sessionId : ''
+
       let response: Response
       try {
         response = await fetchImpl(endpoint, {
@@ -211,6 +301,9 @@ export function createNexusGenerateImageTool(
             seed: args.seed,
             num_images: 1,
             workspace: rawWorkspace || undefined,
+            session_id: sessionId || undefined,
+            reference_image_b64: referenceImageB64,
+            strength: typeof args.strength === 'number' ? args.strength : undefined,
           }),
           signal,
         })
@@ -252,7 +345,10 @@ export function createNexusGenerateImageTool(
         height: payload.height ?? ref.height,
         steps: payload.steps ?? args.steps ?? 0,
         operationId: payload.operation_id ?? '',
-        savedToDrive: Boolean(payload.master_path),
+        savedToDrive: Boolean(payload.drive_path || payload.master_path),
+        drivePath: payload.drive_path ?? payload.master_path ?? '',
+        workspacePath: payload.workspace_path ?? '',
+        masterPath: payload.master_path ?? '',
         attachment: attachmentJson,
       }
     },
@@ -346,6 +442,15 @@ export function apply(
 
   const tool = createNexusGenerateImageTool(ctx, config, fetchImpl)
   ctx.effect(() => ctx.tools.register(tool), 'nexus-host: nexus_generate_image tool')
+
+  const researchTool = createNexusWebResearchTool(baseUrl.toString(), process.env[config.apiKeyEnv] ?? '', fetchImpl)
+  ctx.effect(() => ctx.tools.register(researchTool), 'nexus-host: nexus_web_research tool')
+
+  const runtimeTool = createNexusInspectRuntimeTool(baseUrl.toString(), process.env[config.apiKeyEnv] ?? '', fetchImpl)
+  ctx.effect(() => ctx.tools.register(runtimeTool), 'nexus-host: nexus_inspect_runtime tool')
+
+  registerNexusWebProvider(ctx, baseUrl.toString(), process.env[config.apiKeyEnv] ?? '', fetchImpl)
+  registerNexusPurgeRoutes(ctx)
 
   ctx.effect(
     () =>

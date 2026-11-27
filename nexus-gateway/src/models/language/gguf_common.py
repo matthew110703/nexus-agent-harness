@@ -87,6 +87,8 @@ class LlamaServerRuntimeBase:
         reasoning_format: Optional[str] = "deepseek",
         extra_args: Optional[list[str]] = None,
         merge_consecutive_roles: bool = False,
+        allow_quantized_kv: bool = True,
+        moe_cpu_offload: bool = False,
     ) -> None:
         self.model_id = model_id
         self.model_path = model_path
@@ -100,6 +102,8 @@ class LlamaServerRuntimeBase:
         self.reasoning_format = reasoning_format
         self.extra_args = extra_args or []
         self.merge_consecutive_roles = merge_consecutive_roles
+        self.allow_quantized_kv = allow_quantized_kv
+        self.moe_cpu_offload = moe_cpu_offload
         self.has_mmproj = find_mmproj_file(model_path) is not None
         self.process: Optional[subprocess.Popen[Any]] = None
         self._active_port = port or 0
@@ -146,6 +150,8 @@ class LlamaServerRuntimeBase:
         ]
         if self.threads > 0:
             cmd.extend(["-t", str(self.threads)])
+        if self.moe_cpu_offload and n_gpu_layers < 999:
+            cmd.extend(["-ot", ".ffn_.*_exps.=CPU"])
         if mmproj_path is not None:
             cmd.extend(["--mmproj", str(mmproj_path)])
         cmd.extend(self.extra_args)
@@ -212,13 +218,15 @@ class LlamaServerRuntimeBase:
         ngl_primary = self.n_gpu_layers
         ngl_stepdown = int(ngl_primary * 0.8) if 0 < ngl_primary < 999 else ngl_primary
 
-        attempts: list[tuple[int, int, list[str]]] = [
-            (ctx_primary, ngl_primary, ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", *perf_flags]),
+        attempts: list[tuple[int, int, list[str]]] = []
+        if self.allow_quantized_kv:
+            attempts.append((ctx_primary, ngl_primary, ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", *perf_flags]))
+        attempts.extend([
             (ctx_primary, ngl_primary, ["-fa", "on", *perf_flags]),
             (ctx_primary, ngl_primary, ["-fa", "on"]),
             (ctx_stepdown, ngl_stepdown, ["-fa", "on"]),
             (ctx_stepdown, ngl_stepdown, []),
-        ]
+        ])
         last_exc: Optional[Exception] = None
         for ctx_val, ngl_val, flags in attempts:
             try:

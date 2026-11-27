@@ -73,6 +73,13 @@ export const NEXUS_UI_COPY = {
   'imageCard.inspect': 'Inspect',
   'imageCard.closeLightboxAria': 'Close image preview',
   'imageCard.altFallback': 'Generated image',
+  'imageCard.download': 'Download PNG',
+  'imageCard.openPreview': 'Open in Preview',
+  'imageCard.copyPath': 'Copy path',
+  'imageCard.copied': 'Copied',
+  'imageCard.drivePath': 'Drive',
+  'menu.deleteSession': 'Delete chat',
+  'menu.deleteSessionConfirm': 'Permanently delete this chat and all generated images/artifacts?',
 
   // Errors
   'error.requestFailed': 'Request failed (HTTP {status})',

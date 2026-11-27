@@ -77,27 +77,47 @@ def save_generated_image_artifact(
     operation_id: str,
     workspace: Optional[str] = None,
     drive_root: Optional[Path] = None,
+    session_id: Optional[str] = None,
+    reference_image_used: bool = False,
+    strength: Optional[float] = None,
 ) -> dict[str, Any]:
-    """Atomically persist a generated PNG master copy and metadata JSON sidecar into workspace/generated_images."""
-    target_dir = resolve_image_target_dir(output_dir, workspace=workspace, drive_root=drive_root)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    """Atomically persist a generated PNG master copy to Drive and optionally mirror into workspace/generated_images."""
+    drive_dir = resolve_image_target_dir(output_dir, workspace=None, drive_root=drive_root)
+    drive_dir.mkdir(parents=True, exist_ok=True)
+    ws_dir = resolve_image_target_dir(output_dir, workspace=workspace, drive_root=drive_root) if workspace else None
+    if ws_dir is not None and ws_dir != drive_dir:
+        ws_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        ws_dir = None
+
     artifact_id = f"img_{uuid.uuid4().hex[:12]}"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"{stamp}_{_slug(prompt)}_{artifact_id}.png"
-    master_path = target_dir / filename
-    meta_path = target_dir / f"{filename}.json"
+    drive_path = drive_dir / filename
+    drive_meta_path = drive_dir / f"{filename}.json"
 
     png_bytes = base64.b64decode(b64_png)
-    tmp_png = target_dir / f".{filename}.tmp"
+    tmp_png = drive_dir / f".{filename}.tmp"
     tmp_png.write_bytes(png_bytes)
-    os.replace(tmp_png, master_path)
+    os.replace(tmp_png, drive_path)
 
+    workspace_path: Optional[Path] = None
+    if ws_dir is not None:
+        workspace_path = ws_dir / filename
+        tmp_ws_png = ws_dir / f".{filename}.tmp"
+        tmp_ws_png.write_bytes(png_bytes)
+        os.replace(tmp_ws_png, workspace_path)
+
+    master_path = workspace_path or drive_path
     metadata: dict[str, Any] = {
         "artifact_id": artifact_id,
         "type": "generated_image",
         "filename": filename,
         "master_path": str(master_path),
+        "drive_path": str(drive_path),
+        "workspace_path": str(workspace_path) if workspace_path is not None else "",
         "workspace": workspace or "",
+        "session_id": session_id or "",
         "model": model_id,
         "quality": quality,
         "prompt": prompt,
@@ -105,19 +125,29 @@ def save_generated_image_artifact(
         "height": height,
         "steps": steps,
         "seed": seed,
+        "reference_image_used": bool(reference_image_used),
+        "strength": strength,
         "operation_id": operation_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "bytes": len(png_bytes),
     }
-    tmp_meta = output_dir / f".{filename}.json.tmp"
-    tmp_meta.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp_meta, meta_path)
+    meta_json = json.dumps(metadata, indent=2) + "\n"
+    tmp_meta = drive_dir / f".{filename}.json.tmp"
+    tmp_meta.write_text(meta_json, encoding="utf-8")
+    os.replace(tmp_meta, drive_meta_path)
+    if ws_dir is not None and workspace_path is not None:
+        ws_meta_path = ws_dir / f"{filename}.json"
+        tmp_ws_meta = ws_dir / f".{filename}.json.tmp"
+        tmp_ws_meta.write_text(meta_json, encoding="utf-8")
+        os.replace(tmp_ws_meta, ws_meta_path)
 
     return {
         "artifact_id": artifact_id,
         "filename": filename,
         "master_path": str(master_path),
-        "metadata_path": str(meta_path),
+        "drive_path": str(drive_path),
+        "workspace_path": str(workspace_path) if workspace_path is not None else "",
+        "metadata_path": str(drive_meta_path),
         "media_type": "image/png",
         "width": width,
         "height": height,

@@ -12,6 +12,7 @@
     { "path": "../../client/connection/tsconfig.host.json" },
     { "path": "../../core/tools" },
     { "path": "../../session/working-directory" },
+    { "path": "../../web/web" },
     { "path": "../../../vendor/cordis" },
     { "path": "../../../vendor/schemastery" }
   ]

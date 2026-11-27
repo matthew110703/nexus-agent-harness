@@ -178,8 +178,23 @@ class SdxlImageModel:
                 })
             return callback_kwargs
 
+        ref_image = None
+        ref_b64 = req.get("reference_image_b64")
+        active_pipe = self.pipe
+        if isinstance(ref_b64, str) and ref_b64.strip():
+            from PIL import Image
+            raw_b64 = ref_b64.split(",", 1)[1] if "," in ref_b64 and ref_b64.startswith("data:") else ref_b64
+            ref_image = Image.open(io.BytesIO(base64.b64decode(raw_b64))).convert("RGB")
+            ref_image = ref_image.resize((params["width"], params["height"]), Image.Resampling.LANCZOS)
+            try:
+                from diffusers import StableDiffusionXLImg2ImgPipeline  # type: ignore[import-not-found]
+                if not isinstance(self.pipe, StableDiffusionXLImg2ImgPipeline):
+                    active_pipe = StableDiffusionXLImg2ImgPipeline.from_pipe(self.pipe)
+            except Exception:
+                active_pipe = self.pipe
+
         try:
-            sig_params = inspect.signature(self.pipe.__call__).parameters
+            sig_params = inspect.signature(active_pipe.__call__).parameters
             accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
         except (TypeError, ValueError):
             sig_params = {}
@@ -190,10 +205,16 @@ class SdxlImageModel:
 
         call_kwargs: dict[str, Any] = {
             "prompt": prompt,
-            "width": params["width"],
-            "height": params["height"],
             "num_inference_steps": steps_total,
         }
+        if ref_image is not None and _supports("image"):
+            call_kwargs["image"] = ref_image
+            strength = req.get("strength")
+            if _supports("strength"):
+                call_kwargs["strength"] = max(0.1, min(1.0, float(strength))) if strength is not None else 0.75
+        else:
+            call_kwargs["width"] = params["width"]
+            call_kwargs["height"] = params["height"]
         if _supports("num_images_per_prompt"):
             call_kwargs["num_images_per_prompt"] = 1
         if params.get("guidance_scale") is not None and _supports("guidance_scale"):
@@ -206,7 +227,7 @@ class SdxlImageModel:
         if cancel_event is not None and cancel_event.is_set():
             raise GenerationCancelledError("Image generation cancelled before start")
 
-        result = self.pipe(**call_kwargs)
+        result = active_pipe(**call_kwargs)
         images = getattr(result, "images", None) or []
         if not images:
             raise RuntimeError("SDXL pipeline returned no images")

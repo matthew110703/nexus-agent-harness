@@ -248,6 +248,35 @@ def _copy_file_fuse(
     }
 
 
+def _evict_old_staged_models(
+    stage_root: Path,
+    *,
+    exclude_dir: Path,
+    needed_bytes: int,
+    on_status: Callable[[str], None],
+) -> None:
+    """Evict oldest unused staged model directories until `needed_bytes` is free."""
+    if not stage_root.is_dir():
+        return
+    candidates: list[tuple[float, Path]] = []
+    for entry in stage_root.iterdir():
+        if not entry.is_dir() or entry.resolve() == exclude_dir.resolve():
+            continue
+        lock_file = stage_root / f".{entry.name}.staging.lock"
+        if lock_file.is_file():
+            continue
+        try:
+            candidates.append((entry.stat().st_mtime, entry))
+        except OSError:
+            continue
+    candidates.sort(key=lambda pair: pair[0])
+    for _mtime, old_dir in candidates:
+        if shutil.disk_usage(stage_root).free >= needed_bytes:
+            break
+        on_status(f"[STAGE] Evicting cached model '{old_dir.name}' to free SSD space...")
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+
 def _stage_raw_gguf_parts(
     *,
     source_dir: Path,
@@ -289,6 +318,14 @@ def _stage_raw_gguf_parts(
 
     free_bytes = shutil.disk_usage(dest_dir.parent).free
     if free_bytes < total_bytes + min_free_margin_bytes:
+        _evict_old_staged_models(
+            dest_dir.parent,
+            exclude_dir=dest_dir,
+            needed_bytes=total_bytes + min_free_margin_bytes,
+            on_status=on_status,
+        )
+        free_bytes = shutil.disk_usage(dest_dir.parent).free
+    if free_bytes < total_bytes + min_free_margin_bytes:
         raise InsufficientDiskSpaceError(
             f"Insufficient local disk for assembled {model_id}: need {(total_bytes + min_free_margin_bytes) / (1024**3):.1f} GiB, "
             f"only {free_bytes / (1024**3):.1f} GiB free"
@@ -301,27 +338,60 @@ def _stage_raw_gguf_parts(
     copied = 0
     last_log = time.monotonic()
 
+    drive_token: Optional[str] = None
+    drive_remote_map: dict[str, Any] = {}
+    if transport in ("auto", "drive_api"):
+        try:
+            import drive_fast_transfer  # type: ignore[import-not-found]
+
+            drive_token, drive_remote_map = drive_fast_transfer.list_drive_model_files(source_dir)
+        except Exception:
+            drive_token = None
+            drive_remote_map = {}
+
     on_status(
         f"[STAGE] Reassembling {len(part_files)}-part split GGUF '{model_id}' "
-        f"({total_bytes / (1024**3):.2f} GiB) onto local SSD..."
+        f"({total_bytes / (1024**3):.2f} GiB, transport={'drive_api' if drive_remote_map else 'fuse'}) onto local SSD..."
     )
     try:
         with tmp_assembled.open("wb") as f_out:
-            for part in part_files:
-                with part.open("rb") as f_in:
-                    while True:
-                        buf = f_in.read(CHUNK_SIZE)
-                        if not buf:
-                            break
-                        f_out.write(buf)
-                        h.update(buf)
-                        copied += len(buf)
-                        now = time.monotonic()
-                        if now - last_log >= 4.0 and total_bytes > 0:
-                            pct = min(100.0, (copied / total_bytes) * 100.0)
-                            mbps = (copied / (1024 * 1024)) / max(0.1, now - t0)
-                            on_status(f"[STAGE] {model_id}: {copied / (1024**3):.2f} / {total_bytes / (1024**3):.2f} GiB ({pct:.1f}%) — {mbps:.1f} MB/s")
-                            last_log = now
+            for idx, part in enumerate(part_files, start=1):
+                rel_key = part.relative_to(source_dir).as_posix()
+                part_tmp: Optional[Path] = None
+                if drive_token and rel_key in drive_remote_map:
+                    try:
+                        import drive_fast_transfer  # type: ignore[import-not-found]
+
+                        part_tmp = dest_dir / f".{assembled_filename}.part{idx}.tmp"
+                        drive_fast_transfer.download_file_via_drive_api(
+                            remote=drive_remote_map[rel_key],
+                            dest_file=part_tmp,
+                            token=drive_token,
+                        )
+                    except Exception:
+                        if part_tmp is not None:
+                            part_tmp.unlink(missing_ok=True)
+                        part_tmp = None
+
+                read_src = part_tmp if (part_tmp is not None and part_tmp.is_file()) else part
+                try:
+                    with read_src.open("rb") as f_in:
+                        while True:
+                            buf = f_in.read(CHUNK_SIZE)
+                            if not buf:
+                                break
+                            f_out.write(buf)
+                            h.update(buf)
+                            copied += len(buf)
+                            now = time.monotonic()
+                            if now - last_log >= 4.0 and total_bytes > 0:
+                                pct = min(100.0, (copied / total_bytes) * 100.0)
+                                mbps = (copied / (1024 * 1024)) / max(0.1, now - t0)
+                                on_status(f"[STAGE] {model_id}: {copied / (1024**3):.2f} / {total_bytes / (1024**3):.2f} GiB ({pct:.1f}%) — {mbps:.1f} MB/s")
+                                last_log = now
+                finally:
+                    if part_tmp is not None:
+                        part_tmp.unlink(missing_ok=True)
         os.replace(tmp_assembled, assembled_path)
     except Exception:
         tmp_assembled.unlink(missing_ok=True)

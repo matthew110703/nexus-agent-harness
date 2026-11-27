@@ -19,7 +19,11 @@ type Actions = Omit<PinSessionInjected & ArchiveSessionInjected, 'hooks'>
  * @param ctx - workspace plugin context owning menus, access, membership, and locale.
  * @param actions - shared row and dialog callbacks; execution always uses the captured Session.
  */
-export function registerSessionMenus(ctx: Context, actions: Actions): void {
+export function registerSessionMenus(
+  ctx: Context,
+  actions: Actions,
+  options: { readonly showArchiveMenu?: boolean } = {},
+): void {
   const t = ctx.locale.bind('workspace')
   const register = (
     id: string,
@@ -73,14 +77,16 @@ export function registerSessionMenus(ctx: Context, actions: Actions): void {
     id: 'copy', label: t('menu.sessionId'), icon: { key: 'workspace.copy' }, separatorBefore: true,
     run: () => actions.copySessionId(target.sessionId),
   }])
-  register('archive', 600, ['workspace/archiveSession', 'workspace/unarchiveSession'], (target) => {
-    const restoring = archived(target)
-    if (!allowed(target, restoring ? 'workspace/unarchiveSession' : 'workspace/archiveSession')) return []
-    return [{
-      id: 'archive', label: t(restoring ? 'menu.unarchiveSession' : 'menu.archiveSession'),
-      icon: { key: restoring ? 'workspace.unarchive' : 'workspace.archive' }, separatorBefore: true, afterContent: true,
-      ...restoring ? {} : { commandId: 'session.archive' as ShortcutCommandId },
-      run: () => { (restoring ? actions.unarchiveSession : actions.archiveSession)(target.sessionId) },
-    }]
-  })
+  if (options.showArchiveMenu !== false) {
+    register('archive', 600, ['workspace/archiveSession', 'workspace/unarchiveSession'], (target) => {
+      const restoring = archived(target)
+      if (!allowed(target, restoring ? 'workspace/unarchiveSession' : 'workspace/archiveSession')) return []
+      return [{
+        id: 'archive', label: t(restoring ? 'menu.unarchiveSession' : 'menu.archiveSession'),
+        icon: { key: restoring ? 'workspace.unarchive' : 'workspace.archive' }, separatorBefore: true, afterContent: true,
+        ...restoring ? {} : { commandId: 'session.archive' as ShortcutCommandId },
+        run: () => { (restoring ? actions.unarchiveSession : actions.archiveSession)(target.sessionId) },
+      }]
+    })
+  }
 }

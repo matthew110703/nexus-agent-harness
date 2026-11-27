@@ -22,9 +22,10 @@ from models.base import SessionRuntimeConfig
 from services.conversation import normalize_openai_messages, resolve_reasoning_controls
 from services.image_generation import save_generated_image_artifact
 from services.progress import ProgressService
+from services.web_research import research_web, search_web
 from workers.worker_protocol import WorkerGenerateRequest, WorkerImageRequest, WorkerLoadRequest, WorkerStatus
 
-GATEWAY_VERSION = "2.1.0"
+GATEWAY_VERSION = "2.2.0"
 IMAGE_QUALITY_PROFILES = ("normal", "detailed", "maximum")
 
 
@@ -312,7 +313,10 @@ def create_app(
                             detail=f"Failed to recover language model '{lang_spec.id}': {exc}",
                         ) from exc
 
-        messages = normalize_openai_messages(body.get("messages") or [])
+        messages = normalize_openai_messages(
+            body.get("messages") or [],
+            allow_images="image" in (lang_spec.modalities or []),
+        )
         if not messages:
             raise HTTPException(status_code=400, detail="messages must be a non-empty list")
 
@@ -472,7 +476,7 @@ def create_app(
                         "model": lang_spec.id,
                         "choices": [{"index": 0, "delta": {"content": parsed.trailing_text}, "finish_reason": None}],
                     }, ensure_ascii=False) + "\n\n"
-                if parsed.errors:
+                if parsed.errors and not parsed.tool_calls and not (parsed.text or parsed.trailing_text):
                     prog.fail(gen_op.operation_id, "; ".join(parsed.errors))
                     yield "data: " + json.dumps({
                         "error": {"message": "; ".join(parsed.errors), "type": "tool_call_parse_error"}
@@ -594,6 +598,10 @@ def create_app(
             msg = str(err).lower()
             return "out of memory" in msg or "outofmemoryerror" in msg or "cuda error: out of memory" in msg
 
+        ref_b64 = body.get("reference_image_b64")
+        raw_strength = body.get("strength")
+        strength = max(0.1, min(1.0, float(raw_strength))) if raw_strength is not None else None
+
         def _run_image_gen_and_save() -> dict[str, Any]:
             raw = worker_mgr.generate_image(
                 WorkerImageRequest(
@@ -607,6 +615,8 @@ def create_app(
                     seed=body.get("seed"),
                     num_images=1,
                     output_dir=str(config.output_image_dir),
+                    reference_image_b64=str(ref_b64) if isinstance(ref_b64, str) and ref_b64.strip() else None,
+                    strength=strength,
                 ),
                 on_progress=_relay_progress,
             )
@@ -629,6 +639,9 @@ def create_app(
                 operation_id=op.operation_id,
                 workspace=body.get("workspace"),
                 drive_root=config.output_image_dir.parents[1] if len(config.output_image_dir.parents) >= 2 else None,
+                session_id=str(body.get("session_id") or "") or None,
+                reference_image_used=bool(isinstance(ref_b64, str) and ref_b64.strip()),
+                strength=strength,
             )
 
         with res_mgr.exclusive(swapping=True):
@@ -728,6 +741,30 @@ def create_app(
         )
         prog.complete(op.operation_id, phase="ready", message=done_msg)
         return saved
+
+    @app.post("/v1/web/search")
+    def web_search_endpoint(body: dict[str, Any], _auth: None = Depends(require_auth)) -> dict[str, Any]:
+        query = str(body.get("query") or "").strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="query is required")
+        limit = int(body.get("limit") or 8)
+        return {"query": query, "results": search_web(query, limit=limit)}
+
+    @app.post("/v1/web/research")
+    def web_research_endpoint(body: dict[str, Any], _auth: None = Depends(require_auth)) -> dict[str, Any]:
+        raw_queries = body.get("queries")
+        if isinstance(raw_queries, str):
+            queries = [raw_queries]
+        elif isinstance(raw_queries, list):
+            queries = [str(q) for q in raw_queries]
+        else:
+            q_single = str(body.get("query") or "").strip()
+            queries = [q_single] if q_single else []
+        if not queries:
+            raise HTTPException(status_code=400, detail="queries must be a non-empty list of search strings")
+        max_pages = int(body.get("max_pages") or 4)
+        max_chars = int(body.get("max_chars_per_page") or 12_000)
+        return research_web(queries, max_pages=max_pages, max_chars_per_page=max_chars)
 
     @app.get("/v1/plugin-index.json")
     def plugin_index() -> JSONResponse:

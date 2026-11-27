@@ -8,7 +8,7 @@
  * and `dsh web`, redacts `NEXUS_API_KEY`, and cleans up only managed children.
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import net from 'node:net'
 import process from 'node:process'
 
@@ -155,8 +155,15 @@ async function verifyGatewaySessionReady() {
       + 'Run the Colab model bootstrap cell before starting Harness.',
     )
   }
+  const lockedModel = buildLockedModelProfile(lang)
+  if (payload?.image_model?.id) {
+    const curInput = Array.isArray(lockedModel.input) ? lockedModel.input : ['text']
+    if (!curInput.includes('image')) {
+      lockedModel.input = [...curInput, 'image']
+    }
+  }
   return {
-    lockedModel: buildLockedModelProfile(lang),
+    lockedModel,
     imageModelId: payload?.image_model?.id ?? null,
   }
 }
@@ -240,9 +247,25 @@ async function main() {
     trustedHost: tunnelHost,
     port: HARNESS_PORT,
   })
+  let permissionMode = process.env.COLAB_SANDBOX_MODE || process.env.DSH_PERMISSION_MODE || ''
+  if (!permissionMode || permissionMode === 'auto') {
+    const bwrapProbe = spawnSync('bwrap', ['--unshare-user', '--ro-bind', '/', '/', 'true'], {
+      stdio: 'ignore',
+      timeout: 3000,
+    })
+    if (bwrapProbe.status === 0) {
+      permissionMode = 'workspace-write'
+    } else {
+      permissionMode = 'danger-full-access'
+      console.log('[supervisor] bwrap user-namespace unavailable in Colab container; using DSH_PERMISSION_MODE=danger-full-access so Bash/Write work.')
+    }
+  }
+  const defaultWorkspace = process.env.NEXUS_DEFAULT_WORKSPACE || process.env.NEXUS_WORKSPACE_ROOT || '/content/drive/MyDrive/Nexus/workspaces/projects'
   console.log(`[supervisor] Starting locked Nexus Harness (${publicUrl})...`)
   const harnessEnv = {
     ...process.env,
+    DSH_PERMISSION_MODE: permissionMode,
+    NEXUS_DEFAULT_WORKSPACE: defaultWorkspace,
     NEXUS_DISCOVERED_MODELS: JSON.stringify([lockedModel]),
     NEXUS_SELECTED_LANGUAGE_MODEL: lockedModel.id,
   }

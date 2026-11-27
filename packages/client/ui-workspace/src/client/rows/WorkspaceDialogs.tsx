@@ -47,6 +47,8 @@ export function WorkspaceDialogs({ request, workspaces, renameWorkspace, deleteW
   const [deleting, setDeleting] = useState(false)
   const [deleteCommittedId, setDeleteCommittedId] = useState<WorkspaceId | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [deleteChats, setDeleteChats] = useState(true)
+  const [deleteDiskFolder, setDeleteDiskFolder] = useState(false)
   useEffect(() => {
     if (deleteCommittedId === null
       || workspaces.some(workspace => workspace.workspaceId === deleteCommittedId)) return
@@ -65,7 +67,22 @@ export function WorkspaceDialogs({ request, workspaces, renameWorkspace, deleteW
     setDeleting(true)
     setDeleteCommittedId(null)
     setDeleteError(null)
-    deleteWorkspace(deleteTarget.workspaceId).then(() => {
+    const matchedWorkspace = workspaces.find(w => w.workspaceId === deleteTarget.workspaceId)
+    const runPurge = typeof fetch === 'function' && (deleteChats || deleteDiskFolder)
+      ? fetch('/api/nexus.purge-workspace', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId: deleteTarget.workspaceId,
+          sessionIds: matchedWorkspace?.sessionIds ?? [],
+          workspacePath: matchedWorkspace?.path ?? '',
+          deleteChats,
+          deleteDiskFolder,
+        }),
+      }).catch(() => undefined)
+      : Promise.resolve()
+    void runPurge.then(() => deleteWorkspace(deleteTarget.workspaceId)).then(() => {
       // Keep the confirmation pending until this component has rendered the
       // committed list projection without the deleted id. Closing earlier
       // exposes one stale React frame to the next Create Workspace gesture.
@@ -134,6 +151,28 @@ export function WorkspaceDialogs({ request, workspaces, renameWorkspace, deleteW
         </>
       )}
     >
+      {deleteTarget !== null && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '8px', fontSize: '13px' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={deleteChats}
+              disabled={deleting}
+              onChange={(e) => { setDeleteChats(e.target.checked) }}
+            />
+            <span>{t('delete.deleteChats')}</span>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={deleteDiskFolder}
+              disabled={deleting}
+              onChange={(e) => { setDeleteDiskFolder(e.target.checked) }}
+            />
+            <span>{t('delete.deleteDiskFolder')}</span>
+          </label>
+        </div>
+      )}
       {deleting && <div className={css.deleteStatus} role="status">{t('delete.pending')}</div>}
       {deleteError !== null && <div className={css.renameError} role="alert">{deleteError}</div>}
     </Modal>

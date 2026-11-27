@@ -72,8 +72,9 @@ function extractCardInfo(props: ToolCallViewProps): NexusImageCardInfo {
   let attachment: ImageAttachmentRef | null = null
   const content = props.block.content
   if (Array.isArray(content)) {
-    for (const part of content) {
-      if (typeof part === 'object' && part !== null && 'type' in part && part.type === 'image' && 'attachment' in part) {
+    for (const rawPart of content) {
+      const part = rawPart as { type?: string; attachment?: unknown } | null
+      if (part !== null && typeof part === 'object' && part.type === 'image') {
         if (isImageAttachmentRef(part.attachment)) {
           attachment = part.attachment
           break
@@ -140,10 +141,10 @@ export function NexusImageToolRow(props: ToolCallViewProps) {
     }
   }, [attachmentId, props.loadImage])
 
-  const isError = props.phase === 'result' && props.block.isError === true
+  const isError = props.phase === 'result' && props.block.isError
   const errorText = isError && Array.isArray(props.block.content)
-    ? props.block.content
-      .map(p => (typeof p === 'object' && p !== null && 'type' in p && p.type === 'text' && 'text' in p && typeof p.text === 'string' ? p.text : ''))
+    ? (props.block.content as Array<{ type?: string; text?: string } | null>)
+      .map(p => (p !== null && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string' ? p.text : ''))
       .filter(Boolean)
       .join('\n')
     : ''
@@ -201,9 +202,7 @@ export function NexusImageToolRow(props: ToolCallViewProps) {
             marginBottom: '8px',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
-            display: '-webkit-box',
-            WebkitLineClamp: 2,
-            WebkitBoxOrient: 'vertical',
+            whiteSpace: 'nowrap',
           }}
         >
           {info.prompt}
@@ -222,7 +221,7 @@ export function NexusImageToolRow(props: ToolCallViewProps) {
             <img
               src={imageUrl}
               alt={info.prompt || tNexus('imageCard.altFallback')}
-              onClick={() => setLightboxOpen(true)}
+              onClick={() => { setLightboxOpen(true) }}
               style={{
                 display: 'block',
                 width: '100%',
@@ -253,7 +252,7 @@ export function NexusImageToolRow(props: ToolCallViewProps) {
             role="dialog"
             aria-modal="true"
             aria-label={tNexus('imageCard.closeLightboxAria')}
-            onClick={() => setLightboxOpen(false)}
+            onClick={() => { setLightboxOpen(false) }}
             style={{
               position: 'fixed',
               inset: 0,

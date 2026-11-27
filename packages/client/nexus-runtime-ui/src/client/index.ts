@@ -4,12 +4,20 @@
  * composer's `conversation.input.right` slot.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
+import type {} from '@deepseek-ai/dsh-client-ui-context-menu/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
+import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { tNexus } from './locales.ts'
 import { NexusImageToolRow } from './NexusImageToolRow.tsx'
+import { NexusTurnImagesTail, type NexusTurnImagesTailInjected } from './NexusTurnImagesTail.tsx'
+import { nexusTurnImagesDefinition } from './turn-images.ts'
 import {
   NexusApiError,
   NexusRuntimeControl,
@@ -19,6 +27,8 @@ import {
 
 export { NexusApiError, NexusRuntimeControl } from './NexusRuntimeControl.tsx'
 export { NexusImageToolRow } from './NexusImageToolRow.tsx'
+export { NexusTurnImagesTail, type NexusTurnImagesTailInjected, type NexusTurnImagesTailProps } from './NexusTurnImagesTail.tsx'
+export { nexusTurnImagesDefinition, type NexusTurnImage } from './turn-images.ts'
 export { resolveCompactModelName, resolveModelDisplayName } from './displayName.ts'
 export {
   getNotificationPermission,
@@ -104,5 +114,60 @@ export function apply(ctx: ClientContext): void {
       name: 'tool.call.toolview',
       key: 'nexus_generate_image',
     }, NexusImageToolRow))
+  })
+
+  ctx.inject(['uiConversation', 'sessions', 'slots'], (convScope: ClientContext) => {
+    convScope.effect(
+      () => convScope.uiConversation.events.register(nexusTurnImagesDefinition),
+      'nexus-runtime-ui: turn images conversation definition',
+    )
+    convScope.slots.inject('conversation.chat.turnTail', () => convScope.slots.register({
+      name: 'conversation.chat.turnTail',
+      id: '@deepseek-ai/dsh-client-nexus-runtime-ui/turn-images',
+      inject: (sessionId: SessionId): NexusTurnImagesTailInjected => {
+        const binding = convScope.sessions.binding(sessionId)
+        if (binding === undefined) {
+          return { useImages: () => [] }
+        }
+        const chat = convScope.uiConversation.binding(binding).target('chat')
+        return {
+          useImages: (turn: PropsRuntime<'conversation.chat.turnTail'>['turn']) => {
+            const snapshot = chat.getSnapshot()
+            if (snapshot === undefined) return []
+            return snapshot.nodes.turnDataSource(Number(turn), 'nexus-generated-images').getSnapshot()
+          },
+        }
+      },
+    }, NexusTurnImagesTail))
+  })
+
+  ctx.inject(['contextMenus'], (menuScope: ClientContext) => {
+    menuScope.effect(
+      () =>
+        menuScope.contextMenus.register({
+          id: 'session.nexus-delete',
+          target: 'session',
+          order: 600,
+          resolve: target => [
+            {
+              id: 'nexus-delete',
+              label: tNexus('menu.deleteSession'),
+              separatorBefore: true,
+              run: () => {
+                if (typeof window !== 'undefined' && !window.confirm(tNexus('menu.deleteSessionConfirm'))) {
+                  return
+                }
+                void fetch('/api/nexus.purge-session', {
+                  method: 'POST',
+                  credentials: 'same-origin',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ sessionId: target.sessionId }),
+                })
+              },
+            },
+          ],
+        }),
+      'nexus-runtime-ui: session delete menu',
+    )
   })
 }

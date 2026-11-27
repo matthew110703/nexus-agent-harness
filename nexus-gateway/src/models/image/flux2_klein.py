@@ -153,12 +153,25 @@ class Flux2KleinImageModel:
         def _supports(name: str) -> bool:
             return name in sig_params or accepts_var_kw
 
+        ref_image = None
+        ref_b64 = req.get("reference_image_b64")
+        if isinstance(ref_b64, str) and ref_b64.strip():
+            from PIL import Image
+            raw_b64 = ref_b64.split(",", 1)[1] if "," in ref_b64 and ref_b64.startswith("data:") else ref_b64
+            ref_image = Image.open(io.BytesIO(base64.b64decode(raw_b64))).convert("RGB")
+            ref_image = ref_image.resize((params["width"], params["height"]), Image.Resampling.LANCZOS)
+
         call_kwargs: dict[str, Any] = {
             "prompt": prompt,
             "width": params["width"],
             "height": params["height"],
             "num_inference_steps": steps_total,
         }
+        if ref_image is not None and _supports("image"):
+            call_kwargs["image"] = ref_image
+        if ref_image is not None and _supports("strength"):
+            strength = req.get("strength")
+            call_kwargs["strength"] = max(0.1, min(1.0, float(strength))) if strength is not None else 0.75
         if _supports("num_images_per_prompt"):
             call_kwargs["num_images_per_prompt"] = 1
         if params.get("guidance_scale") is not None and _supports("guidance_scale"):

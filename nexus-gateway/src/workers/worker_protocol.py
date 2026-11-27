@@ -53,6 +53,8 @@ class WorkerImageRequest:
     seed: Optional[int] = None
     num_images: int = 1
     output_dir: str = ""
+    reference_image_b64: Optional[str] = None
+    strength: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

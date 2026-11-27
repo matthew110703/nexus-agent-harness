@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import uuid
@@ -13,7 +14,7 @@ CLOSE_TOOL_TAG = "</tool_call>"
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
 CONTROL_TOKEN_RE = re.compile(
-    r"<\|(?:im_end|im_start|endoftext|return|end|call|start|channel|message|constrain|python_tag|eot_id|eom_id|tool_call)\|>"
+    r"<\|(?:im_end|im_start|endoftext|return|end|call|start|channel|message|constrain|python_tag|python_start|python_end|eot_id|eom_id|tool_call)\|>"
 )
 IMPLEMENTED_PARSER_FAMILIES = frozenset({
     "qwen3_vl",
@@ -356,6 +357,7 @@ class Qwen35XmlToolStreamParser:
                     p_name = p_match.group(1).strip()
                     p_raw = p_match.group(2).strip()
                     arguments[p_name] = _coerce_xml_parameter(p_raw, props.get(p_name))
+                arguments = _coerce_arguments_to_schema(arguments, schema)
                 err = validate_tool_arguments(arguments, schema)
                 if err is not None:
                     errors.append(f"Invalid arguments for tool {name!r}: {err}")
@@ -557,14 +559,14 @@ class GptOssHarmonyStreamParser:
                 if name not in schema_by_name:
                     errors.append(f"Unknown or unadvertised tool: {name!r}")
                     continue
-                try:
-                    arguments = json.loads(args_raw) if args_raw else {}
-                except json.JSONDecodeError as exc:
-                    errors.append(f"Malformed Harmony tool_call JSON for {name!r}: {exc.msg}")
+                arguments = _repair_and_parse_json_obj(args_raw) if args_raw else {}
+                if arguments is None:
+                    errors.append(f"Malformed Harmony tool_call JSON for {name!r}")
                     continue
                 if not isinstance(arguments, dict):
                     errors.append(f"Arguments for tool {name!r} must be an object")
                     continue
+                arguments = _coerce_arguments_to_schema(arguments, schema_by_name[name])
                 err = validate_tool_arguments(arguments, schema_by_name[name])
                 if err is not None:
                     errors.append(f"Invalid arguments for tool {name!r}: {err}")
@@ -726,6 +728,168 @@ def _coerce_xml_parameter(raw_value: str, prop_schema: Any) -> Any:
     return raw_value
 
 
+def _repair_and_parse_json_obj(raw: str) -> Optional[dict[str, Any]]:
+    """Parse a JSON object with repair for fenced blocks, trailing commas, and Pythonic dicts."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json|python)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+    for candidate in (
+        text,
+        re.sub(r",\s*([}\]])", r"\1", text),
+        re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', re.sub(r",\s*([}\]])", r"\1", text)),
+    ):
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    try:
+        parsed_ast = ast.literal_eval(text)
+        if isinstance(parsed_ast, dict):
+            return parsed_ast
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        snippet = re.sub(r",\s*([}\]])", r"\1", text[start : end + 1])
+        try:
+            parsed = json.loads(snippet)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+_PARAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "file_path": ("path", "filepath", "filePath", "filename"),
+    "path": ("file_path", "filepath", "filePath"),
+    "command": ("cmd", "shell_command", "bash_command"),
+    "queries": ("query", "search_query"),
+    "query": ("queries",),
+    "urls": ("url",),
+    "url": ("urls",),
+}
+
+
+def _coerce_value_to_schema(value: Any, prop_schema: Any) -> Any:
+    if not isinstance(prop_schema, dict):
+        return value
+    expected = prop_schema.get("type")
+    if not isinstance(expected, str):
+        return value
+    if expected == "integer" and not isinstance(value, bool):
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                try:
+                    fval = float(value.strip())
+                    if fval.is_integer():
+                        return int(fval)
+                except ValueError:
+                    pass
+    elif expected == "number" and not isinstance(value, bool):
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                pass
+    elif expected == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            low = value.strip().lower()
+            if low in {"true", "1", "yes"}:
+                return True
+            if low in {"false", "0", "no"}:
+                return False
+    elif expected == "array":
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+            return [value] if value.strip() else []
+    elif expected == "object":
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            parsed_obj = _repair_and_parse_json_obj(value)
+            if parsed_obj is not None:
+                return parsed_obj
+    elif expected == "string" and value is not None and not isinstance(value, str):
+        return str(value)
+    return value
+
+
+def _coerce_arguments_to_schema(arguments: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return arguments
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return arguments
+    out = dict(arguments)
+    for target_key in props:
+        if target_key not in out:
+            for alias in _PARAM_ALIASES.get(target_key, ()):
+                if alias in out:
+                    out[target_key] = out.pop(alias)
+                    break
+    for key, val in list(out.items()):
+        if key in props:
+            out[key] = _coerce_value_to_schema(val, props[key])
+    return out
+
+
+def _parse_pythonic_calls(raw: str) -> list[tuple[str, dict[str, Any]]]:
+    """Parse `[func(k=v, ...)]` or `func(k=v, ...)` Pythonic tool calls via AST."""
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        return []
+    nodes: list[ast.expr] = list(tree.body.elts) if isinstance(tree.body, ast.List) else [tree.body]
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            return []
+        if isinstance(node.func, ast.Name):
+            fn_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            fn_name = node.func.attr
+        else:
+            return []
+        kwargs: dict[str, Any] = {}
+        for kw in node.keywords:
+            if not kw.arg:
+                continue
+            try:
+                kwargs[kw.arg] = ast.literal_eval(kw.value)
+            except Exception:
+                return []
+        parsed.append((fn_name, kwargs))
+    return parsed
+
+
 def _validate_json_tool_calls(
     raw_calls: list[str],
     advertised_tools: list[dict[str, Any]],
@@ -735,30 +899,40 @@ def _validate_json_tool_calls(
     valid_calls: list[ParsedToolCall] = []
     errors = list(initial_errors)
     for raw in raw_calls:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            errors.append(f"Malformed tool_call JSON: {exc.msg}")
-            continue
-        if not isinstance(payload, dict):
-            errors.append("Tool call payload must be a JSON object")
+        payload = _repair_and_parse_json_obj(raw)
+        if payload is None:
+            py_calls = _parse_pythonic_calls(raw)
+            if py_calls:
+                for py_name, py_args in py_calls:
+                    if py_name not in schema_by_name:
+                        errors.append(f"Unknown or unadvertised tool: {py_name!r}")
+                        continue
+                    coerced = _coerce_arguments_to_schema(py_args, schema_by_name[py_name])
+                    err = validate_tool_arguments(coerced, schema_by_name[py_name])
+                    if err is not None:
+                        errors.append(f"Invalid arguments for tool {py_name!r}: {err}")
+                        continue
+                    valid_calls.append(ParsedToolCall(id=f"call_{uuid.uuid4().hex[:12]}", name=py_name, arguments=coerced))
+                continue
+            errors.append("Malformed tool_call JSON")
             continue
         name = payload.get("name")
         arguments = payload.get("arguments")
         if arguments is None:
             arguments = payload.get("parameters", {})
         if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                errors.append(f"Malformed tool_call arguments JSON string: {exc.msg}")
+            repaired_args = _repair_and_parse_json_obj(arguments)
+            if repaired_args is None:
+                errors.append("Malformed tool_call arguments JSON string")
                 continue
+            arguments = repaired_args
         if not isinstance(name, str) or name not in schema_by_name:
             errors.append(f"Unknown or unadvertised tool: {name!r}")
             continue
         if not isinstance(arguments, dict):
             errors.append(f"Arguments for tool {name!r} must be an object")
             continue
+        arguments = _coerce_arguments_to_schema(arguments, schema_by_name[name])
         err = validate_tool_arguments(arguments, schema_by_name[name])
         if err is not None:
             errors.append(f"Invalid arguments for tool {name!r}: {err}")

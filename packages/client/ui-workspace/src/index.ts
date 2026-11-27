@@ -13,6 +13,7 @@ export type Config = WorkspaceNavigationConfig
 /** Live Workspace navigation preferences projected to the browser. */
 export const Config = z.object({
   recentViewLimit: z.natural().default(10).volatile(),
+  showArchiveMenu: z.boolean().default(true).volatile(),
 })
 
 /** Register the browser plugin without Host behavior. */
