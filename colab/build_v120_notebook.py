@@ -157,6 +157,7 @@ sync_source.seed_drive_baseline(
         ("scripts/harness_home_snapshot.py", "colab/harness_home_snapshot.py"),
         ("scripts/model_inventory.py", "colab/model_inventory.py"),
         ("scripts/runtime_deps.py", "colab/runtime_deps.py"),
+        ("scripts/drive_fast_transfer.py", "colab/drive_fast_transfer.py"),
         ("scripts/staging.py", "colab/staging.py"),
         ("config/colab.overlay.yml", "apps/cli/config/examples/colab.overlay.yml"),
         ("config/plugin-index.json", "colab/plugin-index.json"),
@@ -261,6 +262,7 @@ LIGHTWEIGHT_PY = {
     "diffusers": "diffusers",
     "accelerate": "accelerate",
     "PIL": "pillow",
+    "xxhash": "xxhash",
 }
 missing_pkgs = []
 for mod, pip_name in LIGHTWEIGHT_PY.items():
@@ -352,7 +354,7 @@ if (BUILD_STAMP.read_text("utf-8").strip() if BUILD_STAMP.is_file() else "") != 
 print(f"[BUILD] Harness artifacts ready ({fp[:12]}).")
 """
         ),
-        _md("## 5. Upfront SSD Staging, Start Gateway & Warm-Load Selected Language Model"),
+        _md("## 5. Fast SSD Staging, Start Gateway & Warm-Load Selected Language Model"),
         _code(
             """
 # @title
@@ -361,25 +363,53 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 import urllib.request
 
+import drive_fast_transfer
+drive_fast_transfer = importlib.reload(drive_fast_transfer)
 import staging
 staging = importlib.reload(staging)
 
-# 1. Stage both selected models to local SSD & write locked session-runtime.json.
+STAGING_TRANSPORT = "auto"  # @param ["auto", "drive_api", "fuse"]
+STAGING_VERIFY_MODE = "fast"  # @param ["fast", "local_full", "strict_source"]
+STAGE_IMAGE_IN_BACKGROUND = True  # @param {type:"boolean"}
+
+# 1. Stage language model (and image model upfront unless background staging is enabled).
+img_lock_path = (NEXUS_STAGE_DIR / f".{NEXUS_SELECTED_IMAGE.id}.staging.lock") if NEXUS_SELECTED_IMAGE is not None else None
+if img_lock_path is not None:
+    if STAGE_IMAGE_IN_BACKGROUND:
+        img_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        img_lock_path.write_text("staging\\n", encoding="utf-8")
+    else:
+        img_lock_path.unlink(missing_ok=True)
+
 NEXUS_SESSION_CONFIG = staging.stage_selected_models(
     local_stage_root=NEXUS_STAGE_DIR,
     language_candidate=NEXUS_SELECTED_LANGUAGE,
     image_candidate=NEXUS_SELECTED_IMAGE,
     manifest_path=NEXUS_SESSION_MANIFEST,
     drive_manifest_copy=NEXUS_RUNTIME_MANIFEST_DIR / "runtime" / "session-runtime.json",
+    verify_mode=STAGING_VERIFY_MODE,
+    transport=STAGING_TRANSPORT,
+    defer_image_staging=STAGE_IMAGE_IN_BACKGROUND,
     on_status=print,
 )
 
 # 2. Restart Gateway bound strictly to loopback 127.0.0.1:7861.
 prev_gw = NEXUS_MANAGED_PIDS.pop("gateway", None)
 if prev_gw is not None:
+    try:
+        req_un = urllib.request.Request(
+            f"{NEXUS_GATEWAY_ROOT_URL}/v1/runtime/unload",
+            data=b'{"force_terminate": true}',
+            headers={"Authorization": f"Bearer {NEXUS_API_KEY}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req_un, timeout=10)
+    except Exception:
+        pass
     try:
         os.kill(prev_gw, signal.SIGTERM)
         time.sleep(1.0)
@@ -441,7 +471,30 @@ except Exception as exc:
     # Failed load MUST NOT leave a false-ready gateway running.
     gw_proc.terminate()
     NEXUS_MANAGED_PIDS.pop("gateway", None)
+    if img_lock_path is not None:
+        img_lock_path.unlink(missing_ok=True)
     raise RuntimeError(f"Initial language model load failed; gateway terminated cleanly: {exc}") from exc
+
+# 4. Stage image model in background while you start chatting immediately!
+if STAGE_IMAGE_IN_BACKGROUND and NEXUS_SELECTED_IMAGE is not None and img_lock_path is not None:
+    def _bg_stage_image() -> None:
+        try:
+            staging.stage_model_directory(
+                Path(NEXUS_SELECTED_IMAGE.source_path),
+                NEXUS_STAGE_DIR,
+                model_id=NEXUS_SELECTED_IMAGE.id,
+                verify_mode=STAGING_VERIFY_MODE,
+                transport=STAGING_TRANSPORT,
+                on_status=lambda msg: print(f"[BG-IMAGE] {msg}"),
+            )
+        except Exception as bg_exc:
+            print(f"[BG-IMAGE] Staging failed for {NEXUS_SELECTED_IMAGE.id}: {bg_exc}")
+        finally:
+            img_lock_path.unlink(missing_ok=True)
+
+    bg_thread = threading.Thread(target=_bg_stage_image, daemon=True)
+    bg_thread.start()
+    print(f"[STAGE] Background staging started for image model '{NEXUS_SELECTED_IMAGE.id}'. You can run Section 6 now!")
 """
         ),
         _md("## 6. Restore Session Snapshot & Start Locked Single-Model Harness + Quick Tunnel"),

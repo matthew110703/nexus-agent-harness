@@ -499,6 +499,32 @@ def create_app(
             message=f"Swapping GPU from {lang_spec.id} to {img_spec.id}",
         )
 
+        # If Colab is staging the image model in the background, wait cleanly before unloading the LLM.
+        img_dir = Path(img_spec.model_path)
+        stage_lock = img_dir.parent / f".{img_spec.id}.staging.lock"
+        if stage_lock.is_file() or not img_dir.is_dir():
+            prog.update(
+                op.operation_id,
+                phase="resolving",
+                indeterminate=True,
+                message=f"Waiting for background staging of {img_spec.id} to finish...",
+            )
+            wait_deadline = time.monotonic() + 600.0
+            while stage_lock.is_file() or not img_dir.is_dir():
+                if time.monotonic() > wait_deadline:
+                    prog.fail(op.operation_id, f"Timed out waiting for background staging of {img_spec.id}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Image model '{img_spec.id}' is still staging from Drive; please retry in a moment.",
+                    )
+                time.sleep(1.0)
+            prog.update(
+                op.operation_id,
+                phase="swapping_to_image",
+                indeterminate=True,
+                message=f"Swapping GPU from {lang_spec.id} to {img_spec.id}",
+            )
+
         def _relay_progress(ev: dict[str, Any]) -> None:
             prog.update(
                 op.operation_id,
