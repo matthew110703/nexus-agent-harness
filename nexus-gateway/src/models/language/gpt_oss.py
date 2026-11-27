@@ -34,16 +34,22 @@ class GptOssLanguageModel:
     def load(self, *, precision: Optional[str] = None) -> None:
         import torch  # type: ignore[import-not-found]
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
+        from models.language.quantization import resolve_quantization_config
 
-        dtype = select_torch_dtype(torch, precision)
+        total_size = sum(p.stat().st_size for p in self.model_path.glob("*.safetensors"))
+        q_cfg, dtype = resolve_quantization_config(torch, model_size_bytes=total_size)
+
         self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path), local_files_only=True, trust_remote_code=False)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            str(self.model_path),
-            local_files_only=True,
-            torch_dtype=dtype,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=False,
-        )
+        load_kwargs: dict[str, Any] = {
+            "local_files_only": True,
+            "torch_dtype": dtype,
+            "device_map": "auto" if torch.cuda.is_available() else None,
+            "trust_remote_code": False,
+        }
+        if q_cfg is not None:
+            load_kwargs["quantization_config"] = q_cfg
+
+        self.model = AutoModelForCausalLM.from_pretrained(str(self.model_path), **load_kwargs)
         self.model.eval()
 
     def _format_prompt(

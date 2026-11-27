@@ -75,7 +75,56 @@ class SdxlImageModel:
             raise RuntimeError("SDXL image generation requires a CUDA GPU runtime")
 
         dtype = torch.float16 if precision != "bf16" else torch.bfloat16
-        pipe = StableDiffusionXLPipeline.from_pretrained(str(self.model_path), torch_dtype=dtype, local_files_only=True)
+
+        # Determine loading strategy:
+        # 1. Component directory check: Does unet have fp16 variant files?
+        # e.g. unet/diffusion_pytorch_model.fp16.safetensors or unet/diffusion_pytorch_model.fp16.bin
+        unet_dir = self.model_path / "unet"
+        has_fp16_variant = False
+        has_regular_unet = False
+        if unet_dir.is_dir():
+            unet_files = [p.name for p in unet_dir.iterdir() if p.is_file()]
+            has_fp16_variant = any(".fp16." in name for name in unet_files)
+            has_regular_unet = any(
+                (name.endswith(".safetensors") or name.endswith(".bin")) and ".fp16." not in name
+                for name in unet_files
+            )
+
+        # 2. Check for single-file monolithic checkpoint in root (e.g. lustifySDXLNSFWSFW_v20.safetensors)
+        single_file_candidates = sorted(
+            [p for p in self.model_path.glob("*.safetensors") if p.is_file() and p.stat().st_size > 2 * 1024 * 1024 * 1024]
+        )
+
+        pipe = None
+        # Try from_pretrained with appropriate variant first
+        if has_fp16_variant or has_regular_unet:
+            try:
+                kwargs: dict[str, Any] = {"torch_dtype": dtype, "local_files_only": True}
+                if has_fp16_variant:
+                    kwargs["variant"] = "fp16"
+                pipe = StableDiffusionXLPipeline.from_pretrained(str(self.model_path), **kwargs)
+            except Exception as load_err:
+                if not single_file_candidates:
+                    raise
+                # Fall back to single-file if from_pretrained failed
+                pipe = None
+
+        if pipe is None and single_file_candidates:
+            single_file = single_file_candidates[0]
+            pipe = StableDiffusionXLPipeline.from_single_file(
+                str(single_file),
+                torch_dtype=dtype,
+                local_files_only=True,
+            )
+
+        if pipe is None:
+            # Fallback attempt if neither succeeded yet
+            pipe = StableDiffusionXLPipeline.from_pretrained(
+                str(self.model_path),
+                torch_dtype=dtype,
+                local_files_only=True,
+            )
+
         pipe.to("cuda")
         self.pipe = pipe
 

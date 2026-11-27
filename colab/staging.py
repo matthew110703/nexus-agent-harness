@@ -63,11 +63,22 @@ def _write_stage_manifest(dest_dir: Path, payload: dict[str, Any]) -> None:
 
 def _iter_stage_files(source_dir: Path) -> list[Path]:
     files: list[Path] = []
+    # If this is a diffusers pipeline directory with complete components,
+    # skip staging redundant monolithic single-file checkpoints in root (e.g. *.safetensors > 2GB in root)
+    has_diffusers_components = (
+        (source_dir / "model_index.json").is_file()
+        and (source_dir / "unet").is_dir()
+        and (source_dir / "vae").is_dir()
+    )
+
     for p in sorted(source_dir.rglob("*")):
         if not p.is_file():
             continue
         rel = p.relative_to(source_dir)
         if p.name == MANIFEST_FILENAME or any(seg in SKIPPED_STAGE_DIRS for seg in rel.parts):
+            continue
+        if has_diffusers_components and len(rel.parts) == 1 and p.name.endswith(".safetensors") and p.stat().st_size > 2 * 1024 * 1024 * 1024:
+            # Redundant monolithic single-file checkpoint in root; diffusers components take precedence
             continue
         files.append(p)
     return files

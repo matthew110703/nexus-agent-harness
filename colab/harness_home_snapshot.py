@@ -15,8 +15,8 @@ from typing import Any
 SNAPSHOT_MANIFEST_NAME = "snapshot-manifest.json"
 SNAPSHOT_FORMAT_VERSION = 1
 
-# Only non-secret durable session/profile state is copied to Drive snapshots.
-ALLOWED_TOP_LEVEL_DIRS = ("sessions", "attachments")
+# Only non-secret durable session/profile/storage state is copied to Drive snapshots.
+ALLOWED_TOP_LEVEL_DIRS = ("sessions", "attachments", "storages")
 ALLOWED_FILENAMES: tuple[str, ...] = ()
 
 SECRET_DIR_NAMES = frozenset({"credentials", ".ssh", ".gnupg"})

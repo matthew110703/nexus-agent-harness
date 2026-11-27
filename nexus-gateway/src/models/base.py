@@ -9,7 +9,17 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Optional, Protocol
 
-LanguageImplName = Literal["qwen3_vl", "qwen3_5", "gpt_oss"]
+LanguageImplName = Literal[
+    "qwen3_vl",
+    "qwen3_5",
+    "gpt_oss",
+    "gemma3",
+    "deepseek_vl2",
+    "deepseek_vl",
+    "gguf_qwen3_5",
+    "gguf_gemma4",
+    "gguf_deepseek_qwen3_5",
+]
 ImageImplName = Literal["flux2_klein", "sdxl"]
 ReasoningMode = Literal["none", "binary_toggle", "effort_levels"]
 ImageQualityProfile = Literal["normal", "detailed", "maximum"]
@@ -18,6 +28,12 @@ LANGUAGE_IMPLEMENTATIONS: dict[str, tuple[str, str]] = {
     "qwen3_vl": ("models.language.qwen3_vl", "Qwen3VLLanguageModel"),
     "qwen3_5": ("models.language.qwen3_5", "Qwen35LanguageModel"),
     "gpt_oss": ("models.language.gpt_oss", "GptOssLanguageModel"),
+    "gemma3": ("models.language.gemma3", "Gemma3LanguageModel"),
+    "deepseek_vl2": ("models.language.deepseek_vl2", "DeepSeekVl2LanguageModel"),
+    "deepseek_vl": ("models.language.deepseek_vl", "DeepSeekVlLanguageModel"),
+    "gguf_qwen3_5": ("models.language.gguf_qwen3_5", "GgufQwen35Model"),
+    "gguf_gemma4": ("models.language.gguf_gemma4", "GgufGemma4Model"),
+    "gguf_deepseek_qwen3_5": ("models.language.gguf_deepseek_qwen3_5", "GgufDeepSeekQwen35Model"),
 }
 
 IMAGE_IMPLEMENTATIONS: dict[str, tuple[str, str]] = {

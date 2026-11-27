@@ -17,6 +17,52 @@ def _slug(text: str, max_len: int = 40) -> str:
     return (cleaned[:max_len] or "image").strip("-")
 
 
+def resolve_image_target_dir(
+    default_output_dir: Path,
+    workspace: Optional[str] = None,
+    drive_root: Optional[Path] = None,
+) -> Path:
+    """
+    Resolve the directory where generated images should be saved.
+    If workspace is provided:
+      1. Resolves relative to drive_root (or absolute if inside drive_root or /content).
+      2. Prevents path traversal outside permitted Drive / workspace boundaries.
+      3. Targets <resolved_workspace>/generated_images/.
+    Falls back safely to default_output_dir if workspace is missing or invalid.
+    """
+    if not workspace or not str(workspace).strip():
+        return default_output_dir
+
+    raw_ws = str(workspace).strip()
+    root = (drive_root or default_output_dir).resolve()
+    try:
+        ws_path = Path(raw_ws).resolve()
+        # If relative or not rooted in Drive / /content, join with root
+        if not ws_path.is_absolute():
+            ws_path = (root / raw_ws).resolve()
+
+        # Path traversal guard: must not resolve to filesystem root or traverse outside
+        # Accept paths under drive_root, /content/drive, or default_output_dir
+        allowed_parents = [root, default_output_dir.resolve(), Path("/content/drive").resolve()]
+        if any(p.exists() for p in allowed_parents):
+            is_sub = False
+            for parent in allowed_parents:
+                try:
+                    ws_path.relative_to(parent)
+                    is_sub = True
+                    break
+                except ValueError:
+                    continue
+            if not is_sub and ws_path != root:
+                # Disallowed traversal, fallback to default_output_dir
+                return default_output_dir
+
+        target_dir = ws_path / "generated_images"
+        return target_dir
+    except Exception:
+        return default_output_dir
+
+
 def save_generated_image_artifact(
     *,
     output_dir: Path,
@@ -30,17 +76,19 @@ def save_generated_image_artifact(
     seed: Optional[int],
     operation_id: str,
     workspace: Optional[str] = None,
+    drive_root: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Atomically persist a generated PNG master copy and metadata JSON sidecar."""
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Atomically persist a generated PNG master copy and metadata JSON sidecar into workspace/generated_images."""
+    target_dir = resolve_image_target_dir(output_dir, workspace=workspace, drive_root=drive_root)
+    target_dir.mkdir(parents=True, exist_ok=True)
     artifact_id = f"img_{uuid.uuid4().hex[:12]}"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"{stamp}_{_slug(prompt)}_{artifact_id}.png"
-    master_path = output_dir / filename
-    meta_path = output_dir / f"{filename}.json"
+    master_path = target_dir / filename
+    meta_path = target_dir / f"{filename}.json"
 
     png_bytes = base64.b64decode(b64_png)
-    tmp_png = output_dir / f".{filename}.tmp"
+    tmp_png = target_dir / f".{filename}.tmp"
     tmp_png.write_bytes(png_bytes)
     os.replace(tmp_png, master_path)
 

@@ -11,6 +11,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-client-connection'
+import type {} from '@deepseek-ai/dsh-working-directory'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
@@ -165,6 +166,15 @@ export function createNexusGenerateImageTool(
       const endpoint = new URL('/v1/images/generations', baseUrl)
       const timeoutSignal = AbortSignal.timeout(config.imageTimeoutMs)
       const signal = AbortSignal.any([exec.signal, timeoutSignal])
+      let rawWorkspace = ''
+      if (exec.agent !== undefined && 'workingDirectory' in ctx && typeof ctx.workingDirectory?.ensure === 'function') {
+        try {
+          rawWorkspace = await ctx.workingDirectory.ensure(exec.agent, exec.signal)
+        } catch {
+          rawWorkspace = ''
+        }
+      }
+
       const response = await fetchImpl(endpoint, {
         method: 'POST',
         headers: {
@@ -179,6 +189,7 @@ export function createNexusGenerateImageTool(
           steps: args.steps,
           seed: args.seed,
           num_images: 1,
+          workspace: rawWorkspace || undefined,
         }),
         signal,
       })

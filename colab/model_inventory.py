@@ -345,24 +345,110 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 reason=f"Dedicated GPT-OSS Harmony runtime ({weights_msg})",
             )
 
+        if model_type == "gemma3":
+            # Gemma 3 supports tool calling via prompt injection and strict alternation
+            # Size on disk ~22.7 GiB, fits in 4-bit NF4 on L4 22 GiB
+            min_vram = 14.0 if size_bytes > 20 * GIB else _estimate_min_vram_gib(size_bytes, "language", "gemma3", model_id)
+            return InventoryCandidate(
+                id=model_id,
+                role="language",
+                source_path=str(hf_root),
+                implementation="gemma3",
+                architecture=arch,
+                size_bytes=size_bytes,
+                min_vram_gib=min_vram,
+                fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                modalities=["text", "image"],
+                context_window=ctx_len,
+                max_output_tokens=4096,
+                reasoning_mode="none",
+                reasoning_efforts=False,
+                default_reasoning_effort=None,
+                reason=f"Dedicated Gemma 3 runtime (4-bit auto-fit on L4, {weights_msg})",
+            )
+
+        if model_type in ("deepseek_vl_v2", "deepseek_vlv2", "deepseek_vl2"):
+            min_vram = 16.0 if size_bytes > 20 * GIB else _estimate_min_vram_gib(size_bytes, "language", "deepseek_vl2", model_id)
+            return InventoryCandidate(
+                id=model_id,
+                role="language",
+                source_path=str(hf_root),
+                implementation="deepseek_vl2",
+                architecture=arch,
+                size_bytes=size_bytes,
+                min_vram_gib=min_vram,
+                fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                modalities=["text", "image"],
+                context_window=ctx_len,
+                max_output_tokens=4096,
+                reasoning_mode="none",
+                reasoning_efforts=False,
+                default_reasoning_effort=None,
+                reason=f"Dedicated DeepSeek-VL2 runtime (4-bit auto-fit on L4, {weights_msg})",
+            )
+
+        if model_type in ("multi_modality", "deepseek_vl"):
+            min_vram = _estimate_min_vram_gib(size_bytes, "language", "deepseek_vl", model_id)
+            return InventoryCandidate(
+                id=model_id,
+                role="language",
+                source_path=str(hf_root),
+                implementation="deepseek_vl",
+                architecture=arch,
+                size_bytes=size_bytes,
+                min_vram_gib=min_vram,
+                fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                modalities=["text", "image"],
+                context_window=ctx_len,
+                max_output_tokens=4096,
+                reasoning_mode="none",
+                reasoning_efforts=False,
+                default_reasoning_effort=None,
+                reason=f"Dedicated DeepSeek-VL runtime ({weights_msg})",
+            )
+
         return InventoryCandidate(
             id=model_id,
             role="excluded",
             source_path=str(hf_root),
             architecture=arch,
             size_bytes=size_bytes,
-            reason=f"No dedicated v1.1.0 tool-calling implementation for model_type={model_type!r} (tools_in_template={'tools' in low_tpl})",
+            reason=f"No dedicated v1.2.0 tool-calling implementation for model_type={model_type!r} (tools_in_template={'tools' in low_tpl})",
         )
 
-    # 3. GGUF or incomplete/unknown directories
-    if any(model_dir.glob("*.gguf")):
+    # 3. GGUF package (managed via llama-server)
+    gguf_files = list(model_dir.glob("*.gguf"))
+    if gguf_files:
+        low_id = model_id.lower()
+        size_bytes = _dir_size_bytes(model_dir)
+        # Identify GGUF implementation
+        if "gemma" in low_id or "gemma4" in low_id:
+            impl = "gguf_gemma4"
+            arch = "gemma4"
+        elif "deepseek" in low_id:
+            impl = "gguf_deepseek_qwen3_5"
+            arch = "deepseek_v4_pro"
+        else:
+            impl = "gguf_qwen3_5"
+            arch = "qwen3_5"
+
+        min_vram = round(max(6.0, (size_bytes / GIB) * 1.1), 1)
         return InventoryCandidate(
             id=model_id,
-            role="excluded",
+            role="language",
             source_path=str(model_dir),
-            architecture="gguf",
-            size_bytes=_dir_size_bytes(model_dir),
-            reason="GGUF package (unsupported in v1.1.0 Transformers runtime; no llama.cpp/Ollama backend)",
+            implementation=impl,
+            architecture=arch,
+            size_bytes=size_bytes,
+            min_vram_gib=min_vram,
+            fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+            modalities=["text"],
+            context_window=32768,
+            max_output_tokens=4096,
+            reasoning_mode="none",
+            reasoning_efforts=False,
+            default_reasoning_effort=None,
+            reason="Dedicated GGUF runtime via llama-server (CUDA GPU offload)",
         )
 
     return InventoryCandidate(

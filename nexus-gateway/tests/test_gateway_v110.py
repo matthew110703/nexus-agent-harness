@@ -201,12 +201,12 @@ def test_colab_inventory_validation_and_upfront_staging(tmp_path: Path) -> None:
         "GPT-OSS-20B-Abliterated",
         "Qwen-3-VL-8B-Instruct-heretic",
         "Qwen3.5-4B",
+        "Qwen3.5-9B-Defiant-Fable-Uncensored",
     ]
     assert [m.id for m in inv.image_models] == ["FLUX.2-klein-4B"]
     assert {m.id for m in inv.excluded_models} == {
         "FLUX.2-klein-9b-fp8",
         "HunyuanVideo-1.5",
-        "Qwen3.5-9B-Defiant-Fable-Uncensored",
     }
 
     lang, img = model_inventory.validate_selected_pair(
@@ -219,7 +219,7 @@ def test_colab_inventory_validation_and_upfront_staging(tmp_path: Path) -> None:
     assert img is not None and img.implementation == "flux2_klein"
 
     with pytest.raises(ValueError, match="not a runnable"):
-        model_inventory.validate_selected_pair(models_root, "Qwen3.5-9B-Defiant-Fable-Uncensored")
+        model_inventory.validate_selected_pair(models_root, "HunyuanVideo-1.5")
 
     stage_root = tmp_path / "staged"
     manifest_out = stage_root / "session-runtime.json"

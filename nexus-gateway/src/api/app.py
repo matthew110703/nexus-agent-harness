@@ -540,6 +540,7 @@ def create_app(
                     seed=raw.get("seed"),
                     operation_id=op.operation_id,
                     workspace=body.get("workspace"),
+                    drive_root=config.output_image_dir.parents[1] if len(config.output_image_dir.parents) >= 2 else None,
                 )
             except BaseException as exc:
                 gen_exc = exc
