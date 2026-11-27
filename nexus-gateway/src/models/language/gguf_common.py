@@ -185,8 +185,10 @@ class LlamaServerRuntimeBase:
             payload["tools"] = tools
 
         url = f"{self.base_url}/v1/chat/completions"
+        in_think = False
+        pending_tool_calls: dict[int, dict[str, str]] = {}
         try:
-            with httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+            with httpx.Client(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
                 with client.stream("POST", url, json=payload) as response:
                     if response.status_code != 200:
                         err_text = response.read().decode("utf-8", errors="replace")
@@ -203,12 +205,52 @@ class LlamaServerRuntimeBase:
                             try:
                                 chunk = json.loads(data_str)
                                 choices = chunk.get("choices") or []
-                                if choices:
-                                    delta = choices[0].get("delta") or {}
-                                    content = delta.get("content")
-                                    if content:
-                                        yield content
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta") or {}
+
+                                reasoning = delta.get("reasoning_content")
+                                if reasoning:
+                                    if not in_think:
+                                        yield "<think>"
+                                        in_think = True
+                                    yield reasoning
+
+                                content = delta.get("content")
+                                if content:
+                                    if in_think:
+                                        yield "</think>"
+                                        in_think = False
+                                    yield content
+
+                                raw_tool_calls = delta.get("tool_calls")
+                                if isinstance(raw_tool_calls, list):
+                                    for tc in raw_tool_calls:
+                                        if not isinstance(tc, dict):
+                                            continue
+                                        idx = int(tc.get("index", 0))
+                                        entry = pending_tool_calls.setdefault(idx, {"name": "", "arguments": ""})
+                                        fn = tc.get("function") or {}
+                                        if isinstance(fn.get("name"), str) and fn["name"]:
+                                            entry["name"] += fn["name"]
+                                        if isinstance(fn.get("arguments"), str) and fn["arguments"]:
+                                            entry["arguments"] += fn["arguments"]
                             except json.JSONDecodeError:
                                 pass
+
+            if in_think:
+                yield "</think>"
+                in_think = False
+
+            for idx in sorted(pending_tool_calls):
+                entry = pending_tool_calls[idx]
+                if not entry["name"]:
+                    continue
+                args_raw = entry["arguments"].strip() or "{}"
+                try:
+                    args_obj = json.loads(args_raw)
+                except json.JSONDecodeError:
+                    args_obj = args_raw
+                yield f"<tool_call>{json.dumps({'name': entry['name'], 'arguments': args_obj}, ensure_ascii=False)}</tool_call>"
         except Exception as exc:
             raise RuntimeError(f"llama-server streaming failed: {exc}") from exc

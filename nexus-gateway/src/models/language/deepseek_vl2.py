@@ -92,3 +92,15 @@ class DeepSeekVl2LanguageModel:
             yield chunk
 
         thread.join()
+
+    def unload(self) -> None:
+        self.model = None
+        self.tokenizer = None
+        self.vl_chat_processor = None
+        gc.collect()
+        try:
+            import torch  # type: ignore[import-not-found]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

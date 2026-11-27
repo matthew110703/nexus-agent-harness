@@ -13,7 +13,17 @@ CLOSE_TOOL_TAG = "</tool_call>"
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
 CONTROL_TOKEN_RE = re.compile(r"<\|(?:im_end|im_start|endoftext|return|end|call|start|channel|message)\|>")
-IMPLEMENTED_PARSER_FAMILIES = frozenset({"qwen3_vl", "qwen3_5", "gpt_oss"})
+IMPLEMENTED_PARSER_FAMILIES = frozenset({
+    "qwen3_vl",
+    "qwen3_5",
+    "gpt_oss",
+    "gemma3",
+    "deepseek_vl2",
+    "deepseek_vl",
+    "gguf_qwen3_5",
+    "gguf_gemma4",
+    "gguf_deepseek_qwen3_5",
+})
 
 _XML_FUNC_RE = re.compile(r"<function=([^\s>]+)>\s*(.*?)\s*</function>", re.DOTALL)
 _XML_PARAM_RE = re.compile(r"<parameter=([^\s>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
@@ -375,14 +385,74 @@ class GptOssHarmonyStreamParser:
         )
 
 
+_FENCED_JSON_TOOL_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+
+
+class FencedJsonToolStreamParser:
+    """
+    Parser for prompt-injected tool-calling models (Gemma 3, DeepSeek-VL, DeepSeek-VL2):
+    Supports both `<tool_call>{"name":...,"arguments":...}</tool_call>` and fenced
+    ```` ```json {"name":...,"arguments":...} ``` ```` blocks.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[str] = []
+
+    def feed(self, chunk: str) -> StreamDelta:
+        self._chunks.append(chunk)
+        # Buffer until finish so fenced JSON tool calls are not leaked as visible assistant text.
+        return StreamDelta()
+
+    def finish(self, advertised_tools: list[dict[str, Any]], tool_choice: Any = "auto") -> ToolParseResult:
+        raw = CONTROL_TOKEN_RE.sub("", "".join(self._chunks))
+        if tool_choice == "none" or not advertised_tools:
+            text = raw.strip()
+            return ToolParseResult(text=text, trailing_text=text)
+
+        raw_calls: list[str] = []
+        cleaned = raw
+
+        # 1. Extract <tool_call>...</tool_call> blocks if emitted
+        def _collect_tag(match: re.Match[str]) -> str:
+            raw_calls.append(match.group(1).strip())
+            return ""
+
+        cleaned = re.sub(r"<tool_call>([\s\S]*?)</tool_call>", _collect_tag, cleaned)
+
+        # 2. Extract fenced JSON blocks that contain both "name" and "arguments"
+        def _collect_fenced(match: re.Match[str]) -> str:
+            candidate = match.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
+                    raw_calls.append(candidate)
+                    return ""
+            except json.JSONDecodeError:
+                pass
+            return match.group(0)
+
+        cleaned = _FENCED_JSON_TOOL_RE.sub(_collect_fenced, cleaned)
+
+        valid_calls, errors = _validate_json_tool_calls(raw_calls, advertised_tools, [])
+        text = cleaned.strip()
+        return ToolParseResult(
+            text=text,
+            trailing_text=text,
+            tool_calls=valid_calls,
+            errors=errors,
+        )
+
+
 def create_tool_parser(implementation: str, *, started_in_think: bool = False) -> ToolCallStreamParser:
     """Create the dedicated stream parser for the selected language model implementation."""
     if implementation == "qwen3_vl":
         return QwenJsonToolStreamParser()
-    if implementation == "qwen3_5":
+    if implementation in ("qwen3_5", "gguf_qwen3_5", "gguf_gemma4", "gguf_deepseek_qwen3_5"):
         return Qwen35XmlToolStreamParser(started_in_think=started_in_think)
     if implementation == "gpt_oss":
         return GptOssHarmonyStreamParser()
+    if implementation in ("gemma3", "deepseek_vl2", "deepseek_vl"):
+        return FencedJsonToolStreamParser()
     raise ValueError(f"No dedicated tool/stream parser for implementation {implementation!r}")
 
 

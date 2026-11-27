@@ -84,3 +84,14 @@ class Gemma3LanguageModel:
             yield chunk
 
         thread.join()
+
+    def unload(self) -> None:
+        self.model = None
+        self.processor = None
+        gc.collect()
+        try:
+            import torch  # type: ignore[import-not-found]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
