@@ -76,11 +76,35 @@ def _resolve_latest_llama_cuda_urls() -> tuple[str, str, Optional[str]]:
     )
 
 
+def _verify_llama_cuda_support(binary: Path) -> None:
+    """Verify CUDA GPU backend is active in `llama-server` when a CUDA GPU is present."""
+    try:
+        import torch  # type: ignore[import-not-found]
+
+        if not torch.cuda.is_available():
+            return
+    except Exception:
+        return
+    env = os.environ.copy()
+    lib_dirs = sorted({str(p.parent) for p in LLAMA_INSTALL_DIR.rglob("*.so*") if p.is_file()})
+    if lib_dirs:
+        cur_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
+    res = subprocess.run([str(binary), "--list-devices"], capture_output=True, text=True, env=env, check=False)
+    output = (res.stdout or "") + "\n" + (res.stderr or "")
+    if "CUDA" not in output.upper():
+        raise RuntimeError(
+            f"llama-server ({binary}) did not report a CUDA device (--list-devices output:\n{output.strip()}).\n"
+            "Refusing silent CPU-only fallback for large GGUF inference."
+        )
+
+
 def ensure_llama_server() -> None:
     """Download and extract pre-built official CUDA llama-server binary if missing."""
     existing = _find_installed_llama_server()
     if existing is not None:
         print(f"[DEPS] llama-server already available: {existing}")
+        _verify_llama_cuda_support(existing)
         return
 
     tag, bin_url, cudart_url = _resolve_latest_llama_cuda_urls()
@@ -124,6 +148,7 @@ def ensure_llama_server() -> None:
         os.environ["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
 
     print(f"[DEPS] Successfully installed llama-server ({tag}): {binary}")
+    _verify_llama_cuda_support(binary)
 
 
 def ensure_bitsandbytes() -> None:

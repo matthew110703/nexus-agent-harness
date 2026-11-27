@@ -131,7 +131,11 @@ class WorkerManager:
 
             port = _pick_free_loopback_port()
             secret = secrets.token_urlsafe(32)
-            env = {**os.environ, "NEXUS_WORKER_SECRET": secret}
+            env = {
+                **os.environ,
+                "NEXUS_WORKER_SECRET": secret,
+                "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+            }
             cmd = [self._python, str(self._worker_script), "--host", "127.0.0.1", "--port", str(port)]
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_fh = self._log_path.open("ab")
@@ -282,23 +286,24 @@ class WorkerManager:
             raise WorkerError("Worker image stream ended without returning a result", status_code=502)
         return result_data
 
-    def unload(self, *, terminate_on_failure: bool = True) -> dict[str, Any]:
+    def unload(self, *, kind: str = "all", terminate_on_failure: bool = True) -> dict[str, Any]:
         with self._lock:
             if not self.is_running:
                 self._active_kind = None
                 self._active_model_id = None
                 return {"status": "not_running"}
             try:
-                res = self._request_json("POST", "/worker/unload", {}, timeout=30.0)
-                self._active_kind = None
-                self._active_model_id = None
-                # Check actual allocated VRAM (not reserved pool) + active_model_id.
-                allocated = int(res.get("cuda_allocated_bytes") or 0)
-                still_loaded = res.get("active_model_id") is not None
-                if still_loaded or allocated > MAX_LEAKED_ALLOCATED_VRAM_BYTES:
-                    if terminate_on_failure:
-                        self._terminate_unlocked()
-                        return {"status": "terminated_for_vram_release", "leaked_allocated_bytes": allocated}
+                res = self._request_json("POST", "/worker/unload", {"kind": kind}, timeout=30.0)
+                if kind == "all":
+                    self._active_kind = None
+                    self._active_model_id = None
+                    # Check actual allocated VRAM (not reserved pool) + active_model_id.
+                    allocated = int(res.get("cuda_allocated_bytes") or 0)
+                    still_loaded = res.get("active_model_id") is not None
+                    if still_loaded or allocated > MAX_LEAKED_ALLOCATED_VRAM_BYTES:
+                        if terminate_on_failure:
+                            self._terminate_unlocked()
+                            return {"status": "terminated_for_vram_release", "leaked_allocated_bytes": allocated}
                 return res
             except WorkerError:
                 if terminate_on_failure:

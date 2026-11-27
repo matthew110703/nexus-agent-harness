@@ -6,21 +6,13 @@ import json
 import re
 from typing import Any, Optional
 
-TOOL_SYSTEM_PROMPT = """
-# Available Tools
-You have access to the following functions to help solve user requests:
-{tools_json}
+TOOL_SYSTEM_PROMPT = """# Available Tools
+You can call these functions when needed:
+{tools_summary}
 
-To call a function, respond with a JSON block in the following format:
-```json
-{{
-  "name": "function_name",
-  "arguments": {{
-    "arg1": "value1"
-  }}
-}}
-```
-Only call tools when needed. When providing the final answer, do not use the tool block.
+To call a function, emit:
+<tool_call>{{"name": "function_name", "arguments": {{"arg1": "value1"}}}}</tool_call>
+Only call tools when needed. For a normal answer, reply directly without <tool_call>.
 """
 
 
@@ -45,12 +37,35 @@ def extract_text_content(content: Any) -> str:
     return str(content)
 
 
+def _format_compact_tool(entry: dict[str, Any]) -> str:
+    fn = entry.get("function") if entry.get("type") == "function" else entry
+    if not isinstance(fn, dict):
+        return ""
+    name = str(fn.get("name") or "").strip()
+    if not name:
+        return ""
+    desc = " ".join(str(fn.get("description") or "").split())[:140]
+    params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+    props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+    required = set(params.get("required") or [])
+    arg_parts: list[str] = []
+    for k, schema in props.items():
+        ptype = schema.get("type", "any") if isinstance(schema, dict) else "any"
+        if isinstance(schema, dict) and isinstance(schema.get("enum"), list):
+            ptype = "|".join(repr(v) for v in schema["enum"][:5])
+        req_mark = "*" if k in required else "?"
+        arg_parts.append(f"{k}{req_mark}: {ptype}")
+    sig = f"{name}({', '.join(arg_parts)})"
+    return f"- {sig}: {desc}" if desc else f"- {sig}"
+
+
 def build_tools_instruction(tools: list[dict[str, Any]]) -> str:
-    """Generate system prompt instructions explaining tool calling."""
+    """Generate compact system prompt instructions explaining tool calling (~75% fewer tokens)."""
     if not tools:
         return ""
-    tools_formatted = json.dumps(tools, indent=2)
-    return TOOL_SYSTEM_PROMPT.format(tools_json=tools_formatted).strip()
+    lines = [line for t in tools if isinstance(t, dict) and (line := _format_compact_tool(t))]
+    summary = "\n".join(lines) if lines else json.dumps(tools)
+    return TOOL_SYSTEM_PROMPT.format(tools_summary=summary).strip()
 
 
 def inject_tools_into_messages(
@@ -89,7 +104,6 @@ def inject_tools_into_messages(
             else:
                 out.append(dict(m))
     elif strict_alternation:
-        # Gemma models prefer system/tool instructions folded into the first user turn
         if normalized and normalized[0].get("role") == "user":
             first = dict(normalized[0])
             first["content"] = f"{tool_instr}\n\n{first.get('content') or ''}".strip()
@@ -109,7 +123,6 @@ def _format_roles(messages: list[dict[str, Any]], *, strict_alternation: bool = 
     if not strict_alternation:
         return messages
 
-    # Gemma strict alternation: user, model, user, model...
     formatted: list[dict[str, Any]] = []
     current_role: Optional[str] = None
     accumulated_content: list[str] = []
@@ -120,7 +133,7 @@ def _format_roles(messages: list[dict[str, Any]], *, strict_alternation: bool = 
         if m.get("role") == "tool" and content:
             content = f"[Tool Result]\n{content}"
         if m.get("tool_calls"):
-            content = f"{content}\n```json\n{json.dumps(m['tool_calls'], indent=2)}\n```".strip()
+            content = f"{content}\n<tool_call>{json.dumps(m['tool_calls'])}</tool_call>".strip()
 
         if role == current_role:
             accumulated_content.append(content)
@@ -137,28 +150,31 @@ def _format_roles(messages: list[dict[str, Any]], *, strict_alternation: bool = 
 
 
 def parse_prompt_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Detect fenced JSON tool call blocks from generated text."""
+    """Detect `<tool_call>` or fenced JSON tool call blocks from generated text."""
     tool_calls: list[dict[str, Any]] = []
     cleaned = text
 
-    pattern = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
-    for m in pattern.finditer(text):
-        raw_json = m.group(1)
-        try:
-            parsed = json.loads(raw_json)
-            if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
-                call_id = f"call_{len(tool_calls) + 1}"
-                args = parsed["arguments"]
-                args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-                tool_calls.append({
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": parsed["name"],
-                        "arguments": args_str,
-                    },
-                })
-        except Exception:
-            pass
+    for pattern in (
+        re.compile(r"<tool_call>([\s\S]*?)</tool_call>"),
+        re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE),
+    ):
+        for m in pattern.finditer(text):
+            raw_json = m.group(1).strip()
+            try:
+                parsed = json.loads(raw_json)
+                if isinstance(parsed, dict) and "name" in parsed:
+                    args = parsed.get("arguments", parsed.get("parameters", {}))
+                    call_id = f"call_{len(tool_calls) + 1}"
+                    args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                    tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": parsed["name"],
+                            "arguments": args_str,
+                        },
+                    })
+            except Exception:
+                pass
 
     return cleaned, tool_calls

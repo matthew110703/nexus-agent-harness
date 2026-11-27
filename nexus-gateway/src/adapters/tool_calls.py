@@ -12,7 +12,9 @@ OPEN_TOOL_TAG = "<tool_call>"
 CLOSE_TOOL_TAG = "</tool_call>"
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
-CONTROL_TOKEN_RE = re.compile(r"<\|(?:im_end|im_start|endoftext|return|end|call|start|channel|message)\|>")
+CONTROL_TOKEN_RE = re.compile(
+    r"<\|(?:im_end|im_start|endoftext|return|end|call|start|channel|message|constrain|python_tag|eot_id|eom_id|tool_call)\|>"
+)
 IMPLEMENTED_PARSER_FAMILIES = frozenset({
     "qwen3_vl",
     "qwen3_5",
@@ -23,22 +25,19 @@ IMPLEMENTED_PARSER_FAMILIES = frozenset({
     "gguf_qwen3_5",
     "gguf_gemma4",
     "gguf_deepseek_qwen3_5",
+    "gguf_llama3",
+    "gguf_llama4",
+    "gguf_generic",
 })
 
 _XML_FUNC_RE = re.compile(r"<function=([^\s>]+)>\s*(.*?)\s*</function>", re.DOTALL)
 _XML_PARAM_RE = re.compile(r"<parameter=([^\s>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
-_HARMONY_CALL_RE = re.compile(
-    r"(?:<\|start\|>assistant\s+)?to=functions\.([A-Za-z0-9_.-]+)<\|channel\|>commentary(?:\s+json)?<\|message\|>(.*?)<\|call\|>",
+_HARMONY_TO_FUNC_RE = re.compile(r"to=functions\.([A-Za-z0-9_.-]+)")
+_GEMMA4_CALL_RE = re.compile(
+    r"(?:<\|tool_call\|>|<start_function_call>)\s*call:([A-Za-z0-9_.-]+)\s*(\{.*?\})\s*(?:<\|tool_call\|>|<end_function_call>)",
     re.DOTALL,
 )
-_HARMONY_ANALYSIS_RE = re.compile(
-    r"(?:<\|start\|>assistant)?<\|channel\|>analysis<\|message\|>(.*?)(?:<\|end\|>|$)",
-    re.DOTALL,
-)
-_HARMONY_FINAL_RE = re.compile(
-    r"(?:<\|start\|>assistant)?<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|<\|end\|>|$)",
-    re.DOTALL,
-)
+_PYTHON_TAG_RE = re.compile(r"<\|python_tag\|>([\s\S]*?)(?=<\|eom_id\|>|<\|eot_id\|>|$)")
 
 
 def has_native_tool_parser(implementation: str) -> bool:
@@ -162,11 +161,10 @@ class QwenJsonToolStreamParser:
 
 class Qwen35XmlToolStreamParser:
     """
-    Incremental parser for Qwen3.5 / Qwen3.6 models:
-    - Streams `<think>...</think>` reasoning blocks (including when the chat template
-      prefilled `<think>\n` before token 0) into `StreamDelta.reasoning`.
-    - Parses `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`
-      (plus JSON fallback) with schema-aware value coercion and validation.
+    Incremental parser for Qwen3.5 / Qwen3.6 and all GGUF models:
+    - Streams `<think>...</think>` reasoning blocks into `StreamDelta.reasoning`.
+    - Parses `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`,
+      JSON `<tool_call>...</tool_call>`, Llama `<|python_tag|>...`, and Gemma 4 `<|tool_call|>call:...`.
     """
 
     def __init__(self, *, started_in_think: bool = False) -> None:
@@ -176,9 +174,11 @@ class Qwen35XmlToolStreamParser:
         self._text_parts: list[str] = []
         self._reasoning_parts: list[str] = []
         self._raw_calls: list[str] = []
+        self._raw_chunks: list[str] = []
         self._errors: list[str] = []
 
     def feed(self, chunk: str) -> StreamDelta:
+        self._raw_chunks.append(chunk)
         self._buffer += chunk
         emitted_content: list[str] = []
         emitted_reasoning: list[str] = []
@@ -221,10 +221,42 @@ class Qwen35XmlToolStreamParser:
                     self._buffer = self._buffer[safe:]
                 break
 
+            if self._state == "python_call":
+                # Buffer Llama <|python_tag|> call until end of stream or <|eom_id|>/<|eot_id|>.
+                stop_idx = -1
+                stop_len = 0
+                for end_tok in ("<|eom_id|>", "<|eot_id|>"):
+                    pos = self._buffer.find(end_tok)
+                    if pos != -1 and (stop_idx == -1 or pos < stop_idx):
+                        stop_idx = pos
+                        stop_len = len(end_tok)
+                if stop_idx != -1:
+                    self._call_buf += self._buffer[:stop_idx]
+                    self._raw_calls.extend(_split_json_objects(self._call_buf))
+                    self._call_buf = ""
+                    self._state = "text"
+                    self._buffer = self._buffer[stop_idx + stop_len :]
+                    continue
+                keep = max(_partial_prefix_len(self._buffer, "<|eom_id|>"), _partial_prefix_len(self._buffer, "<|eot_id|>"))
+                safe = len(self._buffer) - keep
+                if safe > 0:
+                    self._call_buf += self._buffer[:safe]
+                    self._buffer = self._buffer[safe:]
+                break
+
             # state == "text"
             idx_tool = self._buffer.find(OPEN_TOOL_TAG)
             idx_think = self._buffer.find(OPEN_THINK_TAG)
-            candidates = [(i, tag) for i, tag in ((idx_tool, OPEN_TOOL_TAG), (idx_think, OPEN_THINK_TAG)) if i != -1]
+            idx_py = self._buffer.find("<|python_tag|>")
+            candidates = [
+                (i, tag)
+                for i, tag in (
+                    (idx_tool, OPEN_TOOL_TAG),
+                    (idx_think, OPEN_THINK_TAG),
+                    (idx_py, "<|python_tag|>"),
+                )
+                if i != -1
+            ]
             if candidates:
                 idx, tag = min(candidates, key=lambda pair: pair[0])
                 if idx > 0:
@@ -236,6 +268,9 @@ class Qwen35XmlToolStreamParser:
                 if tag == OPEN_TOOL_TAG:
                     self._state = "call"
                     self._call_buf = ""
+                elif tag == "<|python_tag|>":
+                    self._state = "python_call"
+                    self._call_buf = ""
                 else:
                     self._state = "think"
                 continue
@@ -243,6 +278,7 @@ class Qwen35XmlToolStreamParser:
             keep = max(
                 _partial_prefix_len(self._buffer, OPEN_TOOL_TAG),
                 _partial_prefix_len(self._buffer, OPEN_THINK_TAG),
+                _partial_prefix_len(self._buffer, "<|python_tag|>"),
             )
             safe = len(self._buffer) - keep
             if safe > 0:
@@ -263,6 +299,13 @@ class Qwen35XmlToolStreamParser:
             self._state = "text"
             self._call_buf = ""
             self._buffer = ""
+        elif self._state == "python_call":
+            tail = (self._call_buf + self._buffer).strip()
+            if tail:
+                self._raw_calls.extend(_split_json_objects(tail))
+            self._state = "text"
+            self._call_buf = ""
+            self._buffer = ""
         elif self._state == "think" and self._buffer:
             r = CONTROL_TOKEN_RE.sub("", self._buffer)
             if r:
@@ -276,9 +319,18 @@ class Qwen35XmlToolStreamParser:
                 trailing_text = visible
             self._buffer = ""
 
+        # Check for Gemma 4 native `<|tool_call|>call:name{...}` blocks if no `<tool_call>` was seen.
+        full_text = "".join(self._text_parts)
+        if tool_choice != "none" and not self._raw_calls and advertised_tools:
+            gemma_matches = list(_GEMMA4_CALL_RE.finditer("".join(self._raw_chunks)))
+            if gemma_matches:
+                for gm in gemma_matches:
+                    self._raw_calls.append(json.dumps({"name": gm.group(1), "arguments": _parse_gemma4_args(gm.group(2))}))
+                full_text = _GEMMA4_CALL_RE.sub("", full_text)
+
         if tool_choice == "none":
             return ToolParseResult(
-                text="".join(self._text_parts).strip(),
+                text=full_text.strip(),
                 trailing_text=trailing_text,
                 reasoning="".join(self._reasoning_parts).strip(),
                 trailing_reasoning=trailing_reasoning,
@@ -311,13 +363,12 @@ class Qwen35XmlToolStreamParser:
                 valid_calls.append(ParsedToolCall(id=f"call_{uuid.uuid4().hex[:12]}", name=name, arguments=arguments))
                 continue
 
-            # Fallback to JSON payload inside <tool_call>...</tool_call>.
             calls_from_json, json_errs = _validate_json_tool_calls([raw], advertised_tools, [])
             valid_calls.extend(calls_from_json)
             errors.extend(json_errs)
 
         return ToolParseResult(
-            text="".join(self._text_parts).strip(),
+            text=full_text.strip(),
             trailing_text=trailing_text,
             reasoning="".join(self._reasoning_parts).strip(),
             trailing_reasoning=trailing_reasoning,
@@ -328,29 +379,181 @@ class Qwen35XmlToolStreamParser:
 
 class GptOssHarmonyStreamParser:
     """
-    Parser for GPT-OSS Harmony channel format (`analysis`, `commentary json` `<|call|>`, `final`).
-    Buffers channel tokens cleanly so raw Harmony control tokens never leak to the user.
+    Live incremental parser for GPT-OSS Harmony channel format:
+    - `<|channel|>analysis<|message|>...` -> streams live to `StreamDelta.reasoning`
+    - `<|channel|>final<|message|>...` -> streams live to `StreamDelta.content`
+    - `<|channel|>commentary to=functions.<name> [<|constrain|>json]<|message|>{...}<|call|>`
+      (and `to=functions.<name>` in any attribute order) -> emits validated `tool_calls`.
     """
 
+    _CHANNEL_TAG = "<|channel|>"
+    _MESSAGE_TAG = "<|message|>"
+    _STOP_TAGS = ("<|call|>", "<|return|>", "<|end|>", "<|start|>")
+
     def __init__(self) -> None:
-        self._raw = ""
+        self._buffer = ""
+        self._state = "scan"  # scan | header | analysis | final | call_body
+        self._pre_channel_buf = ""
+        self._header_buf = ""
+        self._call_name = ""
+        self._call_buf = ""
+        self._text_parts: list[str] = []
+        self._reasoning_parts: list[str] = []
+        self._raw_calls: list[tuple[str, str]] = []
+
+    def _find_earliest_stop(self, buf: str) -> tuple[int, str]:
+        best_idx = -1
+        best_tag = ""
+        for tag in (*self._STOP_TAGS, self._CHANNEL_TAG):
+            pos = buf.find(tag)
+            if pos != -1 and (best_idx == -1 or pos < best_idx):
+                best_idx = pos
+                best_tag = tag
+        return best_idx, best_tag
+
+    def _max_partial_stop(self, buf: str) -> int:
+        return max(
+            _partial_prefix_len(buf, tag)
+            for tag in (*self._STOP_TAGS, self._CHANNEL_TAG, self._MESSAGE_TAG)
+        )
 
     def feed(self, chunk: str) -> StreamDelta:
-        self._raw += chunk
-        return StreamDelta()
+        self._buffer += chunk
+        emitted_content: list[str] = []
+        emitted_reasoning: list[str] = []
+
+        while self._buffer:
+            if self._state == "scan":
+                idx = self._buffer.find(self._CHANNEL_TAG)
+                if idx != -1:
+                    raw_prefix = self._buffer[:idx]
+                    self._pre_channel_buf += raw_prefix
+                    prefix = CONTROL_TOKEN_RE.sub("", raw_prefix).strip()
+                    if prefix and "<|" not in raw_prefix and "to=functions." not in raw_prefix:
+                        self._text_parts.append(prefix)
+                        emitted_content.append(prefix)
+                    self._buffer = self._buffer[idx + len(self._CHANNEL_TAG) :]
+                    self._state = "header"
+                    self._header_buf = ""
+                    continue
+                keep = max(
+                    _partial_prefix_len(self._buffer, self._CHANNEL_TAG),
+                    _partial_prefix_len(self._buffer, "<|start|>assistant"),
+                )
+                safe = len(self._buffer) - keep
+                if safe > 0:
+                    seg = self._buffer[:safe]
+                    self._pre_channel_buf += seg
+                    # Only stream outside channels if no Harmony start tag or function route is forming.
+                    if "<|start|>" not in seg and "<|" not in seg and "to=functions." not in seg:
+                        self._text_parts.append(seg)
+                        emitted_content.append(seg)
+                    self._buffer = self._buffer[safe:]
+                break
+
+            if self._state == "header":
+                idx = self._buffer.find(self._MESSAGE_TAG)
+                if idx != -1:
+                    self._header_buf += self._buffer[:idx]
+                    self._buffer = self._buffer[idx + len(self._MESSAGE_TAG) :]
+                    hdr = self._header_buf
+                    combined_hdr = self._pre_channel_buf + " " + hdr
+                    self._header_buf = ""
+                    self._pre_channel_buf = ""
+                    fn_match = _HARMONY_TO_FUNC_RE.search(combined_hdr)
+                    if fn_match is not None:
+                        self._call_name = fn_match.group(1).strip()
+                        self._call_buf = ""
+                        self._state = "call_body"
+                    elif "analysis" in hdr:
+                        self._state = "analysis"
+                    elif "final" in hdr:
+                        self._state = "final"
+                    else:
+                        self._state = "analysis"
+                    continue
+                keep = _partial_prefix_len(self._buffer, self._MESSAGE_TAG)
+                safe = len(self._buffer) - keep
+                if safe > 0:
+                    self._header_buf += self._buffer[:safe]
+                    self._buffer = self._buffer[safe:]
+                break
+
+            # States: analysis | final | call_body
+            stop_idx, stop_tag = self._find_earliest_stop(self._buffer)
+            if stop_idx != -1:
+                body_seg = self._buffer[:stop_idx]
+                if self._state == "analysis":
+                    r = CONTROL_TOKEN_RE.sub("", body_seg)
+                    if r:
+                        self._reasoning_parts.append(r)
+                        emitted_reasoning.append(r)
+                elif self._state == "final":
+                    t = CONTROL_TOKEN_RE.sub("", body_seg)
+                    if t:
+                        self._text_parts.append(t)
+                        emitted_content.append(t)
+                elif self._state == "call_body":
+                    self._call_buf += body_seg
+                    self._raw_calls.append((self._call_name, self._call_buf.strip()))
+                    self._call_name = ""
+                    self._call_buf = ""
+
+                if stop_tag == self._CHANNEL_TAG:
+                    self._buffer = self._buffer[stop_idx + len(stop_tag) :]
+                    self._state = "header"
+                    self._header_buf = ""
+                else:
+                    self._buffer = self._buffer[stop_idx + len(stop_tag) :]
+                    self._state = "scan"
+                continue
+
+            keep = self._max_partial_stop(self._buffer)
+            safe = len(self._buffer) - keep
+            if safe > 0:
+                seg = self._buffer[:safe]
+                if self._state == "analysis":
+                    r = CONTROL_TOKEN_RE.sub("", seg)
+                    if r:
+                        self._reasoning_parts.append(r)
+                        emitted_reasoning.append(r)
+                elif self._state == "final":
+                    t = CONTROL_TOKEN_RE.sub("", seg)
+                    if t:
+                        self._text_parts.append(t)
+                        emitted_content.append(t)
+                elif self._state == "call_body":
+                    self._call_buf += seg
+                self._buffer = self._buffer[safe:]
+            break
+
+        return StreamDelta(content="".join(emitted_content), reasoning="".join(emitted_reasoning))
 
     def finish(self, advertised_tools: list[dict[str, Any]], tool_choice: Any = "auto") -> ToolParseResult:
-        raw = self._raw
-        reasoning_blocks = [m.group(1).strip() for m in _HARMONY_ANALYSIS_RE.finditer(raw) if m.group(1).strip()]
-        final_blocks = [m.group(1).strip() for m in _HARMONY_FINAL_RE.finditer(raw) if m.group(1).strip()]
+        trailing_text = ""
+        trailing_reasoning = ""
+        if self._buffer:
+            rem = CONTROL_TOKEN_RE.sub("", self._buffer)
+            if self._state == "analysis" and rem:
+                self._reasoning_parts.append(rem)
+                trailing_reasoning = rem
+            elif self._state == "final" and rem:
+                self._text_parts.append(rem)
+                trailing_text = rem
+            elif self._state == "call_body":
+                self._call_buf += self._buffer
+                if self._call_name and self._call_buf.strip():
+                    self._raw_calls.append((self._call_name, self._call_buf.strip()))
+            elif self._state == "scan" and rem.strip() and not self._text_parts and not self._reasoning_parts and not self._raw_calls:
+                self._text_parts.append(rem.strip())
+                trailing_text = rem.strip()
+            self._buffer = ""
 
         tool_calls: list[ParsedToolCall] = []
         errors: list[str] = []
-        if tool_choice != "none":
+        if tool_choice != "none" and self._raw_calls:
             schema_by_name = _index_tool_schemas(advertised_tools)
-            for m in _HARMONY_CALL_RE.finditer(raw):
-                name = m.group(1).strip()
-                args_raw = m.group(2).strip()
+            for name, args_raw in self._raw_calls:
                 if name not in schema_by_name:
                     errors.append(f"Unknown or unadvertised tool: {name!r}")
                     continue
@@ -368,18 +571,11 @@ class GptOssHarmonyStreamParser:
                     continue
                 tool_calls.append(ParsedToolCall(id=f"call_{uuid.uuid4().hex[:12]}", name=name, arguments=arguments))
 
-        if final_blocks:
-            text = "\n".join(final_blocks).strip()
-        elif not tool_calls and not reasoning_blocks:
-            text = CONTROL_TOKEN_RE.sub("", raw).strip()
-        else:
-            text = ""
-        reasoning = "\n".join(reasoning_blocks).strip()
         return ToolParseResult(
-            text=text,
-            trailing_text=text,
-            reasoning=reasoning,
-            trailing_reasoning=reasoning,
+            text="".join(self._text_parts).strip(),
+            trailing_text=trailing_text,
+            reasoning="".join(self._reasoning_parts).strip(),
+            trailing_reasoning=trailing_reasoning,
             tool_calls=tool_calls,
             errors=errors,
         )
@@ -400,7 +596,6 @@ class FencedJsonToolStreamParser:
 
     def feed(self, chunk: str) -> StreamDelta:
         self._chunks.append(chunk)
-        # Buffer until finish so fenced JSON tool calls are not leaked as visible assistant text.
         return StreamDelta()
 
     def finish(self, advertised_tools: list[dict[str, Any]], tool_choice: Any = "auto") -> ToolParseResult:
@@ -412,19 +607,17 @@ class FencedJsonToolStreamParser:
         raw_calls: list[str] = []
         cleaned = raw
 
-        # 1. Extract <tool_call>...</tool_call> blocks if emitted
         def _collect_tag(match: re.Match[str]) -> str:
             raw_calls.append(match.group(1).strip())
             return ""
 
         cleaned = re.sub(r"<tool_call>([\s\S]*?)</tool_call>", _collect_tag, cleaned)
 
-        # 2. Extract fenced JSON blocks that contain both "name" and "arguments"
         def _collect_fenced(match: re.Match[str]) -> str:
             candidate = match.group(1).strip()
             try:
                 parsed = json.loads(candidate)
-                if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
+                if isinstance(parsed, dict) and "name" in parsed and ("arguments" in parsed or "parameters" in parsed):
                     raw_calls.append(candidate)
                     return ""
             except json.JSONDecodeError:
@@ -447,13 +640,61 @@ def create_tool_parser(implementation: str, *, started_in_think: bool = False) -
     """Create the dedicated stream parser for the selected language model implementation."""
     if implementation == "qwen3_vl":
         return QwenJsonToolStreamParser()
-    if implementation in ("qwen3_5", "gguf_qwen3_5", "gguf_gemma4", "gguf_deepseek_qwen3_5"):
+    if implementation in (
+        "qwen3_5",
+        "gguf_qwen3_5",
+        "gguf_gemma4",
+        "gguf_deepseek_qwen3_5",
+        "gguf_llama3",
+        "gguf_llama4",
+        "gguf_generic",
+    ):
         return Qwen35XmlToolStreamParser(started_in_think=started_in_think)
     if implementation == "gpt_oss":
         return GptOssHarmonyStreamParser()
     if implementation in ("gemma3", "deepseek_vl2", "deepseek_vl"):
         return FencedJsonToolStreamParser()
     raise ValueError(f"No dedicated tool/stream parser for implementation {implementation!r}")
+
+
+def _split_json_objects(raw: str) -> list[str]:
+    """Extract one or more JSON objects from Llama `<|python_tag|>` output (handles `;` separators)."""
+    decoder = json.JSONDecoder()
+    idx = 0
+    out: list[str] = []
+    n = len(raw)
+    while idx < n:
+        while idx < n and raw[idx] in " \t\r\n;":
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end_idx = decoder.raw_decode(raw, idx)
+            if isinstance(obj, dict):
+                out.append(json.dumps(obj))
+            idx = end_idx
+        except json.JSONDecodeError:
+            idx += 1
+    return out
+
+
+def _parse_gemma4_args(raw_obj: str) -> dict[str, Any]:
+    """Parse Gemma 4 `call:name{key:<|"|>val<|"|>}` or JSON object arguments."""
+    cleaned = raw_obj.replace('<|"|>', '"')
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    quoted_keys = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', cleaned)
+    try:
+        parsed = json.loads(quoted_keys)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    return {}
 
 
 def _coerce_xml_parameter(raw_value: str, prop_schema: Any) -> Any:
@@ -503,7 +744,9 @@ def _validate_json_tool_calls(
             errors.append("Tool call payload must be a JSON object")
             continue
         name = payload.get("name")
-        arguments = payload.get("arguments", {})
+        arguments = payload.get("arguments")
+        if arguments is None:
+            arguments = payload.get("parameters", {})
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)

@@ -192,7 +192,8 @@ def _make_drive_models(models_root: Path) -> None:
     (vid / "config.json").write_text(json.dumps({"model_type": "hunyuan_video"}))
 
 
-def test_colab_inventory_validation_and_upfront_staging(tmp_path: Path) -> None:
+def test_colab_inventory_validation_and_upfront_staging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("models.gguf_metadata.MIN_VALID_GGUF_BYTES", 4)
     models_root = tmp_path / "Nexus" / "models"
     _make_drive_models(models_root)
 

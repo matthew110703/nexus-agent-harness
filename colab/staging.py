@@ -25,6 +25,7 @@ from models.base import (  # noqa: E402
     SessionRuntimeConfig,
     save_session_runtime_config,
 )
+from models.gguf_metadata import inspect_gguf_directory  # noqa: E402
 
 CHUNK_SIZE = 16 * 1024 * 1024  # 16 MiB streaming chunks
 SAMPLE_SLICE_BYTES = 4 * 1024 * 1024  # 4 MiB head + 4 MiB mid + 4 MiB tail sampled fingerprint
@@ -247,6 +248,118 @@ def _copy_file_fuse(
     }
 
 
+def _stage_raw_gguf_parts(
+    *,
+    source_dir: Path,
+    dest_dir: Path,
+    part_files: list[Path],
+    assembled_filename: str,
+    mmproj_file: Optional[Path],
+    model_id: str,
+    min_free_margin_bytes: int,
+    verify_mode: VerifyMode,
+    transport: TransportMode,
+    on_status: Callable[[str], None],
+) -> Path:
+    """
+    Stream-concatenate raw byte-split GGUF parts (`*.gguf.part1ofN` ... `.partNofN`) directly
+    into one local SSD `.gguf` file without duplicating the parts on Drive or SSD.
+    """
+    t0 = time.monotonic()
+    total_bytes = sum(p.stat().st_size for p in part_files) + (mmproj_file.stat().st_size if mmproj_file else 0)
+    assembled_path = dest_dir / assembled_filename
+    parts_sig = [
+        {"name": p.name, "size": int(p.stat().st_size), "mtime_ns": int(p.stat().st_mtime_ns)}
+        for p in part_files
+    ]
+
+    existing = _load_stage_manifest(dest_dir)
+    if (
+        existing is not None
+        and assembled_path.is_file()
+        and assembled_path.stat().st_size == sum(p.stat().st_size for p in part_files)
+        and existing.get("raw_parts") == parts_sig
+    ):
+        entry = (existing.get("files") or {}).get(assembled_filename) or {}
+        if verify_mode == "fast" and entry.get("sample_hash"):
+            _, actual = _sample_hash_file(assembled_path, algo=entry.get("sample_algo"))
+            if actual == entry.get("sample_hash"):
+                on_status(f"[STAGE] Reusing verified assembled split GGUF for {model_id} ({time.monotonic() - t0:.2f}s).")
+                return dest_dir
+
+    free_bytes = shutil.disk_usage(dest_dir.parent).free
+    if free_bytes < total_bytes + min_free_margin_bytes:
+        raise InsufficientDiskSpaceError(
+            f"Insufficient local disk for assembled {model_id}: need {(total_bytes + min_free_margin_bytes) / (1024**3):.1f} GiB, "
+            f"only {free_bytes / (1024**3):.1f} GiB free"
+        )
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    (dest_dir / MANIFEST_FILENAME).unlink(missing_ok=True)
+    tmp_assembled = dest_dir / f".{assembled_filename}.staging.tmp"
+    hash_algo, h = _make_fast_hasher()
+    copied = 0
+    last_log = time.monotonic()
+
+    on_status(
+        f"[STAGE] Reassembling {len(part_files)}-part split GGUF '{model_id}' "
+        f"({total_bytes / (1024**3):.2f} GiB) onto local SSD..."
+    )
+    try:
+        with tmp_assembled.open("wb") as f_out:
+            for part in part_files:
+                with part.open("rb") as f_in:
+                    while True:
+                        buf = f_in.read(CHUNK_SIZE)
+                        if not buf:
+                            break
+                        f_out.write(buf)
+                        h.update(buf)
+                        copied += len(buf)
+                        now = time.monotonic()
+                        if now - last_log >= 4.0 and total_bytes > 0:
+                            pct = min(100.0, (copied / total_bytes) * 100.0)
+                            mbps = (copied / (1024 * 1024)) / max(0.1, now - t0)
+                            on_status(f"[STAGE] {model_id}: {copied / (1024**3):.2f} / {total_bytes / (1024**3):.2f} GiB ({pct:.1f}%) — {mbps:.1f} MB/s")
+                            last_log = now
+        os.replace(tmp_assembled, assembled_path)
+    except Exception:
+        tmp_assembled.unlink(missing_ok=True)
+        raise
+
+    sample_algo, sample_hash = _sample_hash_file(assembled_path, algo=hash_algo)
+    manifest_files: dict[str, Any] = {
+        assembled_filename: {
+            "size": int(assembled_path.stat().st_size),
+            "hash_algo": hash_algo,
+            "hash": h.hexdigest(),
+            "sample_algo": sample_algo,
+            "sample_hash": sample_hash,
+        }
+    }
+    if mmproj_file is not None:
+        mm_entry = _copy_file_fuse(src_file=mmproj_file, dst_file=dest_dir / mmproj_file.name, on_bytes=lambda _n: None)
+        manifest_files[mmproj_file.name] = mm_entry
+
+    _write_stage_manifest(
+        dest_dir,
+        {
+            "version": MANIFEST_VERSION,
+            "model_id": model_id,
+            "source_dir": str(source_dir),
+            "transport": transport,
+            "verify_mode": verify_mode,
+            "status": "complete",
+            "total_bytes": total_bytes,
+            "raw_parts": parts_sig,
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+            "files": manifest_files,
+        },
+    )
+    on_status(f"[STAGE] Reassembled and verified {model_id} -> {assembled_path.name} ({time.monotonic() - t0:.1f}s)")
+    return dest_dir
+
+
 def stage_model_directory(
     source_dir: Path,
     local_stage_root: Path,
@@ -266,6 +379,21 @@ def stage_model_directory(
     """
     log = on_status or (lambda _msg: None)
     dest_dir = local_stage_root / model_id
+    gguf_layout = inspect_gguf_directory(source_dir)
+    if gguf_layout.valid and gguf_layout.layout == "raw_parts":
+        local_stage_root.mkdir(parents=True, exist_ok=True)
+        return _stage_raw_gguf_parts(
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+            part_files=gguf_layout.source_files,
+            assembled_filename=gguf_layout.assembled_filename,
+            mmproj_file=gguf_layout.mmproj_file,
+            model_id=model_id,
+            min_free_margin_bytes=min_free_margin_bytes,
+            verify_mode=verify_mode,
+            transport=transport,
+            on_status=log,
+        )
     files = _iter_stage_files(source_dir)
     total_bytes = sum(p.stat().st_size for p in files)
     total_files = len(files)
@@ -479,6 +607,14 @@ def stage_selected_models(
         default_reasoning_effort=language_candidate.default_reasoning_effort,
         min_vram_gib=float(language_candidate.min_vram_gib),
         size_bytes=int(language_candidate.size_bytes),
+        quantization=str(getattr(language_candidate, "quantization", "unknown")),
+        n_ctx=getattr(language_candidate, "n_ctx", None),
+        n_gpu_layers=getattr(language_candidate, "n_gpu_layers", None),
+        batch_size=getattr(language_candidate, "batch_size", None),
+        ubatch_size=getattr(language_candidate, "ubatch_size", None),
+        threads=getattr(language_candidate, "threads", None),
+        compatibility_tier=getattr(language_candidate, "compatibility_tier", None),
+        can_coreside_image=bool(getattr(language_candidate, "can_coreside_image", True)),
     )
 
     img_spec: Optional[SelectedImageSpec] = None

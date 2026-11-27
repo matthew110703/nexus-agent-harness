@@ -21,6 +21,44 @@ def make_cancel_stopping_criteria(cancel_event: threading.Event) -> Any:
     return StoppingCriteriaList([_CancelEventCriteria()])
 
 
+def enable_cuda_fast_math(torch_mod: Any) -> None:
+    """Enable TF32 matmul/cuDNN on Ampere+ GPUs for faster bf16/fp16 inference."""
+    try:
+        if torch_mod.cuda.is_available():
+            major, _ = torch_mod.cuda.get_device_capability(0)
+            if major >= 8:
+                torch_mod.backends.cuda.matmul.allow_tf32 = True
+                torch_mod.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
+
+def resolve_stop_token_ids(tokenizer: Any, extra_tokens: tuple[str, ...]) -> Optional[Any]:
+    """Collect distinct valid token IDs for `eos_token_id` + model-specific tool/turn stop tokens."""
+    ids: list[int] = []
+    base_eos = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(base_eos, int) and base_eos >= 0:
+        ids.append(base_eos)
+    elif isinstance(base_eos, (list, tuple)):
+        for x in base_eos:
+            if isinstance(x, int) and x >= 0 and x not in ids:
+                ids.append(x)
+
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        for tok in extra_tokens:
+            try:
+                tid = convert(tok)
+                if isinstance(tid, int) and tid >= 0 and tid != unk_id and tid not in ids:
+                    ids.append(tid)
+            except Exception:
+                pass
+    if not ids:
+        return None
+    return ids[0] if len(ids) == 1 else ids
+
+
 def _ensure_schema_descriptions(node: Any) -> Any:
     """Recursively ensure every JSON Schema object node has a `description` string for strict Jinja templates."""
     if not isinstance(node, dict):

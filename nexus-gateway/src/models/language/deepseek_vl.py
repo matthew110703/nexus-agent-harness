@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from models.language.common import make_cancel_stopping_criteria
+from models.language.common import enable_cuda_fast_math, make_cancel_stopping_criteria
 from models.language.prompt_tools import inject_tools_into_messages
 from models.language.quantization import resolve_quantization_config
 
@@ -31,6 +31,7 @@ class DeepSeekVlLanguageModel:
         import torch  # type: ignore[import-not-found]
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
 
+        enable_cuda_fast_math(torch)
         # Register DeepSeek-VL custom model classes BEFORE AutoModelForCausalLM.from_pretrained()
         vl_processor_cls: Any = None
         try:

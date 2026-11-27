@@ -19,6 +19,9 @@ LanguageImplName = Literal[
     "gguf_qwen3_5",
     "gguf_gemma4",
     "gguf_deepseek_qwen3_5",
+    "gguf_llama3",
+    "gguf_llama4",
+    "gguf_generic",
 ]
 ImageImplName = Literal["flux2_klein", "sdxl"]
 ReasoningMode = Literal["none", "binary_toggle", "effort_levels"]
@@ -34,6 +37,9 @@ LANGUAGE_IMPLEMENTATIONS: dict[str, tuple[str, str]] = {
     "gguf_qwen3_5": ("models.language.gguf_qwen3_5", "GgufQwen35Model"),
     "gguf_gemma4": ("models.language.gguf_gemma4", "GgufGemma4Model"),
     "gguf_deepseek_qwen3_5": ("models.language.gguf_deepseek_qwen3_5", "GgufDeepSeekQwen35Model"),
+    "gguf_llama3": ("models.language.gguf_llama3", "GgufLlama3Model"),
+    "gguf_llama4": ("models.language.gguf_llama4", "GgufLlama4Model"),
+    "gguf_generic": ("models.language.gguf_generic", "GgufGenericModel"),
 }
 
 IMAGE_IMPLEMENTATIONS: dict[str, tuple[str, str]] = {
@@ -86,6 +92,14 @@ class SelectedLanguageSpec:
     default_reasoning_effort: Optional[str] = None
     min_vram_gib: float = 0.0
     size_bytes: int = 0
+    quantization: str = "unknown"
+    n_ctx: Optional[int] = None
+    n_gpu_layers: Optional[int] = None
+    batch_size: Optional[int] = None
+    ubatch_size: Optional[int] = None
+    threads: Optional[int] = None
+    compatibility_tier: Optional[str] = None
+    can_coreside_image: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -106,6 +120,9 @@ class SelectedLanguageSpec:
             "default_reasoning_effort": self.default_reasoning_effort,
             "min_vram_gib": self.min_vram_gib,
             "size_bytes": self.size_bytes,
+            "quantization": self.quantization,
+            "compatibility_tier": self.compatibility_tier,
+            "can_coreside_image": self.can_coreside_image,
         }
         return payload
 
@@ -132,6 +149,14 @@ class SelectedLanguageSpec:
             default_reasoning_effort=data.get("default_reasoning_effort"),
             min_vram_gib=float(data.get("min_vram_gib") or 0.0),
             size_bytes=int(data.get("size_bytes") or 0),
+            quantization=str(data.get("quantization") or "unknown"),
+            n_ctx=int(data["n_ctx"]) if data.get("n_ctx") is not None else None,
+            n_gpu_layers=int(data["n_gpu_layers"]) if data.get("n_gpu_layers") is not None else None,
+            batch_size=int(data["batch_size"]) if data.get("batch_size") is not None else None,
+            ubatch_size=int(data["ubatch_size"]) if data.get("ubatch_size") is not None else None,
+            threads=int(data["threads"]) if data.get("threads") is not None else None,
+            compatibility_tier=str(data["compatibility_tier"]) if data.get("compatibility_tier") else None,
+            can_coreside_image=bool(data.get("can_coreside_image", True)),
         )
 
 
@@ -248,6 +273,7 @@ def load_dedicated_language_runtime(
     model_id: str,
     model_path: Path,
     architecture: str = "unknown",
+    runtime_options: Optional[dict[str, Any]] = None,
 ) -> LanguageModelRuntime:
     """Lazy-import and instantiate only the selected language model's dedicated module."""
     target = LANGUAGE_IMPLEMENTATIONS.get(implementation)
@@ -256,7 +282,16 @@ def load_dedicated_language_runtime(
     module_name, class_name = target
     mod = importlib.import_module(module_name)
     cls = getattr(mod, class_name)
-    return cls(model_id=model_id, model_path=model_path, architecture=architecture)
+    kwargs: dict[str, Any] = {
+        "model_id": model_id,
+        "model_path": model_path,
+        "architecture": architecture,
+    }
+    if implementation.startswith("gguf_") and runtime_options:
+        for key in ("n_ctx", "n_gpu_layers", "batch_size", "ubatch_size", "threads"):
+            if runtime_options.get(key) is not None:
+                kwargs[key] = int(runtime_options[key])
+    return cls(**kwargs)
 
 
 def load_dedicated_image_runtime(

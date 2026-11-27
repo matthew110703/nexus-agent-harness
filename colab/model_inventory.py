@@ -1,13 +1,25 @@
-"""Colab-side Google Drive model inventory, structural validation, and GPU VRAM fit checks (v1.1.0)."""
+"""Colab-side Google Drive model inventory, structural validation, and VRAM+RAM fit checks (v2.1.0)."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
+
+_GW_SRC = Path(__file__).resolve().parents[1] / "nexus-gateway" / "src"
+if str(_GW_SRC) not in sys.path:
+    sys.path.insert(0, str(_GW_SRC))
+
+from core.memory_planner import plan_gguf_memory  # noqa: E402
+from models.gguf_metadata import (  # noqa: E402
+    infer_quantization_from_name,
+    inspect_gguf_directory,
+    resolve_gguf_implementation,
+)
 
 GIB = 1024 ** 3
 
@@ -54,6 +66,16 @@ class InventoryCandidate:
     reasoning_efforts: Any = False
     default_reasoning_effort: Optional[str] = None
     default_steps: int = 6
+    quantization: str = "unknown"
+    compatibility_tier: Optional[str] = None
+    n_ctx: Optional[int] = None
+    n_gpu_layers: Optional[int] = None
+    batch_size: Optional[int] = None
+    ubatch_size: Optional[int] = None
+    threads: Optional[int] = None
+    can_coreside_image: bool = True
+    shard_count: int = 1
+    layout: str = "single"
     reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -174,14 +196,18 @@ def _estimate_min_vram_gib(size_bytes: int, role: str, implementation: str, mode
     size_gib = size_bytes / GIB
     if role == "image":
         if implementation == "flux2_klein" and "9b" in model_id.lower():
-            # Runnable on L4 24GB via model CPU offload when sole GPU resident.
             return 20.0
         return round(max(6.0, size_gib * 1.15), 1)
-    # Language models need weights + KV cache headroom (~1.12x weights, min 6 GiB).
     return round(max(6.0, size_gib * 1.12), 1)
 
 
-def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int] = None) -> InventoryCandidate:
+def inspect_single_drive_dir(
+    model_dir: Path,
+    *,
+    total_vram_bytes: Optional[int] = None,
+    available_ram_bytes: int = 0,
+    cpu_count: int = 4,
+) -> InventoryCandidate:
     model_id = model_dir.name
     vram_gib = (total_vram_bytes / GIB) if (total_vram_bytes is not None and total_vram_bytes > 0) else None
 
@@ -278,6 +304,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 size_bytes=size_bytes,
                 min_vram_gib=min_vram,
                 fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                compatibility_tier="RECOMMENDED" if (vram_gib is not None and vram_gib >= min_vram) else None,
                 modalities=["text", "image"],
                 context_window=ctx_len,
                 max_output_tokens=4096,
@@ -307,6 +334,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 size_bytes=size_bytes,
                 min_vram_gib=min_vram,
                 fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                compatibility_tier="RECOMMENDED" if (vram_gib is not None and vram_gib >= min_vram) else None,
                 modalities=["text", "image"],
                 context_window=ctx_len,
                 max_output_tokens=4096,
@@ -336,6 +364,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 size_bytes=size_bytes,
                 min_vram_gib=min_vram,
                 fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                compatibility_tier="RECOMMENDED" if (vram_gib is not None and vram_gib >= min_vram) else None,
                 modalities=["text"],
                 context_window=ctx_len,
                 max_output_tokens=4096,
@@ -346,8 +375,6 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
             )
 
         if model_type == "gemma3":
-            # Gemma 3 supports tool calling via prompt injection and strict alternation
-            # Size on disk ~22.7 GiB, fits in 4-bit NF4 on L4 22 GiB
             min_vram = 14.0 if size_bytes > 20 * GIB else _estimate_min_vram_gib(size_bytes, "language", "gemma3", model_id)
             return InventoryCandidate(
                 id=model_id,
@@ -358,6 +385,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 size_bytes=size_bytes,
                 min_vram_gib=min_vram,
                 fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                compatibility_tier="RECOMMENDED" if (vram_gib is not None and vram_gib >= min_vram) else None,
                 modalities=["text", "image"],
                 context_window=ctx_len,
                 max_output_tokens=4096,
@@ -378,6 +406,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 size_bytes=size_bytes,
                 min_vram_gib=min_vram,
                 fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                compatibility_tier="RECOMMENDED" if (vram_gib is not None and vram_gib >= min_vram) else None,
                 modalities=["text", "image"],
                 context_window=ctx_len,
                 max_output_tokens=4096,
@@ -398,6 +427,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 size_bytes=size_bytes,
                 min_vram_gib=min_vram,
                 fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
+                compatibility_tier="RECOMMENDED" if (vram_gib is not None and vram_gib >= min_vram) else None,
                 modalities=["text", "image"],
                 context_window=ctx_len,
                 max_output_tokens=4096,
@@ -413,42 +443,68 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
             source_path=str(hf_root),
             architecture=arch,
             size_bytes=size_bytes,
-            reason=f"No dedicated v1.2.0 tool-calling implementation for model_type={model_type!r} (tools_in_template={'tools' in low_tpl})",
+            reason=f"No dedicated tool-calling implementation for model_type={model_type!r} (tools_in_template={'tools' in low_tpl})",
         )
 
-    # 3. GGUF package (managed via llama-server)
-    gguf_files = list(model_dir.glob("*.gguf"))
-    if gguf_files:
-        low_id = model_id.lower()
-        size_bytes = _dir_size_bytes(model_dir)
-        # Identify GGUF implementation
-        if "gemma" in low_id or "gemma4" in low_id:
-            impl = "gguf_gemma4"
-            arch = "gemma4"
-        elif "deepseek" in low_id:
-            impl = "gguf_deepseek_qwen3_5"
-            arch = "deepseek_v4_pro"
-        else:
-            impl = "gguf_qwen3_5"
-            arch = "qwen3_5"
-
-        min_vram = round(max(6.0, (size_bytes / GIB) * 1.1), 1)
+    # 3. GGUF package (single, -00001-of-0000N shards, or .gguf.part1ofN split parts)
+    gguf_layout = inspect_gguf_directory(model_dir)
+    if gguf_layout.valid:
+        hdr = gguf_layout.header
+        arch = hdr.architecture if hdr and hdr.architecture != "unknown" else model_id.lower()
+        quant = hdr.quantization if hdr and hdr.quantization != "unknown" else infer_quantization_from_name(gguf_layout.assembled_filename or model_id)
+        impl = resolve_gguf_implementation(arch, model_id)
+        mmproj_bytes = gguf_layout.mmproj_file.stat().st_size if gguf_layout.mmproj_file else 0
+        total_bytes = gguf_layout.total_size_bytes + mmproj_bytes
+        max_ctx = (hdr.context_length if hdr and hdr.context_length else 32768)
+        plan = plan_gguf_memory(
+            weight_bytes=gguf_layout.total_size_bytes,
+            mmproj_bytes=mmproj_bytes,
+            architecture=arch,
+            block_count=hdr.block_count if hdr else None,
+            max_model_ctx=max_ctx,
+            total_vram_bytes=total_vram_bytes or 0,
+            available_ram_bytes=available_ram_bytes,
+            cpu_count=cpu_count,
+        )
+        min_vram = round(max(6.0, (total_bytes / GIB) * 1.12), 1)
+        has_think = (hdr.has_think_template if hdr else False) or impl in ("gguf_qwen3_5", "gguf_deepseek_qwen3_5")
+        modalities = ["text", "image"] if gguf_layout.mmproj_file is not None else ["text"]
         return InventoryCandidate(
             id=model_id,
             role="language",
-            source_path=str(model_dir),
+            source_path=str(gguf_layout.root_dir),
             implementation=impl,
             architecture=arch,
-            size_bytes=size_bytes,
+            size_bytes=total_bytes,
             min_vram_gib=min_vram,
-            fits_current_gpu=(vram_gib >= min_vram) if vram_gib is not None else None,
-            modalities=["text"],
-            context_window=32768,
+            fits_current_gpu=(plan.tier != "INSUFFICIENT_MEMORY") if total_vram_bytes else None,
+            modalities=modalities,
+            context_window=plan.n_ctx,
             max_output_tokens=4096,
-            reasoning_mode="none",
-            reasoning_efforts=False,
-            default_reasoning_effort=None,
-            reason="Dedicated GGUF runtime via llama-server (CUDA GPU offload)",
+            reasoning_mode="binary_toggle" if has_think else "none",
+            reasoning_efforts={"off": "off", "high": "high"} if has_think else False,
+            default_reasoning_effort="high" if has_think else None,
+            quantization=quant,
+            compatibility_tier=plan.tier if total_vram_bytes else None,
+            n_ctx=plan.n_ctx,
+            n_gpu_layers=plan.n_gpu_layers,
+            batch_size=plan.batch_size,
+            ubatch_size=plan.ubatch_size,
+            threads=plan.threads,
+            shard_count=len(gguf_layout.source_files),
+            layout=gguf_layout.layout,
+            reason=f"{gguf_layout.reason} | {plan.reason}",
+        )
+
+    # Report explicit GGUF validation failures (e.g., 0-byte downloads or missing split parts).
+    if any(model_dir.rglob("*.gguf*")) or (model_dir / ".cache").is_dir():
+        return InventoryCandidate(
+            id=model_id,
+            role="excluded",
+            source_path=str(model_dir),
+            architecture="gguf",
+            size_bytes=_dir_size_bytes(model_dir),
+            reason=gguf_layout.reason,
         )
 
     return InventoryCandidate(
@@ -457,11 +513,17 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
         source_path=str(model_dir),
         architecture="unknown",
         size_bytes=_dir_size_bytes(model_dir),
-        reason="Missing config.json or Diffusers model_index.json (incomplete or single-file checkpoint)",
+        reason="Missing config.json, Diffusers model_index.json, or valid GGUF weights",
     )
 
 
-def inspect_drive_models(models_root: Path, *, total_vram_bytes: Optional[int] = None) -> DriveInventory:
+def inspect_drive_models(
+    models_root: Path,
+    *,
+    total_vram_bytes: Optional[int] = None,
+    available_ram_bytes: int = 0,
+    cpu_count: int = 4,
+) -> DriveInventory:
     """Scan Drive `models/` once during Colab pre-run inventory and classify every folder."""
     inv = DriveInventory()
     if not models_root.is_dir():
@@ -469,7 +531,12 @@ def inspect_drive_models(models_root: Path, *, total_vram_bytes: Optional[int] =
     for child in sorted(models_root.iterdir()):
         if not child.is_dir() or child.name.startswith((".", "_")):
             continue
-        item = inspect_single_drive_dir(child, total_vram_bytes=total_vram_bytes)
+        item = inspect_single_drive_dir(
+            child,
+            total_vram_bytes=total_vram_bytes,
+            available_ram_bytes=available_ram_bytes,
+            cpu_count=cpu_count,
+        )
         if item.role == "language":
             inv.language_models.append(item)
         elif item.role == "image":
@@ -485,13 +552,21 @@ def validate_selected_pair(
     image_model_id: str = "",
     *,
     total_vram_bytes: Optional[int] = None,
+    available_ram_bytes: int = 0,
+    cpu_count: int = 4,
     free_disk_bytes: Optional[int] = None,
     min_disk_margin_bytes: int = 2 * GIB,
     enforce_gpu_fit: bool = True,
+    n_ctx_override: int = 0,
+    n_gpu_layers_override: int = -1,
+    batch_size_override: int = 0,
+    threads_override: int = 0,
+    allow_cpu_offload: bool = True,
+    enable_image_coresidency: bool = True,
 ) -> tuple[InventoryCandidate, Optional[InventoryCandidate]]:
     """
     Validate the single selected language model and optional single image model before staging.
-    Raises ValueError with an actionable message if either selection is invalid or does not fit.
+    Recomputes the optimal MemoryPlanner configuration with any user overrides and image co-residency.
     """
     lang_id = language_model_id.strip()
     img_id = image_model_id.strip()
@@ -501,29 +576,74 @@ def validate_selected_pair(
     lang_dir = models_root / lang_id
     if not lang_dir.is_dir():
         raise ValueError(f"Selected language model directory not found on Drive: {lang_dir}")
-    lang = inspect_single_drive_dir(lang_dir, total_vram_bytes=total_vram_bytes)
+    lang = inspect_single_drive_dir(
+        lang_dir,
+        total_vram_bytes=total_vram_bytes,
+        available_ram_bytes=available_ram_bytes,
+        cpu_count=cpu_count,
+    )
     if lang.role != "language":
-        raise ValueError(f"'{lang_id}' is not a runnable v1.1.0 language model: {lang.reason}")
-    if enforce_gpu_fit and lang.fits_current_gpu is False:
-        avail_gib = round((total_vram_bytes or 0) / GIB, 1)
-        raise ValueError(
-            f"Selected language model '{lang_id}' requires ~{lang.min_vram_gib:.1f} GiB VRAM, "
-            f"but current GPU only has {avail_gib:.1f} GiB. Choose a smaller model or switch Colab GPU tier."
-        )
+        raise ValueError(f"'{lang_id}' is not a runnable language model: {lang.reason}")
 
     img: Optional[InventoryCandidate] = None
     if img_id:
         img_dir = models_root / img_id
         if not img_dir.is_dir():
             raise ValueError(f"Selected image model directory not found on Drive: {img_dir}")
-        img = inspect_single_drive_dir(img_dir, total_vram_bytes=total_vram_bytes)
+        img = inspect_single_drive_dir(
+            img_dir,
+            total_vram_bytes=total_vram_bytes,
+            available_ram_bytes=available_ram_bytes,
+            cpu_count=cpu_count,
+        )
         if img.role != "image":
-            raise ValueError(f"'{img_id}' is not a runnable v1.1.0 image-generation model: {img.reason}")
+            raise ValueError(f"'{img_id}' is not a runnable image-generation model: {img.reason}")
         if enforce_gpu_fit and img.fits_current_gpu is False:
             avail_gib = round((total_vram_bytes or 0) / GIB, 1)
             raise ValueError(
                 f"Selected image model '{img_id}' requires ~{img.min_vram_gib:.1f} GiB VRAM, "
                 f"but current GPU only has {avail_gib:.1f} GiB."
+            )
+
+    if lang.implementation.startswith("gguf_"):
+        gguf_layout = inspect_gguf_directory(lang_dir)
+        hdr = gguf_layout.header
+        mmproj_bytes = gguf_layout.mmproj_file.stat().st_size if gguf_layout.mmproj_file else 0
+        plan = plan_gguf_memory(
+            weight_bytes=gguf_layout.total_size_bytes,
+            mmproj_bytes=mmproj_bytes,
+            architecture=lang.architecture,
+            block_count=hdr.block_count if hdr else None,
+            max_model_ctx=hdr.context_length if hdr and hdr.context_length else 32768,
+            total_vram_bytes=total_vram_bytes or 0,
+            available_ram_bytes=available_ram_bytes,
+            cpu_count=cpu_count,
+            image_min_vram_gib=(img.min_vram_gib if (img and enable_image_coresidency) else 0.0),
+            n_ctx_override=n_ctx_override,
+            n_gpu_layers_override=n_gpu_layers_override,
+            batch_size_override=batch_size_override,
+            threads_override=threads_override,
+            allow_cpu_offload=allow_cpu_offload,
+        )
+        lang.compatibility_tier = plan.tier
+        lang.n_ctx = plan.n_ctx
+        lang.context_window = plan.n_ctx
+        lang.n_gpu_layers = plan.n_gpu_layers
+        lang.batch_size = plan.batch_size
+        lang.ubatch_size = plan.ubatch_size
+        lang.threads = plan.threads
+        lang.can_coreside_image = bool(enable_image_coresidency and plan.can_coreside_image)
+        lang.fits_current_gpu = plan.tier != "INSUFFICIENT_MEMORY"
+        lang.reason = plan.reason
+        if enforce_gpu_fit and plan.tier == "INSUFFICIENT_MEMORY":
+            raise ValueError(f"Selected language model '{lang_id}' cannot fit on this runtime: {plan.reason}")
+    else:
+        lang.can_coreside_image = bool(enable_image_coresidency)
+        if enforce_gpu_fit and lang.fits_current_gpu is False:
+            avail_gib = round((total_vram_bytes or 0) / GIB, 1)
+            raise ValueError(
+                f"Selected language model '{lang_id}' requires ~{lang.min_vram_gib:.1f} GiB VRAM, "
+                f"but current GPU only has {avail_gib:.1f} GiB. Choose a smaller model or switch Colab GPU tier."
             )
 
     if free_disk_bytes is not None:
@@ -541,17 +661,22 @@ def validate_selected_pair(
 def format_inventory_report(inv: DriveInventory, *, gpu_summary: str = "Unknown GPU") -> str:
     """Format a copy-pasteable inventory report for the Colab Inventory cell."""
     lines = [
-        f"=== NEXUS AI LAB v2.0.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
+        f"=== NEXUS AI LAB v2.1.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
         "",
         f"Selectable Language Models ({len(inv.language_models)}):",
     ]
     if not inv.language_models:
         lines.append("  (none found)")
     for m in inv.language_models:
-        fit = "FITS GPU" if m.fits_current_gpu else ("TOO LARGE FOR GPU" if m.fits_current_gpu is False else "GPU N/A")
+        tier = m.compatibility_tier or (
+            "RECOMMENDED" if m.fits_current_gpu else ("INSUFFICIENT_MEMORY" if m.fits_current_gpu is False else "GPU N/A")
+        )
+        quant_str = f"{m.quantization}" if m.quantization != "unknown" else "-"
+        shard_str = f"{m.shard_count}p" if m.shard_count > 1 else "1f"
+        ctx_str = f"ctx={m.n_ctx}" if m.n_ctx else f"ctx={m.context_window}"
         lines.append(
-            f"  - {m.id:<34} | impl={m.implementation:<8} | {m.size_bytes / GIB:5.1f} GiB "
-            f"| minVRAM={m.min_vram_gib:4.1f} GiB | reasoning={m.reasoning_mode:<13} | {fit}"
+            f"  - {m.id:<34} | impl={m.implementation:<14} | {m.size_bytes / GIB:5.1f} GiB "
+            f"| q={quant_str:<7} ({shard_str}) | {ctx_str:<9} | {tier}"
         )
 
     lines.extend(["", f"Selectable Image Models ({len(inv.image_models)}):"])
@@ -564,7 +689,7 @@ def format_inventory_report(inv: DriveInventory, *, gpu_summary: str = "Unknown 
             f"| minVRAM={m.min_vram_gib:4.1f} GiB | steps={m.default_steps:<2} | {fit}"
         )
 
-    lines.extend(["", f"Skipped / Non-Runnable Folders ({len(inv.excluded_models)}):"])
+    lines.extend(["", f"Skipped / Incomplete Folders ({len(inv.excluded_models)}):"])
     for m in inv.excluded_models:
         lines.append(f"  - {m.id:<34} | {m.reason}")
 

@@ -225,6 +225,16 @@ def restore_latest_snapshot(backup_root: Path, target_home: Path) -> dict[str, A
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         restored_count += 1
+        # If a restored session metadata file points to an ephemeral /root/* or /tmp/* cwd
+        # from an older Colab VM, ensure that directory exists so reopening the session works.
+        if rel.name == "session.json":
+            try:
+                sdata = json.loads(dst.read_text(encoding="utf-8"))
+                cwd_val = sdata.get("workingDirectory") if isinstance(sdata, dict) else None
+                if isinstance(cwd_val, str) and (cwd_val.startswith("/root/") or cwd_val.startswith("/tmp/")):
+                    Path(cwd_val).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
 
     return {
         "restored": True,

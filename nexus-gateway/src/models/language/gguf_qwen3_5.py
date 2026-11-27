@@ -20,6 +20,11 @@ class GgufQwen35Model:
         model_path: Path,
         architecture: str = "gguf",
         port: int = 0,
+        n_ctx: int = 16384,
+        n_gpu_layers: int = 999,
+        batch_size: int = 2048,
+        ubatch_size: int = 512,
+        threads: int = 0,
     ) -> None:
         self.model_id = model_id
         self.model_path = model_path
@@ -28,8 +33,12 @@ class GgufQwen35Model:
             model_id=model_id,
             model_path=model_path,
             port=port,
-            n_ctx=16384,
-            n_gpu_layers=999,
+            n_ctx=n_ctx,
+            n_gpu_layers=n_gpu_layers,
+            batch_size=batch_size,
+            ubatch_size=ubatch_size,
+            threads=threads,
+            reasoning_format="deepseek",
         )
 
     def is_ready(self) -> bool:

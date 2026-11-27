@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from adapters.tool_calls import create_tool_parser, has_native_tool_parser
 from api.middleware.auth import make_auth_dependency
 from core.hardware_detector import detect_hardware
+from core.memory_planner import can_coreside_image_model
 from core.resource_manager import ResourceManager
 from core.worker_manager import WorkerError, WorkerManager
 from models.base import SessionRuntimeConfig
@@ -23,7 +24,7 @@ from services.image_generation import save_generated_image_artifact
 from services.progress import ProgressService
 from workers.worker_protocol import WorkerGenerateRequest, WorkerImageRequest, WorkerLoadRequest, WorkerStatus
 
-GATEWAY_VERSION = "2.0.0"
+GATEWAY_VERSION = "2.1.0"
 IMAGE_QUALITY_PROFILES = ("normal", "detailed", "maximum")
 
 
@@ -61,13 +62,24 @@ def create_app(
     def _live_readiness(ws: WorkerStatus) -> tuple[bool, str]:
         if res_mgr.is_swapping:
             return False, "swapping"
-        if ws.alive and ws.active_kind == "language" and ws.active_model_id == lang_spec.id:
+        if ws.alive and (
+            ws.active_language_id == lang_spec.id
+            or (ws.active_kind == "language" and ws.active_model_id == lang_spec.id)
+        ):
             return True, "ready"
         if ws.last_error:
             return False, "degraded"
         return False, "unloaded"
 
-    def _load_selected_language_unlocked(op_id: str) -> WorkerStatus:
+    def _language_runtime_options() -> dict[str, Any]:
+        opts: dict[str, Any] = {}
+        for key in ("n_ctx", "n_gpu_layers", "batch_size", "ubatch_size", "threads"):
+            val = getattr(lang_spec, key, None)
+            if val is not None:
+                opts[key] = int(val)
+        return opts
+
+    def _load_selected_language_unlocked(op_id: str, *, keep_other_slot: bool = False) -> WorkerStatus:
         prog.update(
             op_id,
             phase="weight_loading",
@@ -81,11 +93,13 @@ def create_app(
                 model_path=lang_spec.model_path,
                 implementation=lang_spec.implementation,
                 architecture=lang_spec.architecture,
+                keep_other_slot=keep_other_slot,
+                runtime_options=_language_runtime_options(),
             )
         )
         prog.update(op_id, phase="placement", indeterminate=True, message=f"Verifying worker readiness for {lang_spec.id}")
         ws = worker_mgr.status()
-        if not ws.alive or ws.active_kind != "language" or ws.active_model_id != lang_spec.id:
+        if not ws.alive or (ws.active_language_id != lang_spec.id and ws.active_model_id != lang_spec.id):
             raise WorkerError(
                 f"Worker failed to confirm active language model {lang_spec.id} "
                 f"(alive={ws.alive}, kind={ws.active_kind}, active={ws.active_model_id})",
@@ -187,6 +201,41 @@ def create_app(
             except Exception as exc:
                 prog.fail(op.operation_id, f"{type(exc).__name__}: {exc}")
                 raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    @app.post("/v1/runtime/preload-image")
+    def runtime_preload_image(_auth: None = Depends(require_auth)) -> dict[str, Any]:
+        """Co-load the selected image pipeline alongside the LLM if live free VRAM suffices."""
+        if img_spec is None:
+            return {"status": "skipped", "reason": "no_image_model"}
+        if not lang_spec.can_coreside_image:
+            return {"status": "skipped", "reason": "coresidency_disabled"}
+        img_dir = Path(img_spec.model_path)
+        stage_lock = img_dir.parent / f".{img_spec.id}.staging.lock"
+        if stage_lock.is_file() or not img_dir.is_dir():
+            return {"status": "skipped", "reason": "staging_incomplete"}
+        with res_mgr.exclusive():
+            ws = worker_mgr.status()
+            if ws.active_image_id == img_spec.id:
+                return {"status": "ready", "co_resident": ws.co_resident, "worker": ws.to_dict()}
+            hw = detect_hardware(Path(lang_spec.model_path).parent)
+            free_vram = ws.device_free_vram_bytes or hw.free_vram_bytes
+            if not can_coreside_image_model(free_vram_bytes=free_vram, image_min_vram_gib=img_spec.min_vram_gib):
+                return {"status": "skipped", "reason": "insufficient_free_vram", "free_vram_bytes": free_vram}
+            try:
+                worker_mgr.load_model(
+                    WorkerLoadRequest(
+                        kind="image",
+                        model_id=img_spec.id,
+                        model_path=img_spec.model_path,
+                        implementation=img_spec.implementation,
+                        architecture=img_spec.architecture,
+                        keep_other_slot=True,
+                    )
+                )
+                return {"status": "ready", "co_resident": True, "worker": worker_mgr.status().to_dict()}
+            except Exception as exc:
+                worker_mgr.unload(kind="image", terminate_on_failure=False)
+                return {"status": "skipped", "reason": f"preload_failed: {exc}"}
 
     @app.post("/v1/runtime/unload")
     def runtime_unload(body: Optional[dict[str, Any]] = None, _auth: None = Depends(require_auth)) -> dict[str, Any]:
@@ -539,77 +588,122 @@ def create_app(
         saved: Optional[dict[str, Any]] = None
         gen_exc: Optional[BaseException] = None
         restore_exc: Optional[BaseException] = None
+        used_coresident = False
 
-        with res_mgr.exclusive(swapping=True):
-            try:
-                # 1. Explicitly unload resident language model so image pipeline owns VRAM cleanly.
-                worker_mgr.unload(terminate_on_failure=True)
-                prog.update(
-                    op.operation_id,
-                    phase="weight_loading",
-                    indeterminate=True,
-                    message=f"Loading pre-staged {img_spec.id} from local SSD",
-                )
-                worker_mgr.load_model(
-                    WorkerLoadRequest(
-                        kind="image",
-                        model_id=img_spec.id,
-                        model_path=img_spec.model_path,
-                        implementation=img_spec.implementation,
-                        architecture=img_spec.architecture,
-                    )
-                )
-                # 2. Run denoising with real step progress.
-                raw = worker_mgr.generate_image(
-                    WorkerImageRequest(
-                        model_id=img_spec.id,
-                        prompt=prompt,
-                        operation_id=op.operation_id,
-                        quality=quality,  # type: ignore[arg-type]
-                        width=body.get("width"),
-                        height=body.get("height"),
-                        steps=body.get("steps"),
-                        seed=body.get("seed"),
-                        num_images=1,
-                        output_dir=str(config.output_image_dir),
-                    ),
-                    on_progress=_relay_progress,
-                )
-                prog.update(
-                    op.operation_id,
-                    phase="saving",
-                    indeterminate=True,
-                    message="Saving PNG + metadata to Drive",
-                )
-                saved = save_generated_image_artifact(
-                    output_dir=config.output_image_dir,
-                    b64_png=str(raw["b64_png"]),
+        def _is_oom_error(err: BaseException) -> bool:
+            msg = str(err).lower()
+            return "out of memory" in msg or "outofmemoryerror" in msg or "cuda error: out of memory" in msg
+
+        def _run_image_gen_and_save() -> dict[str, Any]:
+            raw = worker_mgr.generate_image(
+                WorkerImageRequest(
                     model_id=img_spec.id,
                     prompt=prompt,
-                    quality=str(raw.get("quality") or quality),
-                    width=int(raw.get("width") or body.get("width") or 1024),
-                    height=int(raw.get("height") or body.get("height") or 1024),
-                    steps=int(raw.get("steps") or body.get("steps") or img_spec.default_steps),
-                    seed=raw.get("seed"),
                     operation_id=op.operation_id,
-                    workspace=body.get("workspace"),
-                    drive_root=config.output_image_dir.parents[1] if len(config.output_image_dir.parents) >= 2 else None,
-                )
-            except BaseException as exc:
-                gen_exc = exc
-            finally:
-                # 3. Always unload image pipeline and restore the pre-staged language model for the follow-up turn.
+                    quality=quality,  # type: ignore[arg-type]
+                    width=body.get("width"),
+                    height=body.get("height"),
+                    steps=body.get("steps"),
+                    seed=body.get("seed"),
+                    num_images=1,
+                    output_dir=str(config.output_image_dir),
+                ),
+                on_progress=_relay_progress,
+            )
+            prog.update(
+                op.operation_id,
+                phase="saving",
+                indeterminate=True,
+                message="Saving PNG + metadata to Drive",
+            )
+            return save_generated_image_artifact(
+                output_dir=config.output_image_dir,
+                b64_png=str(raw["b64_png"]),
+                model_id=img_spec.id,
+                prompt=prompt,
+                quality=str(raw.get("quality") or quality),
+                width=int(raw.get("width") or body.get("width") or 1024),
+                height=int(raw.get("height") or body.get("height") or 1024),
+                steps=int(raw.get("steps") or body.get("steps") or img_spec.default_steps),
+                seed=raw.get("seed"),
+                operation_id=op.operation_id,
+                workspace=body.get("workspace"),
+                drive_root=config.output_image_dir.parents[1] if len(config.output_image_dir.parents) >= 2 else None,
+            )
+
+        with res_mgr.exclusive(swapping=True):
+            ws_now = worker_mgr.status()
+            already_coresident = ws_now.alive and ws_now.active_image_id == img_spec.id and ws_now.active_language_id == lang_spec.id
+            hw_now = detect_hardware(Path(lang_spec.model_path).parent)
+            free_vram_now = ws_now.device_free_vram_bytes or hw_now.free_vram_bytes
+            try_coresident = already_coresident or (
+                lang_spec.can_coreside_image
+                and can_coreside_image_model(free_vram_bytes=free_vram_now, image_min_vram_gib=img_spec.min_vram_gib)
+            )
+
+            if try_coresident:
                 try:
+                    if not already_coresident:
+                        prog.update(
+                            op.operation_id,
+                            phase="weight_loading",
+                            indeterminate=True,
+                            message=f"Co-loading {img_spec.id} alongside {lang_spec.id} in VRAM",
+                        )
+                        worker_mgr.load_model(
+                            WorkerLoadRequest(
+                                kind="image",
+                                model_id=img_spec.id,
+                                model_path=img_spec.model_path,
+                                implementation=img_spec.implementation,
+                                architecture=img_spec.architecture,
+                                keep_other_slot=True,
+                            )
+                        )
+                    saved = _run_image_gen_and_save()
+                    used_coresident = True
+                except BaseException as exc:
+                    if _is_oom_error(exc):
+                        # OOM during co-resident load/generation: unload image and fall back to exclusive swap.
+                        worker_mgr.unload(kind="image", terminate_on_failure=False)
+                        used_coresident = False
+                    else:
+                        gen_exc = exc
+
+            if saved is None and gen_exc is None:
+                try:
+                    # Exclusive swap fallback: unload LLM, load image, generate, then restore LLM.
+                    worker_mgr.unload(terminate_on_failure=True)
                     prog.update(
                         op.operation_id,
-                        phase="restoring_language_model",
+                        phase="weight_loading",
                         indeterminate=True,
-                        message=f"Restoring {lang_spec.id} to GPU VRAM",
+                        message=f"Loading pre-staged {img_spec.id} from local SSD",
                     )
-                    worker_mgr.unload(terminate_on_failure=True)
-                    _load_selected_language_unlocked(op.operation_id)
+                    worker_mgr.load_model(
+                        WorkerLoadRequest(
+                            kind="image",
+                            model_id=img_spec.id,
+                            model_path=img_spec.model_path,
+                            implementation=img_spec.implementation,
+                            architecture=img_spec.architecture,
+                        )
+                    )
+                    saved = _run_image_gen_and_save()
                 except BaseException as exc:
-                    restore_exc = exc
+                    gen_exc = exc
+                finally:
+                    try:
+                        prog.update(
+                            op.operation_id,
+                            phase="restoring_language_model",
+                            indeterminate=True,
+                            message=f"Restoring {lang_spec.id} to GPU VRAM",
+                        )
+                        worker_mgr.unload(terminate_on_failure=True)
+                        _load_selected_language_unlocked(op.operation_id)
+                    except BaseException as exc:
+                        restore_exc = exc
 
         if gen_exc is not None:
             if isinstance(gen_exc, WorkerError) and gen_exc.status_code == 499:
@@ -627,7 +721,12 @@ def create_app(
             ) from restore_exc
 
         assert saved is not None
-        prog.complete(op.operation_id, phase="ready", message=f"Saved {saved['filename']} and restored {lang_spec.id}")
+        done_msg = (
+            f"Saved {saved['filename']} (co-resident)"
+            if used_coresident
+            else f"Saved {saved['filename']} and restored {lang_spec.id}"
+        )
+        prog.complete(op.operation_id, phase="ready", message=done_msg)
         return saved
 
     @app.get("/v1/plugin-index.json")

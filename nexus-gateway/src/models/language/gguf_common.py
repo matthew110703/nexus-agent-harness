@@ -14,6 +14,9 @@ from typing import Any, Iterator, Optional
 import httpx
 
 from models.base import GenerationCancelledError
+from models.gguf_metadata import inspect_gguf_directory
+from models.language.common import deserialize_tool_call_arguments, normalize_tools_for_jinja
+from models.language.prompt_tools import build_tools_instruction
 
 
 def _pick_free_loopback_port() -> int:
@@ -44,18 +47,25 @@ def find_llama_server_binary() -> str:
 
 
 def find_primary_gguf_file(model_path: Path) -> Path:
-    """Find the single or primary shard `.gguf` file in a directory."""
+    """Find the primary `.gguf` file (or first shard) in a directory, excluding auxiliary files."""
+    layout = inspect_gguf_directory(model_path)
+    if layout.valid and layout.source_files and layout.layout in ("single", "gguf_split"):
+        return layout.source_files[0]
     candidates = sorted(model_path.glob("*.gguf"))
     if not candidates:
-        raise ValueError(f"No .gguf files found in model directory {model_path}")
-    # Prioritize non-mmproj GGUFs
-    non_mmproj = [p for p in candidates if "mmproj" not in p.name.lower()]
-    return non_mmproj[0] if non_mmproj else candidates[0]
+        raise ValueError(f"No .gguf files found in model directory {model_path} ({layout.reason})")
+    non_aux = [
+        p
+        for p in candidates
+        if not any(tag in p.name.lower() for tag in ("mmproj", "mtp-", "imatrix", "draft"))
+    ]
+    pool = non_aux or candidates
+    return max(pool, key=lambda p: p.stat().st_size)
 
 
 def find_mmproj_file(model_path: Path) -> Optional[Path]:
     """Find an optional multimodal projector mmproj-*.gguf in the directory."""
-    candidates = sorted(model_path.glob("*mmproj*.gguf"))
+    candidates = sorted(p for p in model_path.glob("*mmproj*.gguf") if p.stat().st_size > 0)
     return candidates[0] if candidates else None
 
 
@@ -70,6 +80,11 @@ class LlamaServerRuntimeBase:
         port: int = 0,
         n_ctx: int = 16384,
         n_gpu_layers: int = 999,
+        batch_size: int = 2048,
+        ubatch_size: int = 512,
+        threads: int = 0,
+        cache_reuse: int = 256,
+        reasoning_format: Optional[str] = "deepseek",
         extra_args: Optional[list[str]] = None,
         merge_consecutive_roles: bool = False,
     ) -> None:
@@ -78,6 +93,11 @@ class LlamaServerRuntimeBase:
         self.port = port
         self.n_ctx = n_ctx
         self.n_gpu_layers = n_gpu_layers
+        self.batch_size = batch_size
+        self.ubatch_size = ubatch_size
+        self.threads = threads
+        self.cache_reuse = cache_reuse
+        self.reasoning_format = reasoning_format
         self.extra_args = extra_args or []
         self.merge_consecutive_roles = merge_consecutive_roles
         self.has_mmproj = find_mmproj_file(model_path) is not None
@@ -102,6 +122,8 @@ class LlamaServerRuntimeBase:
         binary: str,
         gguf_path: Path,
         mmproj_path: Optional[Path],
+        n_ctx: int,
+        n_gpu_layers: int,
         flag_set: list[str],
         env: dict[str, str],
         log_path: Path,
@@ -113,13 +135,17 @@ class LlamaServerRuntimeBase:
         cmd = [
             binary,
             "-m", str(gguf_path),
-            "-c", str(self.n_ctx),
-            "-ngl", str(self.n_gpu_layers),
+            "-c", str(n_ctx),
+            "-ngl", str(n_gpu_layers),
+            "-b", str(self.batch_size),
+            "-ub", str(self.ubatch_size),
             *flag_set,
             "--port", str(self._active_port),
             "--host", "127.0.0.1",
             "--jinja",
         ]
+        if self.threads > 0:
+            cmd.extend(["-t", str(self.threads)])
         if mmproj_path is not None:
             cmd.extend(["--mmproj", str(mmproj_path)])
         cmd.extend(self.extra_args)
@@ -173,20 +199,35 @@ class LlamaServerRuntimeBase:
         env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
         log_path = Path("/content/nexus-llama-server.log") if Path("/content").is_dir() else Path("nexus-llama-server.log")
 
-        # Try Flash Attention + Q8_0 KV cache first; fall back cleanly for hybrid architectures
-        # (e.g. Qwen 3.5 Gated DeltaNet GGUFs) that reject quantized KV cache or -fa flags.
-        flag_attempts = [
-            ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"],
-            ["-fa", "on"],
-            [],
+        perf_flags: list[str] = []
+        if self.cache_reuse > 0:
+            perf_flags.extend(["--cache-reuse", str(self.cache_reuse)])
+        if self.reasoning_format:
+            perf_flags.extend(["--reasoning-format", self.reasoning_format])
+
+        # Try full perf + Flash Attention + Q8_0 KV cache first; step down gracefully for hybrid
+        # architectures (e.g. Qwen 3.5 Gated DeltaNet) or tight VRAM (smaller n_ctx / partial -ngl).
+        ctx_primary = max(4096, self.n_ctx)
+        ctx_stepdown = max(8192, ctx_primary // 2) if ctx_primary > 8192 else ctx_primary
+        ngl_primary = self.n_gpu_layers
+        ngl_stepdown = int(ngl_primary * 0.8) if 0 < ngl_primary < 999 else ngl_primary
+
+        attempts: list[tuple[int, int, list[str]]] = [
+            (ctx_primary, ngl_primary, ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", *perf_flags]),
+            (ctx_primary, ngl_primary, ["-fa", "on", *perf_flags]),
+            (ctx_primary, ngl_primary, ["-fa", "on"]),
+            (ctx_stepdown, ngl_stepdown, ["-fa", "on"]),
+            (ctx_stepdown, ngl_stepdown, []),
         ]
         last_exc: Optional[Exception] = None
-        for flags in flag_attempts:
+        for ctx_val, ngl_val, flags in attempts:
             try:
                 self._launch_with_flags(
                     binary=binary,
                     gguf_path=gguf_path,
                     mmproj_path=mmproj_path,
+                    n_ctx=ctx_val,
+                    n_gpu_layers=ngl_val,
                     flag_set=flags,
                     env=env,
                     log_path=log_path,
@@ -223,10 +264,12 @@ class LlamaServerRuntimeBase:
         messages: list[dict[str, Any]],
         *,
         inject_tools: Optional[list[dict[str, Any]]] = None,
+        deserialize_args: bool = False,
     ) -> list[dict[str, Any]]:
         """Normalize OpenAI messages for llama-server Jinja templates."""
+        source_messages = deserialize_tool_call_arguments(messages) if deserialize_args else messages
         prepared: list[dict[str, Any]] = []
-        for raw in messages:
+        for raw in source_messages:
             if not isinstance(raw, dict):
                 continue
             msg = dict(raw)
@@ -249,13 +292,7 @@ class LlamaServerRuntimeBase:
             prepared.append(msg)
 
         if inject_tools:
-            tools_json = json.dumps(inject_tools, indent=2)
-            tool_block = (
-                "# Available Tools\n"
-                "You may call a tool by emitting:\n"
-                "<tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call>\n\n"
-                f"Tools:\n{tools_json}"
-            )
+            tool_block = build_tools_instruction(inject_tools)
             if prepared and prepared[0].get("role") == "system" and isinstance(prepared[0].get("content"), str):
                 prepared[0] = {**prepared[0], "content": f"{prepared[0]['content']}\n\n{tool_block}".strip()}
             else:
@@ -268,8 +305,6 @@ class LlamaServerRuntimeBase:
         for msg in prepared:
             role = msg.get("role")
             if merged and merged[-1].get("role") == "tool" and role == "user":
-                # A cancelled turn after a tool call leaves `tool -> user` with no assistant reply;
-                # insert an assistant separator so Gemma's strict Jinja alternation stays valid.
                 merged.append({"role": "assistant", "content": "(Previous tool turn was cancelled.)"})
             if (
                 merged
@@ -375,7 +410,8 @@ class LlamaServerRuntimeBase:
             )
 
         messages = req.get("messages") or []
-        tools = req.get("tools") or []
+        raw_tools = req.get("tools") or []
+        tools = normalize_tools_for_jinja(raw_tools) if raw_tools else []
         temperature = req.get("temperature", 0.7)
         max_tokens = req.get("max_tokens") or 4096
 
@@ -391,19 +427,33 @@ class LlamaServerRuntimeBase:
         try:
             yield from self._stream_once(payload)
         except httpx.HTTPStatusError as exc:
-            if tools and exc.response.status_code in (400, 500):
-                # Fallback when a GGUF's embedded Jinja template rejects OpenAI `tools`
-                fallback_payload: dict[str, Any] = {
-                    "messages": self._prepare_messages(messages, inject_tools=tools),
-                    "stream": True,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                try:
-                    yield from self._stream_once(fallback_payload)
-                    return
-                except Exception as fb_exc:
-                    raise RuntimeError(f"llama-server fallback streaming failed: {fb_exc}") from fb_exc
+            if exc.response.status_code in (400, 500):
+                # Retry once with deserialized tool_call arguments for templates using `|items`.
+                if tools:
+                    try:
+                        dict_args_payload: dict[str, Any] = {
+                            "messages": self._prepare_messages(messages, deserialize_args=True),
+                            "stream": True,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens,
+                            "tools": tools,
+                        }
+                        yield from self._stream_once(dict_args_payload)
+                        return
+                    except httpx.HTTPStatusError:
+                        pass
+                    # Final fallback when a GGUF's embedded Jinja template rejects OpenAI `tools`
+                    fallback_payload: dict[str, Any] = {
+                        "messages": self._prepare_messages(messages, inject_tools=tools),
+                        "stream": True,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+                    try:
+                        yield from self._stream_once(fallback_payload)
+                        return
+                    except Exception as fb_exc:
+                        raise RuntimeError(f"llama-server fallback streaming failed: {fb_exc}") from fb_exc
             raise RuntimeError(f"llama-server streaming failed: {exc}") from exc
         except Exception as exc:
             raise RuntimeError(f"llama-server streaming failed: {exc}") from exc

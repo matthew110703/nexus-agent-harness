@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from models.base import select_torch_dtype
-from models.language.common import deserialize_tool_call_arguments, normalize_tools_for_jinja
+from models.language.common import (
+    deserialize_tool_call_arguments,
+    enable_cuda_fast_math,
+    make_cancel_stopping_criteria,
+    normalize_tools_for_jinja,
+    resolve_stop_token_ids,
+)
 
 
 class GptOssLanguageModel:
@@ -36,6 +42,7 @@ class GptOssLanguageModel:
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
         from models.language.quantization import resolve_quantization_config
 
+        enable_cuda_fast_math(torch)
         total_size = sum(p.stat().st_size for p in self.model_path.glob("*.safetensors"))
         q_cfg, dtype = resolve_quantization_config(torch, model_size_bytes=total_size)
 
@@ -45,11 +52,16 @@ class GptOssLanguageModel:
             "torch_dtype": dtype,
             "device_map": "auto" if torch.cuda.is_available() else None,
             "trust_remote_code": False,
+            "attn_implementation": "sdpa",
         }
         if q_cfg is not None:
             load_kwargs["quantization_config"] = q_cfg
 
-        self.model = AutoModelForCausalLM.from_pretrained(str(self.model_path), **load_kwargs)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(str(self.model_path), **load_kwargs)
+        except Exception:
+            load_kwargs.pop("attn_implementation", None)
+            self.model = AutoModelForCausalLM.from_pretrained(str(self.model_path), **load_kwargs)
         self.model.eval()
 
     def _format_prompt(
@@ -97,7 +109,7 @@ class GptOssLanguageModel:
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=False)
         temperature = float(req.get("temperature", 0.7))
         cancel_event = threading.Event()
-        from models.language.common import make_cancel_stopping_criteria
+        stop_ids = resolve_stop_token_ids(self.tokenizer, ("<|return|>", "<|call|>"))
 
         gen_kwargs: dict[str, Any] = {
             **inputs,
@@ -108,6 +120,8 @@ class GptOssLanguageModel:
             "temperature": max(0.01, temperature),
             "top_p": float(req.get("top_p", 0.9)),
         }
+        if stop_ids is not None:
+            gen_kwargs["eos_token_id"] = stop_ids
 
         exc_holder: list[BaseException] = []
 

@@ -44,6 +44,7 @@ export const NEXUS_UI_COPY = {
   'panel.closeAria': 'Close Nexus runtime panel',
   'panel.languageModel': 'Language model',
   'panel.imageGenerator': 'Image generator',
+  'panel.coResident': 'Co-resident',
   'panel.gpuMemory': 'GPU memory',
   'panel.lockedNote': 'Models are locked by Colab startup. Edit Section 3 in Colab to change models.',
   'panel.progress': 'Progress',

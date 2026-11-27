@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from models.base import select_torch_dtype
-from models.language.common import extract_vlm_messages_and_images
+from models.language.common import (
+    deserialize_tool_call_arguments,
+    enable_cuda_fast_math,
+    extract_vlm_messages_and_images,
+    make_cancel_stopping_criteria,
+    normalize_tools_for_jinja,
+    resolve_stop_token_ids,
+)
 
 
 class Qwen3VLLanguageModel:
@@ -35,22 +42,29 @@ class Qwen3VLLanguageModel:
         import torch  # type: ignore[import-not-found]
         from transformers import AutoModelForImageTextToText, AutoProcessor  # type: ignore[import-not-found]
 
+        enable_cuda_fast_math(torch)
         dtype = select_torch_dtype(torch, precision)
         self.processor = AutoProcessor.from_pretrained(str(self.model_path), local_files_only=True)
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            str(self.model_path),
-            local_files_only=True,
-            torch_dtype=dtype,
-            device_map="auto" if torch.cuda.is_available() else None,
-        )
+        load_kwargs: dict[str, Any] = {
+            "local_files_only": True,
+            "torch_dtype": dtype,
+            "device_map": "auto" if torch.cuda.is_available() else None,
+            "attn_implementation": "sdpa",
+        }
+        try:
+            self.model = AutoModelForImageTextToText.from_pretrained(str(self.model_path), **load_kwargs)
+        except Exception:
+            load_kwargs.pop("attn_implementation", None)
+            self.model = AutoModelForImageTextToText.from_pretrained(str(self.model_path), **load_kwargs)
         self.model.eval()
 
     def _format_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str:
+        prepared = deserialize_tool_call_arguments(messages)
         kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
         if tools:
-            kwargs["tools"] = tools
-        return str(self.tokenizer.apply_chat_template(messages, **kwargs))
+            kwargs["tools"] = normalize_tools_for_jinja(tools)
+        return str(self.tokenizer.apply_chat_template(prepared, **kwargs))
 
     def generate_stream(self, req: dict[str, Any]) -> Iterator[str]:
         import torch  # type: ignore[import-not-found]

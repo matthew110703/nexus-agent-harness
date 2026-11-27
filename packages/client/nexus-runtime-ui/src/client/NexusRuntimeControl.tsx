@@ -53,8 +53,13 @@ export interface NexusWorkerPayload {
   readonly alive: boolean
   readonly active_kind?: 'language' | 'image' | null
   readonly active_model_id?: string | null
+  readonly active_language_id?: string | null
+  readonly active_image_id?: string | null
+  readonly co_resident?: boolean
   readonly cuda_allocated_bytes?: number
   readonly cuda_reserved_bytes?: number
+  readonly device_total_vram_bytes?: number
+  readonly device_used_vram_bytes?: number
   readonly last_error?: string | null
 }
 
@@ -136,11 +141,14 @@ function formatGpuMemory(runtime: NexusRuntimePayload | null): string {
   const hw = runtime?.hardware
   if (!hw) return tNexus('state.checking')
   if (!hw.cuda_available || !hw.total_vram_bytes) return tNexus('state.cpuOnly')
-  const total = hw.total_vram_bytes
+  const total = runtime.worker?.device_total_vram_bytes || hw.total_vram_bytes
+  const deviceUsed = runtime.worker?.alive ? (runtime.worker.device_used_vram_bytes ?? 0) : 0
   const allocated = runtime.worker?.alive ? (runtime.worker.cuda_allocated_bytes ?? 0) : 0
-  const used = allocated > 0
-    ? allocated
-    : Math.max(0, total - (hw.free_vram_bytes ?? total))
+  const used = deviceUsed > 0
+    ? deviceUsed
+    : allocated > 0
+      ? allocated
+      : Math.max(0, total - (hw.free_vram_bytes ?? total))
   const gpuName = hw.gpus?.[0]?.name
   const memText = `${formatGb(used)} / ${formatGb(total)}`
   return gpuName ? `${gpuName} · ${memText}` : memText
@@ -423,6 +431,7 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
             <span className={css.label}>{tNexus('panel.imageGenerator')}</span>
             <span className={css.value} title={imgInfo?.id ?? tNexus('state.disabled')}>
               {imgFullName ?? tNexus('state.disabled')}
+              {runtime?.worker?.co_resident ? ` · ${tNexus('panel.coResident')}` : ''}
             </span>
           </div>
           <div className={css.row}>

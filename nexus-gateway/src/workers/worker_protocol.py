@@ -1,4 +1,4 @@
-"""Typed protocol messages between Nexus Gateway API and the isolated GPU model worker (v1.1.0)."""
+"""Typed protocol messages between Nexus Gateway API and the isolated GPU model worker (v2.1.0)."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ class WorkerLoadRequest:
     implementation: str
     architecture: str = "unknown"
     precision: Optional[str] = None
+    keep_other_slot: bool = False
+    runtime_options: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -62,8 +64,14 @@ class WorkerStatus:
     alive: bool
     active_kind: Optional[WorkerKind] = None
     active_model_id: Optional[str] = None
+    active_language_id: Optional[str] = None
+    active_image_id: Optional[str] = None
+    co_resident: bool = False
     cuda_allocated_bytes: int = 0
     cuda_reserved_bytes: int = 0
+    device_total_vram_bytes: int = 0
+    device_free_vram_bytes: int = 0
+    device_used_vram_bytes: int = 0
     last_error: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
