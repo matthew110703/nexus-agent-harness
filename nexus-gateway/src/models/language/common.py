@@ -21,6 +21,52 @@ def make_cancel_stopping_criteria(cancel_event: threading.Event) -> Any:
     return StoppingCriteriaList([_CancelEventCriteria()])
 
 
+def _ensure_schema_descriptions(node: Any) -> Any:
+    """Recursively ensure every JSON Schema object node has a `description` string for strict Jinja templates."""
+    if not isinstance(node, dict):
+        return node
+    out = dict(node)
+    if "description" not in out or out["description"] is None:
+        out["description"] = ""
+    props = out.get("properties")
+    if isinstance(props, dict):
+        out["properties"] = {k: _ensure_schema_descriptions(v) for k, v in props.items()}
+    if "items" in out:
+        out["items"] = _ensure_schema_descriptions(out["items"])
+    for key in ("anyOf", "oneOf", "allOf"):
+        if isinstance(out.get(key), list):
+            out[key] = [_ensure_schema_descriptions(v) for v in out[key]]
+    return out
+
+
+def normalize_tools_for_jinja(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure every OpenAI tool schema has `description`, `parameters.properties`, and `parameters.required`."""
+    normalized: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        t_copy = dict(tool)
+        fn = t_copy.get("function")
+        if isinstance(fn, dict):
+            fn_copy = dict(fn)
+            if "description" not in fn_copy or fn_copy["description"] is None:
+                fn_copy["description"] = ""
+            params = fn_copy.get("parameters")
+            if isinstance(params, dict):
+                p_copy = _ensure_schema_descriptions(params)
+                p_copy.setdefault("type", "object")
+                p_copy.setdefault("properties", {})
+                p_copy.setdefault("required", [])
+                fn_copy["parameters"] = p_copy
+            else:
+                fn_copy["parameters"] = {"type": "object", "properties": {}, "required": [], "description": ""}
+            t_copy["function"] = fn_copy
+        elif "description" not in t_copy or t_copy["description"] is None:
+            t_copy["description"] = ""
+        normalized.append(t_copy)
+    return normalized
+
+
 def decode_vlm_image_url(url: str) -> Any:
     """
     Decode an authorized `data:` base64 image URL into a PIL RGB image.

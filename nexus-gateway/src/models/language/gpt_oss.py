@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from models.base import select_torch_dtype
-from models.language.common import deserialize_tool_call_arguments
+from models.language.common import deserialize_tool_call_arguments, normalize_tools_for_jinja
 
 
 class GptOssLanguageModel:
@@ -75,7 +75,7 @@ class GptOssLanguageModel:
             "reasoning_effort": reasoning_effort or "medium",
         }
         if tools:
-            kwargs["tools"] = tools
+            kwargs["tools"] = normalize_tools_for_jinja(tools)
         return str(self.tokenizer.apply_chat_template(flat_messages, **kwargs))
 
     def generate_stream(self, req: dict[str, Any]) -> Iterator[str]:
