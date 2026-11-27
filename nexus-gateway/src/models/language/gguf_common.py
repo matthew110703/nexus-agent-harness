@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -13,6 +14,12 @@ from typing import Any, Iterator, Optional
 import httpx
 
 from models.base import GenerationCancelledError
+
+
+def _pick_free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def find_llama_server_binary() -> str:
@@ -60,8 +67,8 @@ class LlamaServerRuntimeBase:
         *,
         model_id: str,
         model_path: Path,
-        port: int = 8081,
-        n_ctx: int = 32768,
+        port: int = 0,
+        n_ctx: int = 16384,
         n_gpu_layers: int = 999,
         extra_args: Optional[list[str]] = None,
         merge_consecutive_roles: bool = False,
@@ -75,7 +82,9 @@ class LlamaServerRuntimeBase:
         self.merge_consecutive_roles = merge_consecutive_roles
         self.has_mmproj = find_mmproj_file(model_path) is not None
         self.process: Optional[subprocess.Popen[Any]] = None
-        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._active_port = port or 0
+        self._log_path: Optional[Path] = None
+        self.base_url = f"http://127.0.0.1:{self._active_port}" if self._active_port else ""
 
     def is_ready(self) -> bool:
         if self.process is None or self.process.poll() is not None:
@@ -90,16 +99,23 @@ class LlamaServerRuntimeBase:
     def start(self) -> None:
         if self.is_ready():
             return
+        self.stop()
         binary = find_llama_server_binary()
         gguf_path = find_primary_gguf_file(self.model_path)
         mmproj_path = find_mmproj_file(self.model_path)
+
+        self._active_port = self.port if self.port > 0 else _pick_free_loopback_port()
+        self.base_url = f"http://127.0.0.1:{self._active_port}"
 
         cmd = [
             binary,
             "-m", str(gguf_path),
             "-c", str(self.n_ctx),
             "-ngl", str(self.n_gpu_layers),
-            "--port", str(self.port),
+            "-fa", "on",
+            "-ctk", "q8_0",
+            "-ctv", "q8_0",
+            "--port", str(self._active_port),
             "--host", "127.0.0.1",
             "--jinja",
         ]
@@ -119,6 +135,7 @@ class LlamaServerRuntimeBase:
         env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
 
         log_path = Path("/content/nexus-llama-server.log") if Path("/content").is_dir() else Path("nexus-llama-server.log")
+        self._log_path = log_path
         self._log_file = open(log_path, "w", encoding="utf-8")
         self.process = subprocess.Popen(
             cmd,
@@ -310,7 +327,16 @@ class LlamaServerRuntimeBase:
 
     def generate_chat_stream(self, req: dict[str, Any]) -> Iterator[str]:
         if not self.is_ready():
-            raise RuntimeError(f"llama-server ({self.model_id}) is not running or not healthy")
+            rc = self.process.poll() if self.process is not None else "no-process"
+            tail = ""
+            if self._log_path is not None and self._log_path.is_file():
+                try:
+                    tail = self._log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"llama-server ({self.model_id}) is not running or not healthy (rc={rc}, port={self._active_port}):\n{tail}"
+            )
 
         messages = req.get("messages") or []
         tools = req.get("tools") or []

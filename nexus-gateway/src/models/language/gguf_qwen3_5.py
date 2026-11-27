@@ -19,7 +19,7 @@ class GgufQwen35Model:
         model_id: str,
         model_path: Path,
         architecture: str = "gguf",
-        port: int = 8081,
+        port: int = 0,
     ) -> None:
         self.model_id = model_id
         self.model_path = model_path

@@ -19,7 +19,7 @@ class GgufGemma4Model:
         model_id: str,
         model_path: Path,
         architecture: str = "gguf",
-        port: int = 8081,
+        port: int = 0,
     ) -> None:
         self.model_id = model_id
         self.model_path = model_path
@@ -29,7 +29,7 @@ class GgufGemma4Model:
             model_id=model_id,
             model_path=model_path,
             port=port,
-            n_ctx=32768,
+            n_ctx=16384,
             n_gpu_layers=999,
             merge_consecutive_roles=True,
         )
