@@ -167,9 +167,10 @@ export function createNexusGenerateImageTool(
       const timeoutSignal = AbortSignal.timeout(config.imageTimeoutMs)
       const signal = AbortSignal.any([exec.signal, timeoutSignal])
       let rawWorkspace = ''
-      if (exec.agent !== undefined && 'workingDirectory' in ctx && typeof ctx.workingDirectory?.ensure === 'function') {
+      const workingDir = ctx.get('workingDirectory')
+      if (exec.agent !== undefined && workingDir !== undefined) {
         try {
-          rawWorkspace = await ctx.workingDirectory.ensure(exec.agent, exec.signal)
+          rawWorkspace = await workingDir.ensure(exec.agent, exec.signal)
         } catch {
           rawWorkspace = ''
         }
