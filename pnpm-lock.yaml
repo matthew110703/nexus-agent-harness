@@ -3901,6 +3901,9 @@ importers:
       '@deepseek-ai/dsh-api-session-controller':
         specifier: workspace:*
         version: link:../../api/session-controller
+      '@deepseek-ai/dsh-attachment':
+        specifier: workspace:*
+        version: link:../../attachment/attachment
       '@deepseek-ai/dsh-client-store':
         specifier: workspace:*
         version: link:../store
@@ -3916,6 +3919,9 @@ importers:
       '@deepseek-ai/dsh-client-ui-slots':
         specifier: workspace:*
         version: link:../ui-slots
+      '@deepseek-ai/dsh-client-ui-tool':
+        specifier: workspace:*
+        version: link:../ui-tool
       '@deepseek-ai/dsh-session':
         specifier: workspace:*
         version: link:../../core/session

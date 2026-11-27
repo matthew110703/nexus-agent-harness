@@ -24,6 +24,27 @@ Only call tools when needed. When providing the final answer, do not use the too
 """
 
 
+def extract_text_content(content: Any) -> str:
+    """Safely flatten OpenAI string or structured content-block lists into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif isinstance(block.get("content"), str):
+                    parts.append(block["content"])
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
 def build_tools_instruction(tools: list[dict[str, Any]]) -> str:
     """Generate system prompt instructions explaining tool calling."""
     if not tools:
@@ -40,39 +61,46 @@ def inject_tools_into_messages(
 ) -> list[dict[str, Any]]:
     """
     Inject tool definitions into system prompt (or first user message if system not supported).
-    Ensures messages adhere to model role constraints (e.g. strict user/model alternation for Gemma 3).
+    Flattens structured content arrays to plain text and enforces strict alternation when requested.
     """
+    normalized: list[dict[str, Any]] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        copied = dict(m)
+        copied["content"] = extract_text_content(copied.get("content"))
+        normalized.append(copied)
+
     if not tools:
-        return _format_roles(messages, strict_alternation=strict_alternation)
+        return _format_roles(normalized, strict_alternation=strict_alternation)
 
     tool_instr = build_tools_instruction(tools)
     out: list[dict[str, Any]] = []
-    has_system = any(m.get("role") == "system" for m in messages)
+    has_system = any(m.get("role") == "system" for m in normalized)
 
-    if has_system:
-        for m in messages:
-            if m.get("role") == "system":
+    if has_system and not strict_alternation:
+        injected = False
+        for m in normalized:
+            if m.get("role") == "system" and not injected:
                 orig = m.get("content") or ""
                 merged = f"{orig}\n\n{tool_instr}".strip()
                 out.append({"role": "system", "content": merged})
+                injected = True
             else:
                 out.append(dict(m))
-    else:
-        # Prepend system or attach to first user message
-        if strict_alternation:
-            # Gemma models often dislike 'system' role
-            if messages and messages[0].get("role") == "user":
-                first = dict(messages[0])
-                first_content = first.get("content") or ""
-                first["content"] = f"{tool_instr}\n\n{first_content}".strip()
-                out.append(first)
-                out.extend(dict(m) for m in messages[1:])
-            else:
-                out.append({"role": "user", "content": tool_instr})
-                out.extend(dict(m) for m in messages)
+    elif strict_alternation:
+        # Gemma models prefer system/tool instructions folded into the first user turn
+        if normalized and normalized[0].get("role") == "user":
+            first = dict(normalized[0])
+            first["content"] = f"{tool_instr}\n\n{first.get('content') or ''}".strip()
+            out.append(first)
+            out.extend(dict(m) for m in normalized[1:])
         else:
-            out.append({"role": "system", "content": tool_instr})
-            out.extend(dict(m) for m in messages)
+            out.append({"role": "user", "content": tool_instr})
+            out.extend(dict(m) for m in normalized)
+    else:
+        out.append({"role": "system", "content": tool_instr})
+        out.extend(dict(m) for m in normalized)
 
     return _format_roles(out, strict_alternation=strict_alternation)
 
@@ -88,45 +116,38 @@ def _format_roles(messages: list[dict[str, Any]], *, strict_alternation: bool = 
 
     for m in messages:
         role = "model" if m.get("role") in ("assistant", "model") else "user"
-        content = str(m.get("content") or "")
-        # If tool_calls exist on assistant, stringify them
+        content = extract_text_content(m.get("content"))
+        if m.get("role") == "tool" and content:
+            content = f"[Tool Result]\n{content}"
         if m.get("tool_calls"):
-            content += f"\n```json\n{json.dumps(m['tool_calls'], indent=2)}\n```"
+            content = f"{content}\n```json\n{json.dumps(m['tool_calls'], indent=2)}\n```".strip()
 
         if role == current_role:
             accumulated_content.append(content)
         else:
             if current_role is not None:
-                formatted.append({"role": current_role, "content": "\n\n".join(accumulated_content)})
+                formatted.append({"role": current_role, "content": "\n\n".join(p for p in accumulated_content if p)})
             current_role = role
             accumulated_content = [content]
 
     if current_role is not None and accumulated_content:
-        formatted.append({"role": current_role, "content": "\n\n".join(accumulated_content)})
+        formatted.append({"role": current_role, "content": "\n\n".join(p for p in accumulated_content if p)})
 
     return formatted
 
 
 def parse_prompt_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """
-    Detect tool call JSON blocks from generated text:
-    ```json
-    { "name": ..., "arguments": ... }
-    ```
-    Returns: (cleaned_text, tool_calls_list).
-    """
+    """Detect fenced JSON tool call blocks from generated text."""
     tool_calls: list[dict[str, Any]] = []
     cleaned = text
 
     pattern = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
-    matches = list(pattern.finditer(text))
-
-    for m in matches:
+    for m in pattern.finditer(text):
         raw_json = m.group(1)
         try:
             parsed = json.loads(raw_json)
             if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
-                call_id = f"call_{len(tool_calls)+1}"
+                call_id = f"call_{len(tool_calls) + 1}"
                 args = parsed["arguments"]
                 args_str = json.dumps(args) if isinstance(args, dict) else str(args)
                 tool_calls.append({

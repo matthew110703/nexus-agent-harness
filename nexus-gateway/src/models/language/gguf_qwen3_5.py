@@ -28,7 +28,7 @@ class GgufQwen35Model:
             model_id=model_id,
             model_path=model_path,
             port=port,
-            n_ctx=32768,
+            n_ctx=16384,
             n_gpu_layers=999,
         )
 

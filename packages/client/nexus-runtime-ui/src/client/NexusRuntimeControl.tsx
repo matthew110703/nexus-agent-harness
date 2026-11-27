@@ -6,6 +6,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { resolveCompactModelName, resolveModelDisplayName } from './displayName.ts'
+import { tNexus, type NexusCopyKey } from './locales.ts'
+import {
+  getNotificationPermission,
+  notifyUnfocusedCompletion,
+  readNotifyPrefs,
+  requestNotificationPermission,
+  writeNotifyPrefs,
+  type NexusNotifyPrefs,
+} from './notifications.ts'
 import css from './NexusRuntimeControl.module.css'
 
 /** Structured error thrown by Host proxy calls. */
@@ -98,24 +107,25 @@ interface PopoverCoords {
   readonly right: number
 }
 
-const PHASE_LABELS: Record<string, string> = {
-  resolving: 'Resolving model',
-  processor_init: 'Loading tokenizer & processor',
-  weight_loading: 'Loading model weights',
-  placement: 'Verifying GPU placement',
-  ready: 'Ready',
-  generating: 'Generating response',
-  swapping_to_image: 'Swapping GPU to image model',
-  denoising: 'Generating image',
-  saving: 'Saving image to Drive',
-  restoring_language_model: 'Restoring language model',
+const PHASE_COPY_KEYS: Record<string, NexusCopyKey> = {
+  resolving: 'phase.resolving',
+  processor_init: 'phase.tokenizer',
+  weight_loading: 'phase.weightLoading',
+  placement: 'phase.placement',
+  ready: 'phase.ready',
+  generating: 'phase.generating',
+  swapping_to_image: 'phase.swappingToImage',
+  denoising: 'phase.denoising',
+  saving: 'phase.saving',
+  restoring_language_model: 'phase.restoringLanguage',
 }
 
 function formatPhaseLabel(op: NexusOperationRecord): string {
   if (op.phase === 'denoising' && op.steps_total && op.steps_total > 0) {
-    return `Denoising step ${op.step ?? 0}/${op.steps_total}`
+    return tNexus('phase.denoisingStep', { step: op.step ?? 0, total: op.steps_total })
   }
-  return PHASE_LABELS[op.phase] ?? op.phase
+  const key = PHASE_COPY_KEYS[op.phase]
+  return key ? tNexus(key) : op.phase
 }
 
 function formatGb(bytes: number): string {
@@ -124,8 +134,8 @@ function formatGb(bytes: number): string {
 
 function formatGpuMemory(runtime: NexusRuntimePayload | null): string {
   const hw = runtime?.hardware
-  if (!hw) return 'Checking…'
-  if (!hw.cuda_available || !hw.total_vram_bytes) return 'CPU only'
+  if (!hw) return tNexus('state.checking')
+  if (!hw.cuda_available || !hw.total_vram_bytes) return tNexus('state.cpuOnly')
   const total = hw.total_vram_bytes
   const allocated = runtime.worker?.alive ? (runtime.worker.cuda_allocated_bytes ?? 0) : 0
   const used = allocated > 0
@@ -157,12 +167,35 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
   const [runtime, setRuntime] = useState<NexusRuntimePayload | null>(null)
   const [progressSnap, setProgressSnap] = useState<NexusProgressSnapshot | null>(null)
   const [statusError, setStatusError] = useState<string | null>(null)
+  const [notifyPrefs, setNotifyPrefs] = useState<NexusNotifyPrefs>(() => readNotifyPrefs())
+  const [notifyPerm, setNotifyPerm] = useState<NotificationPermission | 'unsupported'>(() => getNotificationPermission())
 
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const popoverRef = useRef<HTMLDivElement | null>(null)
   const pollInFlightRef = useRef(false)
   const mountedRef = useRef(true)
   const activeAbortRef = useRef<AbortController | null>(null)
+  const prevChatOpRef = useRef<{ id: string; status: string } | null>(null)
+  const prevDiffOpRef = useRef<{ id: string; status: string } | null>(null)
+  const notifyPrefsRef = useRef<NexusNotifyPrefs>(notifyPrefs)
+  notifyPrefsRef.current = notifyPrefs
+
+  const handleToggleNotify = useCallback(async () => {
+    const nextEnabled = !notifyPrefs.enabled
+    if (nextEnabled) {
+      const perm = await requestNotificationPermission()
+      setNotifyPerm(perm)
+    }
+    const next: NexusNotifyPrefs = { ...notifyPrefs, enabled: nextEnabled }
+    setNotifyPrefs(next)
+    writeNotifyPrefs(next)
+  }, [notifyPrefs])
+
+  const handleToggleSound = useCallback(() => {
+    const next: NexusNotifyPrefs = { ...notifyPrefs, sound: !notifyPrefs.sound }
+    setNotifyPrefs(next)
+    writeNotifyPrefs(next)
+  }, [notifyPrefs])
 
   useEffect(() => {
     mountedRef.current = true
@@ -200,7 +233,48 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
       }
 
       if (progResult.status === 'fulfilled') {
-        setProgressSnap(progResult.value)
+        const snap = progResult.value
+        setProgressSnap(snap)
+
+        const chatOp = snap.chat ?? null
+        if (chatOp) {
+          const prev = prevChatOpRef.current
+          if (
+            prev !== null
+            && prev.id === chatOp.operation_id
+            && (prev.status === 'running' || prev.status === 'queued')
+            && (chatOp.status === 'completed' || chatOp.status === 'failed')
+          ) {
+            const label = resolveCompactModelName(chatOp.model, null)
+            notifyUnfocusedCompletion({
+              title: chatOp.status === 'completed'
+                ? tNexus('notify.chatReadyTitle', { model: label })
+                : tNexus('notify.chatFailedTitle', { model: label }),
+              body: tNexus('notify.chatReadyBody'),
+              prefs: notifyPrefsRef.current,
+            })
+          }
+          prevChatOpRef.current = { id: chatOp.operation_id, status: chatOp.status }
+        }
+
+        const diffOp = snap.diffusion ?? null
+        if (diffOp) {
+          const prev = prevDiffOpRef.current
+          if (
+            prev !== null
+            && prev.id === diffOp.operation_id
+            && (prev.status === 'running' || prev.status === 'queued')
+            && diffOp.status === 'completed'
+          ) {
+            const label = resolveCompactModelName(diffOp.model, null)
+            notifyUnfocusedCompletion({
+              title: tNexus('notify.imageReadyTitle', { model: label }),
+              body: tNexus('notify.imageReadyBody'),
+              prefs: notifyPrefsRef.current,
+            })
+          }
+          prevDiffOpRef.current = { id: diffOp.operation_id, status: diffOp.status }
+        }
       }
     } finally {
       pollInFlightRef.current = false
@@ -267,42 +341,47 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
   const isReady = Boolean(runtime?.ready && runtime.worker?.alive)
   const isSwapping = Boolean(runtime?.swapping)
 
-  let badgeText = 'Runtime off'
+  let badgeText = tNexus('state.runtimeOff')
   let dotClass = ''
   if (activeOp) {
     dotClass = css.dotRunning ?? ''
     if (activeOp.phase === 'restoring_language_model') {
-      badgeText = langCompactName ? `Restoring · ${langCompactName}` : 'Restoring model'
+      badgeText = langCompactName
+        ? tNexus('badge.restoringNamed', { model: langCompactName })
+        : tNexus('badge.restoringModel')
     } else if (activeOp.phase === 'swapping_to_image') {
-      badgeText = 'Swapping GPU'
+      badgeText = tNexus('state.swappingGpu')
     } else if (activeOp.kind === 'image_generation' || activeOp.phase === 'denoising') {
-      const pct = !activeOp.indeterminate && activeOp.progress > 0 ? ` · ${Math.round(activeOp.progress)}%` : ''
-      badgeText = `Generating${pct}`
+      badgeText = !activeOp.indeterminate && activeOp.progress > 0
+        ? tNexus('badge.generatingPct', { pct: Math.round(activeOp.progress) })
+        : tNexus('badge.generating')
     } else if (activeOp.kind === 'chat_generation') {
-      badgeText = 'Generating'
+      badgeText = tNexus('badge.generating')
     } else {
-      badgeText = langCompactName ? `Loading · ${langCompactName}` : 'Loading'
+      badgeText = langCompactName
+        ? tNexus('badge.loadingNamed', { model: langCompactName })
+        : tNexus('badge.loading')
     }
   } else if (isSwapping) {
     dotClass = css.dotRunning ?? ''
-    badgeText = 'Swapping GPU'
+    badgeText = tNexus('state.swappingGpu')
   } else if (statusError || runtime?.state === 'degraded') {
     dotClass = css.dotError ?? ''
-    badgeText = 'Runtime error'
+    badgeText = tNexus('badge.runtimeError')
   } else if (isReady && langCompactName) {
     dotClass = css.dotReady ?? ''
-    badgeText = `Ready · ${langCompactName}`
+    badgeText = tNexus('badge.readyNamed', { model: langCompactName })
   }
 
   const runtimeStateText = isSwapping
-    ? 'Swapping GPU'
+    ? tNexus('state.swappingGpu')
     : activeOp
       ? formatPhaseLabel(activeOp)
       : isReady
-        ? 'Ready'
+        ? tNexus('state.ready')
         : runtime?.state === 'degraded'
-          ? 'Degraded'
-          : 'Not loaded'
+          ? tNexus('state.degraded')
+          : tNexus('state.notLoaded')
 
   const gpuMemoryText = formatGpuMemory(runtime)
 
@@ -312,12 +391,12 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
         ref={popoverRef}
         className={css.popover}
         role="dialog"
-        aria-label="Nexus runtime"
+        aria-label={tNexus('panel.ariaLabel')}
         style={{ bottom: `${coords.bottom}px`, right: `${coords.right}px` }}
       >
         <div className={css.header}>
           <div className={css.headerLeft}>
-            <span className={css.title}>Nexus runtime</span>
+            <span className={css.title}>{tNexus('panel.title')}</span>
             <span className={css.statePill}>
               <span className={`${css.dot} ${dotClass}`} />
               {runtimeStateText}
@@ -327,7 +406,7 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
             type="button"
             className={css.closeBtn}
             onClick={() => { closePopover(true) }}
-            aria-label="Close Nexus runtime panel"
+            aria-label={tNexus('panel.closeAria')}
           >
             ✕
           </button>
@@ -335,32 +414,59 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
 
         <div className={css.section}>
           <div className={css.row}>
-            <span className={css.label}>Language model</span>
-            <span className={css.value} title={langInfo?.id ?? 'Unavailable'}>
-              {langFullName ?? 'Unavailable'}
+            <span className={css.label}>{tNexus('panel.languageModel')}</span>
+            <span className={css.value} title={langInfo?.id ?? tNexus('state.unavailable')}>
+              {langFullName ?? tNexus('state.unavailable')}
             </span>
           </div>
           <div className={css.row}>
-            <span className={css.label}>Image generator</span>
-            <span className={css.value} title={imgInfo?.id ?? 'Disabled'}>
-              {imgFullName ?? 'Disabled'}
+            <span className={css.label}>{tNexus('panel.imageGenerator')}</span>
+            <span className={css.value} title={imgInfo?.id ?? tNexus('state.disabled')}>
+              {imgFullName ?? tNexus('state.disabled')}
             </span>
           </div>
           <div className={css.row}>
-            <span className={css.label}>GPU memory</span>
+            <span className={css.label}>{tNexus('panel.gpuMemory')}</span>
             <span className={css.value} title={gpuMemoryText}>
               {gpuMemoryText}
             </span>
           </div>
+          <div className={css.row}>
+            <span className={css.label}>{tNexus('notify.section')}</span>
+            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+              <button
+                type="button"
+                className={css.statePill}
+                onClick={() => { void handleToggleNotify() }}
+                style={{ cursor: 'pointer', border: 'none' }}
+              >
+                {notifyPerm === 'denied'
+                  ? tNexus('notify.denied')
+                  : notifyPrefs.enabled
+                    ? tNexus('notify.enabled')
+                    : tNexus('notify.enable')}
+              </button>
+              {notifyPrefs.enabled ? (
+                <button
+                  type="button"
+                  className={css.statePill}
+                  onClick={handleToggleSound}
+                  style={{ cursor: 'pointer', border: 'none', opacity: notifyPrefs.sound ? 1 : 0.5 }}
+                >
+                  {tNexus('notify.sound')}
+                </button>
+              ) : null}
+            </div>
+          </div>
           <div className={css.helper}>
-            Models are locked by Colab startup. Edit Section 3 in Colab to change models.
+            {tNexus('panel.lockedNote')}
           </div>
         </div>
 
         {activeOp && (
           <div className={css.section} data-section="active-operation">
             <div className={css.row}>
-              <span className={css.label}>Progress</span>
+              <span className={css.label}>{tNexus('panel.progress')}</span>
               <span className={css.value}>
                 {formatPhaseLabel(activeOp)}
                 {!activeOp.indeterminate && activeOp.progress > 0 ? ` · ${Math.round(activeOp.progress)}%` : ''}
@@ -399,7 +505,7 @@ export function NexusRuntimeControl(props: NexusRuntimeControlProps) {
         onClick={() => { setOpen(prev => !prev) }}
         aria-expanded={open}
         aria-haspopup="dialog"
-        title={langInfo ? `Locked model: ${langInfo.id}` : 'Nexus runtime'}
+        title={langInfo ? tNexus('panel.lockedTooltip', { model: langInfo.id }) : tNexus('panel.title')}
       >
         <span className={`${css.dot} ${dotClass}`} />
         <span className={css.triggerLabel}>{badgeText}</span>

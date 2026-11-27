@@ -7,6 +7,9 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
+import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
+import { tNexus } from './locales.ts'
+import { NexusImageToolRow } from './NexusImageToolRow.tsx'
 import {
   NexusApiError,
   NexusRuntimeControl,
@@ -15,7 +18,18 @@ import {
 } from './NexusRuntimeControl.tsx'
 
 export { NexusApiError, NexusRuntimeControl } from './NexusRuntimeControl.tsx'
+export { NexusImageToolRow } from './NexusImageToolRow.tsx'
 export { resolveCompactModelName, resolveModelDisplayName } from './displayName.ts'
+export {
+  getNotificationPermission,
+  isTabUnfocused,
+  notifyUnfocusedCompletion,
+  playCompletionChime,
+  readNotifyPrefs,
+  requestNotificationPermission,
+  writeNotifyPrefs,
+  type NexusNotifyPrefs,
+} from './notifications.ts'
 export type {
   NexusHardwarePayload,
   NexusLockedModelInfo,
@@ -32,7 +46,7 @@ export const inject = ['slots']
 async function readJsonOrThrow<T>(response: Response): Promise<T> {
   const text = await response.text()
   if (!response.ok) {
-    let message = `Request failed (HTTP ${response.status})`
+    let message = tNexus('error.requestFailed', { status: response.status })
     let operationId: string | undefined
     let details: string | undefined
     try {
@@ -85,5 +99,10 @@ export function apply(ctx: ClientContext): void {
         },
       }),
     }, NexusRuntimeControl))
+
+    scope.slots.inject('tool.call.toolview', () => scope.slots.register({
+      name: 'tool.call.toolview',
+      key: 'nexus_generate_image',
+    }, NexusImageToolRow))
   })
 }

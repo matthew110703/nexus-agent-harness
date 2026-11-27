@@ -75,10 +75,13 @@ describe('NexusRuntimeControl (v1.1.0 read-only)', () => {
     expect(dialog.textContent).toContain('NVIDIA L4')
     expect(dialog.textContent).toContain('Models are locked by Colab startup')
 
-    // Strictly read-only: NO <select> dropdown and NO Load/Unload action buttons.
+    // Strictly read-only for models: NO <select> dropdown and NO Load/Unload/Switch buttons.
     expect(dialog.querySelector('select')).toBeNull()
     const dialogButtons = Array.from(dialog.querySelectorAll('button'))
-    expect(dialogButtons).toHaveLength(1) // Only the close button
+    expect(dialogButtons).toHaveLength(3) // Close button + Notifications toggle + Chime toggle
+    for (const btn of dialogButtons) {
+      expect(btn.textContent ?? '').not.toMatch(/load|switch|select/i)
+    }
 
     await act(async () => {
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))

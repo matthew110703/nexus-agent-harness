@@ -96,14 +96,17 @@ class LlamaServerRuntimeBase:
         except Exception:
             return False
 
-    def start(self) -> None:
-        if self.is_ready():
-            return
+    def _launch_with_flags(
+        self,
+        *,
+        binary: str,
+        gguf_path: Path,
+        mmproj_path: Optional[Path],
+        flag_set: list[str],
+        env: dict[str, str],
+        log_path: Path,
+    ) -> None:
         self.stop()
-        binary = find_llama_server_binary()
-        gguf_path = find_primary_gguf_file(self.model_path)
-        mmproj_path = find_mmproj_file(self.model_path)
-
         self._active_port = self.port if self.port > 0 else _pick_free_loopback_port()
         self.base_url = f"http://127.0.0.1:{self._active_port}"
 
@@ -112,9 +115,7 @@ class LlamaServerRuntimeBase:
             "-m", str(gguf_path),
             "-c", str(self.n_ctx),
             "-ngl", str(self.n_gpu_layers),
-            "-fa", "on",
-            "-ctk", "q8_0",
-            "-ctv", "q8_0",
+            *flag_set,
             "--port", str(self._active_port),
             "--host", "127.0.0.1",
             "--jinja",
@@ -123,18 +124,6 @@ class LlamaServerRuntimeBase:
             cmd.extend(["--mmproj", str(mmproj_path)])
         cmd.extend(self.extra_args)
 
-        env = os.environ.copy()
-        bin_dir = Path(binary).resolve().parent
-        lib_dirs = [str(bin_dir)]
-        install_root = Path("/content/llama-cpp-cuda")
-        if install_root.is_dir():
-            for so_file in install_root.rglob("*.so*"):
-                if so_file.is_file() and str(so_file.parent) not in lib_dirs:
-                    lib_dirs.append(str(so_file.parent))
-        cur_ld = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
-
-        log_path = Path("/content/nexus-llama-server.log") if Path("/content").is_dir() else Path("nexus-llama-server.log")
         self._log_path = log_path
         self._log_file = open(log_path, "w", encoding="utf-8")
         self.process = subprocess.Popen(
@@ -144,7 +133,6 @@ class LlamaServerRuntimeBase:
             env=env,
         )
 
-        # Wait for server health
         start_t = time.monotonic()
         while time.monotonic() - start_t < 180:
             if self.process.poll() is not None:
@@ -165,6 +153,50 @@ class LlamaServerRuntimeBase:
 
         self.stop()
         raise TimeoutError("llama-server failed to become healthy within 180s")
+
+    def start(self) -> None:
+        if self.is_ready():
+            return
+        binary = find_llama_server_binary()
+        gguf_path = find_primary_gguf_file(self.model_path)
+        mmproj_path = find_mmproj_file(self.model_path)
+
+        env = os.environ.copy()
+        bin_dir = Path(binary).resolve().parent
+        lib_dirs = [str(bin_dir)]
+        install_root = Path("/content/llama-cpp-cuda")
+        if install_root.is_dir():
+            for so_file in install_root.rglob("*.so*"):
+                if so_file.is_file() and str(so_file.parent) not in lib_dirs:
+                    lib_dirs.append(str(so_file.parent))
+        cur_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
+        log_path = Path("/content/nexus-llama-server.log") if Path("/content").is_dir() else Path("nexus-llama-server.log")
+
+        # Try Flash Attention + Q8_0 KV cache first; fall back cleanly for hybrid architectures
+        # (e.g. Qwen 3.5 Gated DeltaNet GGUFs) that reject quantized KV cache or -fa flags.
+        flag_attempts = [
+            ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"],
+            ["-fa", "on"],
+            [],
+        ]
+        last_exc: Optional[Exception] = None
+        for flags in flag_attempts:
+            try:
+                self._launch_with_flags(
+                    binary=binary,
+                    gguf_path=gguf_path,
+                    mmproj_path=mmproj_path,
+                    flag_set=flags,
+                    env=env,
+                    log_path=log_path,
+                )
+                return
+            except RuntimeError as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
 
     def stop(self) -> None:
         if self.process is not None:

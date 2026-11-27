@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import gc
+import threading
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from models.language.prompt_tools import inject_tools_into_messages, parse_prompt_tool_calls
+from models.language.common import make_cancel_stopping_criteria
+from models.language.prompt_tools import inject_tools_into_messages
 from models.language.quantization import resolve_quantization_config
 
 
 class Gemma3LanguageModel:
-    """Dedicated runtime for Gemma 3 (Gemma-3-12B-IT)."""
+    """Dedicated runtime for Gemma 3 (`Gemma3ForConditionalGeneration`)."""
 
     implementation = "gemma3"
 
@@ -27,10 +29,9 @@ class Gemma3LanguageModel:
 
     def load(self, *, precision: Optional[str] = None) -> None:
         import torch  # type: ignore[import-not-found]
-        from transformers import AutoModelForCausalLM, AutoProcessor  # type: ignore[import-not-found]
+        from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor  # type: ignore[import-not-found]
 
         self.processor = AutoProcessor.from_pretrained(str(self.model_path), local_files_only=True)
-        # Compute size to decide 4-bit quantization on L4
         total_size = sum(p.stat().st_size for p in self.model_path.glob("*.safetensors"))
         q_cfg, dtype = resolve_quantization_config(torch, model_size_bytes=total_size)
 
@@ -42,21 +43,21 @@ class Gemma3LanguageModel:
         if q_cfg is not None:
             load_kwargs["quantization_config"] = q_cfg
 
-        self.model = AutoModelForCausalLM.from_pretrained(str(self.model_path), **load_kwargs)
+        try:
+            self.model = AutoModelForImageTextToText.from_pretrained(str(self.model_path), **load_kwargs)
+        except Exception:
+            self.model = AutoModelForCausalLM.from_pretrained(str(self.model_path), **load_kwargs)
         self.model.eval()
 
     def generate_stream(self, req: dict[str, Any]) -> Iterator[str]:
         import torch  # type: ignore[import-not-found]
         from transformers import TextIteratorStreamer  # type: ignore[import-not-found]
-        import threading
 
         if not self.is_ready():
             raise RuntimeError(f"Gemma3LanguageModel ({self.model_id}) is not loaded")
 
         messages = req.get("messages") or []
         tools = req.get("tools") or []
-
-        # Gemma requires strict user/model alternation and prompt tool injection
         prepared_messages = inject_tools_into_messages(messages, tools, strict_alternation=True)
 
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
@@ -66,28 +67,44 @@ class Gemma3LanguageModel:
             add_generation_prompt=True,
         )
 
-        inputs = tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        device = next(self.model.parameters()).device
+        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         cancel_event = threading.Event()
-        from models.language.common import make_cancel_stopping_criteria
-
-        gen_kwargs = {
+        temperature = float(req.get("temperature", 0.7))
+        gen_kwargs: dict[str, Any] = {
             **inputs,
             "streamer": streamer,
             "stopping_criteria": make_cancel_stopping_criteria(cancel_event),
-            "max_new_tokens": req.get("max_tokens") or 4096,
-            "temperature": req.get("temperature", 0.7),
-            "do_sample": True,
+            "max_new_tokens": int(req.get("max_tokens") or 4096),
+            "do_sample": temperature > 0,
+            "temperature": max(0.01, temperature),
+            "top_p": float(req.get("top_p", 0.9)),
         }
 
-        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs, daemon=True)
+        exc_holder: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                with torch.inference_mode():
+                    self.model.generate(**gen_kwargs)
+            except BaseException as exc:
+                exc_holder.append(exc)
+                streamer.end()
+
+        thread = threading.Thread(target=_run, daemon=True)
         thread.start()
         try:
             for chunk in streamer:
-                yield chunk
+                if chunk:
+                    yield str(chunk)
         finally:
             cancel_event.set()
             thread.join(timeout=5.0)
+        if exc_holder:
+            raise exc_holder[0]
 
     def unload(self) -> None:
         self.model = None
@@ -95,6 +112,7 @@ class Gemma3LanguageModel:
         gc.collect()
         try:
             import torch  # type: ignore[import-not-found]
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:

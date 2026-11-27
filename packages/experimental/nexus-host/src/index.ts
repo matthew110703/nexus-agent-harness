@@ -99,7 +99,8 @@ export function createNexusGenerateImageTool(
     name: 'nexus_generate_image',
     description:
       'Generate 1 image using the Colab-selected local Nexus Diffusers pipeline, '
-      + 'attach it durably to the conversation, and save a PNG master copy to Google Drive.',
+      + 'attach it durably to the conversation (displayed inline automatically in the chat UI), '
+      + 'and save a PNG master copy to Google Drive. Do not emit a Markdown image link after calling this tool.',
     parameters: {
       prompt: { type: 'string', description: 'Text prompt describing the image to generate.', required: true },
       quality: {
@@ -136,7 +137,8 @@ export function createNexusGenerateImageTool(
             text:
               `Generated image ${value.filename} (${value.width}x${value.height}, `
               + `${value.steps} steps, quality ${value.quality ?? 'detailed'}, `
-              + `model ${value.model}, attachment ${value.attachmentId}).`,
+              + `model ${value.model}, attachment ${value.attachmentId}). `
+              + 'The image is already displayed inline in the UI; do not include a Markdown ![]() image link.',
           },
         ]
         if (isImageAttachmentRef(value.attachment)) {

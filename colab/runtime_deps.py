@@ -144,11 +144,22 @@ def ensure_deepseek_vl2() -> None:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "git+https://github.com/deepseek-ai/DeepSeek-VL2.git"], check=False)
 
 
+def ensure_deepseek_vl() -> None:
+    """Ensure deepseek-vl package is installed if running DeepSeek-VL-7B-Chat."""
+    try:
+        import deepseek_vl  # noqa: F401
+    except ImportError:
+        print("[DEPS] Installing deepseek-vl...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "git+https://github.com/deepseek-ai/DeepSeek-VL.git"], check=False)
+
+
 def prepare_dependencies_for_model(implementation: str) -> None:
     """Check and fetch required runtime packages for the chosen implementation."""
     if implementation.startswith("gguf_"):
         ensure_llama_server()
-    elif implementation in ("gemma3", "deepseek_vl2", "gpt_oss"):
+    elif implementation in ("gemma3", "deepseek_vl2", "deepseek_vl", "gpt_oss"):
         ensure_bitsandbytes()
         if implementation == "deepseek_vl2":
             ensure_deepseek_vl2()
+        elif implementation == "deepseek_vl":
+            ensure_deepseek_vl()

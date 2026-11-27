@@ -23,7 +23,7 @@ from services.image_generation import save_generated_image_artifact
 from services.progress import ProgressService
 from workers.worker_protocol import WorkerGenerateRequest, WorkerImageRequest, WorkerLoadRequest, WorkerStatus
 
-GATEWAY_VERSION = "1.1.0"
+GATEWAY_VERSION = "2.0.0"
 IMAGE_QUALITY_PROFILES = ("normal", "detailed", "maximum")
 
 

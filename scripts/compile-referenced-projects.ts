@@ -164,23 +164,30 @@ function pnpmStep(id: LibraryStepId, label: string, args: readonly string[], nee
 }
 
 /**
- * List the package-library build steps in Host, Desktop, then Client dependency order.
+ * List the package-library build steps in Host, optional Desktop, then Client dependency order.
  * Source-only Typert generation supplies declarations before any package compilation.
- * Client compilation waits for Host and Desktop bundling because split compiler faces
+ * Client compilation waits for Host (and Desktop when included) bundling because split compiler faces
  * rewrite shared lib/types files consumed by those bundles.
  * @param root - Repository root containing the compiler and bundle configurations.
- * @param faces - `host` lists Typert generation, Host compilation, and bundling; `all` adds Desktop and Client.
+ * @param faces - `host` builds Host only; `web` adds Client without Desktop; `all` adds Desktop and Client.
  * @param mode - Check package types by default; benchmark emission defers diagnostics to required full builds.
  * @returns Steps with explicit compiler and bundle dependencies.
  * @throws If an aggregate configuration is invalid.
  */
-export function libraryBuildSteps(root: string, faces: 'host' | 'all', mode: CompilationMode = 'checked'): LibraryStep[] {
+export function libraryBuildSteps(root: string, faces: 'host' | 'web' | 'all', mode: CompilationMode = 'checked'): LibraryStep[] {
   const host: LibraryStep[] = [
     typertStep(),
     compilerStep(root, 'host', mode, ['host-typert']),
     pnpmStep('host-bundle', 'Host bundle', ['exec', 'tsdown', '--config-loader', 'native', '--env.DSH_BUILD_FACE', 'host'], ['host-src']),
   ]
   if (faces === 'host') return host
+  if (faces === 'web') {
+    return [
+      ...host,
+      compilerStep(root, 'client', mode, ['host-bundle']),
+      pnpmStep('client-bundle', 'Client bundle', ['exec', 'tsdown', '--config-loader', 'native', '--env.DSH_BUILD_FACE', 'client'], ['client-src']),
+    ]
+  }
   return [
     ...host,
     pnpmStep('desktop-bundle', 'Desktop bundle', ['--filter', '@deepseek-ai/dsh-desktop', 'run', 'bundle'], ['host-bundle']),

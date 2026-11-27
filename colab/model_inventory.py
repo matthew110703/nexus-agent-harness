@@ -326,7 +326,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                     size_bytes=size_bytes,
                     reason="Missing Harmony tool-call template",
                 )
-            min_vram = _estimate_min_vram_gib(size_bytes, "language", "gpt_oss", model_id)
+            min_vram = 15.0 if size_bytes > 20 * GIB else _estimate_min_vram_gib(size_bytes, "language", "gpt_oss", model_id)
             return InventoryCandidate(
                 id=model_id,
                 role="language",
@@ -342,7 +342,7 @@ def inspect_single_drive_dir(model_dir: Path, *, total_vram_bytes: Optional[int]
                 reasoning_mode="effort_levels",
                 reasoning_efforts={"low": "low", "medium": "medium", "high": "high"},
                 default_reasoning_effort="medium",
-                reason=f"Dedicated GPT-OSS Harmony runtime ({weights_msg})",
+                reason=f"Dedicated GPT-OSS Harmony runtime (4-bit auto-fit on L4, {weights_msg})",
             )
 
         if model_type == "gemma3":
@@ -541,7 +541,7 @@ def validate_selected_pair(
 def format_inventory_report(inv: DriveInventory, *, gpu_summary: str = "Unknown GPU") -> str:
     """Format a copy-pasteable inventory report for the Colab Inventory cell."""
     lines = [
-        f"=== NEXUS AI LAB v1.2.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
+        f"=== NEXUS AI LAB v2.0.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
         "",
         f"Selectable Language Models ({len(inv.language_models)}):",
     ]

@@ -28,25 +28,27 @@ import { runAggregate } from './run-gates.ts'
 import type { Gate } from './run-gates.ts'
 
 /**
- * Steps one build invocation runs: every artifact and check, only artifacts, only aggregate checks,
- * or every type check with the generated Typert declarations it needs.
+ * Steps one build invocation runs: every artifact and check, only artifacts, web-only artifacts
+ * (skipping Desktop/Electron), only aggregate checks, or every type check with Typert declarations.
  */
-export type BuildScope = 'complete' | 'artifacts' | 'check' | 'typecheck'
+export type BuildScope = 'complete' | 'artifacts' | 'web-artifacts' | 'check' | 'typecheck'
 
 /** Parsed command-line selection of one build invocation. */
 export interface BuildArguments {
   readonly scope: BuildScope
-  /** Client build profile requested by `--profile`; `complete` and `artifacts` scopes only. */
+  /** Client build profile requested by `--profile`; `complete`, `artifacts`, and `web-artifacts` scopes only. */
   readonly profile: string | undefined
   /** Run build steps without overlap, including when a concurrency override is set. */
   readonly serial: boolean
+  /** Emit package declarations without full type checking (`tsc -b --noCheck`, for fast Colab runtime builds). */
+  readonly noCheck: boolean
 }
 
 /**
  * Parse the build command line.
  * @param args - Arguments after the script path.
  * @returns The selected scope and requested client build profile.
- * @throws If an option is unknown, the scope is not `artifacts`, `check`, or `typecheck`,
+ * @throws If an option is unknown, the scope is invalid,
  *   or `--profile` accompanies `--scope check` or `--scope typecheck`.
  */
 export function parseBuildArguments(args: readonly string[]): BuildArguments {
@@ -56,17 +58,24 @@ export function parseBuildArguments(args: readonly string[]): BuildArguments {
       profile: { type: 'string' },
       scope: { type: 'string' },
       serial: { type: 'boolean', default: false },
+      'no-check': { type: 'boolean', default: false },
     },
     allowPositionals: false,
   })
-  if (values.scope !== undefined && values.scope !== 'artifacts' && values.scope !== 'check' && values.scope !== 'typecheck') {
-    throw new Error(`build: --scope must be artifacts, check, or typecheck, got ${JSON.stringify(values.scope)}; omit it for the complete build`)
+  if (
+    values.scope !== undefined
+    && values.scope !== 'artifacts'
+    && values.scope !== 'web-artifacts'
+    && values.scope !== 'check'
+    && values.scope !== 'typecheck'
+  ) {
+    throw new Error(`build: --scope must be artifacts, web-artifacts, check, or typecheck, got ${JSON.stringify(values.scope)}; omit it for the complete build`)
   }
   const scope: BuildScope = values.scope ?? 'complete'
   if ((scope === 'check' || scope === 'typecheck') && values.profile !== undefined) {
     throw new Error(`build: --profile selects artifact values and does not apply to --scope ${scope}`)
   }
-  return { scope, profile: values.profile, serial: values.serial }
+  return { scope, profile: values.profile, serial: values.serial, noCheck: values['no-check'] }
 }
 
 /**
@@ -91,12 +100,15 @@ export function buildGates(
   scope: BuildScope,
   environment: Readonly<Record<string, string | undefined>> = {},
   serial = false,
+  noCheck = false,
 ): Gate[] {
   const env = { ...environment }
   const gates: Gate[] = []
-  if (scope === 'complete' || scope === 'artifacts') {
+  if (scope === 'complete' || scope === 'artifacts' || scope === 'web-artifacts') {
+    const faces = scope === 'web-artifacts' ? 'web' : 'all'
+    const mode = noCheck ? 'benchmark-emit' : 'checked'
     gates.push(pnpmGate('native', 'native addon', ['run', 'build:native-system'], [], env))
-    for (const step of libraryBuildSteps(root, 'all')) {
+    for (const step of libraryBuildSteps(root, faces, mode)) {
       gates.push(libraryGate(step, step.id === 'host-src' ? ['native', ...step.needs] : step.needs, env))
     }
     gates.push(pnpmGate('web', 'Web build', ['run', 'build:web'], ['client-bundle'], env))
@@ -104,7 +116,7 @@ export function buildGates(
   if (scope === 'typecheck') {
     for (const step of contractSteps(root, 'all')) gates.push(libraryGate(step, step.needs, env))
   }
-  if (scope !== 'artifacts') {
+  if (scope !== 'artifacts' && scope !== 'web-artifacts') {
     for (const face of ['host', 'client'] as const) {
       gates.push({
         id: `${face}-check`,
@@ -164,7 +176,7 @@ async function main(): Promise<number> {
   if (!process.features.typescript) {
     throw new Error('build: Node.js TypeScript type stripping is unavailable in this Node.js process; remove --no-experimental-strip-types from NODE_OPTIONS or use a Node.js build with TypeScript support')
   }
-  const { scope, profile, serial } = parseBuildArguments(process.argv.slice(2))
+  const { scope, profile, serial, noCheck } = parseBuildArguments(process.argv.slice(2))
   const root = resolve(import.meta.dirname, '..')
   const name = scope === 'complete' ? 'build' : scope === 'typecheck' ? 'typecheck' : `build:${scope}`
   const budget = defaultParallelism()
@@ -181,7 +193,7 @@ async function main(): Promise<number> {
   const clientEnvironment = resolveClientBuildEnvironment(repositoryEnvironment, profile ?? process.env[CLIENT_BUILD_PROFILE_SELECTOR])
   const environment = environmentOverlay(process.env, clientBuildProcessEnvironment(process.env, clientEnvironment))
   rmSync(resolve(root, CLIENT_BUILD_RECORD_PATH), { force: true })
-  const gates = buildGates(root, scope, environment, serial)
+  const gates = buildGates(root, scope, environment, serial, noCheck)
   const exitCode = await runAggregate(name, gates, workers(gates))
   if (exitCode !== 0) return exitCode
   const record = writeClientBuildRecord(root, clientEnvironment)
