@@ -10,6 +10,7 @@ import queue
 import signal
 import sys
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -214,9 +215,18 @@ class ModelWorkerState:
 
 
 def create_worker_app(secret_token: str) -> FastAPI:
-    app = FastAPI(title="Nexus Isolated Model Worker", version="2.1.0")
     state = ModelWorkerState()
     require_auth = make_auth_dependency(secret_token)
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            state.cancel_operation(None)
+            state.unload("all")
+
+    app = FastAPI(title="Nexus Isolated Model Worker", version="2.3.0", lifespan=_lifespan)
 
     @app.get("/worker/health")
     def worker_health(_auth: None = Depends(require_auth)) -> dict[str, Any]:

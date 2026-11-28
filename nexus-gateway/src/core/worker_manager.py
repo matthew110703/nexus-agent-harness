@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -140,7 +141,14 @@ class WorkerManager:
             cmd = [self._python, str(self._worker_script), "--host", "127.0.0.1", "--port", str(port)]
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_fh = self._log_path.open("ab")
-            proc = subprocess.Popen(cmd, env=env, stdout=self._log_fh, stderr=subprocess.STDOUT)
+            popen_kwargs: dict[str, Any] = {
+                "env": env,
+                "stdout": self._log_fh,
+                "stderr": subprocess.STDOUT,
+            }
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(cmd, **popen_kwargs)
             self._proc = proc
             self._port = port
             self._secret = secret
@@ -338,12 +346,24 @@ class WorkerManager:
         self._active_kind = None
         self._active_model_id = None
         if proc is not None and proc.poll() is None:
+            pgid: Optional[int] = None
+            if os.name != "nt":
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except ProcessLookupError:
+                    pgid = None
             try:
-                proc.terminate()
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGTERM)
+                else:
+                    proc.terminate()
                 proc.wait(timeout=5.0)
             except Exception:
                 try:
-                    proc.kill()
+                    if pgid is not None:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        proc.kill()
                     proc.wait(timeout=3.0)
                 except Exception:
                     pass

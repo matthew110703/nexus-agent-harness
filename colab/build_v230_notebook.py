@@ -809,6 +809,7 @@ print(
 # @title
 import os
 import signal
+import subprocess
 import time
 import urllib.request
 
@@ -829,15 +830,35 @@ for label in ("supervisor", "gateway"):
     if pid is None:
         continue
     try:
-        if label == "supervisor":
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        else:
-            os.kill(pid, signal.SIGTERM)
-        print(f"[STOP] Stopped {label} (PID {pid}).")
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        print(f"[STOP] Stopped {label} process group (PID {pid}).")
     except ProcessLookupError:
         pass
+    except PermissionError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"[STOP] Stopped {label} (PID {pid}).")
+        except ProcessLookupError:
+            pass
+
+# Defensive sweep for any orphaned llama-server or model_worker GPU processes
+for pattern in ("llama-server", "workers/model_worker.py"):
+    subprocess.run(["pkill", "-TERM", "-f", pattern], check=False)
 
 time.sleep(1.5)
+
+for pattern in ("llama-server", "workers/model_worker.py"):
+    subprocess.run(["pkill", "-KILL", "-f", pattern], check=False)
+
+try:
+    gpu_procs = subprocess.check_output(
+        ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
+        text=True,
+    ).strip()
+    print("[GPU] Remaining compute processes:", gpu_procs if gpu_procs else "NONE (VRAM clean)")
+except Exception:
+    pass
+
 if "harness_home_snapshot" in globals():
     snap = harness_home_snapshot.create_snapshot(NEXUS_HARNESS_HOME, NEXUS_HARNESS_HOME_DRIVE_BACKUP)
     print("[SNAPSHOT] Verified Drive snapshot saved:", snap)

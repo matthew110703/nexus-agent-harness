@@ -253,6 +253,10 @@ def create_app(
         force_terminate = bool((body or {}).get("force_terminate", False))
         with res_mgr.exclusive():
             if force_terminate:
+                try:
+                    worker_mgr.unload(terminate_on_failure=False)
+                except Exception:
+                    pass
                 worker_mgr.terminate()
                 return {"status": "terminated", "worker": worker_mgr.status().to_dict()}
             result = worker_mgr.unload(terminate_on_failure=True)
