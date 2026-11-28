@@ -71,13 +71,17 @@ describe('BrowseDirectoryPicker allowedRoots confinement', () => {
     const created = await cap.createDirectory(rootA, 'new-proj')
     expect(created.endsWith('new-proj')).toBe(true)
 
+    let linked = true
     try {
       await symlink(outside, join(rootA, 'escape-link'), 'junction')
+    } catch (_symlinkErr) {
+      // Symlink creation may require elevated privileges on some Windows hosts.
+      linked = false
+    }
+    if (linked) {
       const listing = await cap.list(rootA)
       expect(listing.entries.map(entry => entry.name)).not.toContain('escape-link')
       await expect(cap.list(join(rootA, 'escape-link'))).rejects.toThrow(DirectoryPickerError)
-    } catch {
-      // Symlink creation may require elevated privileges on some Windows hosts; skip only if symlink creation fails.
     }
   })
 })

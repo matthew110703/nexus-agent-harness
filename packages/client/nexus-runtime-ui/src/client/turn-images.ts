@@ -7,6 +7,7 @@
 import type { ChatNode } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { ConversationNodeDefinition } from '@deepseek-ai/dsh-client-ui-conversation/client'
 
+/** Projected generated-image record associated with one `nexus_generate_image` tool call. */
 export interface NexusTurnImage {
   callId: string
   filename: string

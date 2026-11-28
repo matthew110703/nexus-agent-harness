@@ -99,13 +99,38 @@ def _verify_llama_cuda_support(binary: Path) -> None:
         )
 
 
+MIN_LLAMA_SERVER_BUILD = 5100
+
+
+def _check_llama_server_min_build(binary: Path) -> bool:
+    """Return True if `llama-server --version` build is >= MIN_LLAMA_SERVER_BUILD (required for Llama 4)."""
+    import re
+
+    env = os.environ.copy()
+    lib_dirs = sorted({str(p.parent) for p in LLAMA_INSTALL_DIR.rglob("*.so*") if p.is_file()}) if LLAMA_INSTALL_DIR.is_dir() else []
+    if lib_dirs:
+        cur_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, *([cur_ld] if cur_ld else [])])
+    try:
+        res = subprocess.run([str(binary), "--version"], capture_output=True, text=True, env=env, timeout=10, check=False)
+        output = (res.stdout or "") + "\n" + (res.stderr or "")
+        m = re.search(r"\bversion:\s*(\d{4,6})\b", output, re.IGNORECASE) or re.search(r"\bb(\d{4,6})\b", output)
+        if m is not None:
+            return int(m.group(1)) >= MIN_LLAMA_SERVER_BUILD
+    except Exception:
+        return False
+    return True
+
+
 def ensure_llama_server() -> None:
-    """Download and extract pre-built official CUDA llama-server binary if missing."""
+    """Download and extract pre-built official CUDA llama-server binary if missing or outdated (< b5100)."""
     existing = _find_installed_llama_server()
-    if existing is not None:
+    if existing is not None and _check_llama_server_min_build(existing):
         print(f"[DEPS] llama-server already available: {existing}")
         _verify_llama_cuda_support(existing)
         return
+    if existing is not None:
+        print(f"[DEPS] Existing llama-server ({existing}) is older than b{MIN_LLAMA_SERVER_BUILD}; upgrading for Llama 4 support...")
 
     tag, bin_url, cudart_url = _resolve_latest_llama_cuda_urls()
     print(f"[DEPS] llama-server not found. Downloading llama.cpp {tag} CUDA 12.8 binaries...")

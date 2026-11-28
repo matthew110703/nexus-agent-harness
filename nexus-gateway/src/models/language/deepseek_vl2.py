@@ -1,4 +1,4 @@
-"""Dedicated DeepSeek-VL2 runtime (DeepSeek-VL2-Small)."""
+"""Dedicated DeepSeek-VL2 runtime (DeepSeek-VL2-Tiny / Small)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,18 @@ import threading
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from models.language.common import enable_cuda_fast_math, make_cancel_stopping_criteria
-from models.language.prompt_tools import inject_tools_into_messages
+from models.language.common import (
+    enable_cuda_fast_math,
+    extract_vlm_messages_and_images,
+    make_cancel_stopping_criteria,
+    resolve_stop_token_ids,
+)
+from models.language.prompt_tools import inject_tools_into_messages, inject_tools_preserving_images
 from models.language.quantization import resolve_quantization_config
 
 
 class DeepSeekVl2LanguageModel:
-    """Dedicated runtime for DeepSeek-VL2 (`DeepseekVLV2ForCausalLM`)."""
+    """Dedicated runtime for DeepSeek-VL2 (`DeepseekVLV2ForCausalLM`) with multimodal PIL image support."""
 
     implementation = "deepseek_vl2"
 
@@ -33,7 +38,6 @@ class DeepSeekVl2LanguageModel:
         from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
 
         enable_cuda_fast_math(torch)
-        # Register DeepSeek-VL2 custom model classes BEFORE AutoModelForCausalLM.from_pretrained()
         vl_processor_cls: Any = None
         try:
             from deepseek_vl2.models import DeepseekVLV2ForCausalLM, DeepseekVLV2Processor  # type: ignore[import-not-found]  # noqa: F401
@@ -66,6 +70,30 @@ class DeepSeekVl2LanguageModel:
                 pass
         self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path), local_files_only=True, trust_remote_code=True)
 
+    def _build_deepseek_vl_conversations(self, vlm_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        conv: list[dict[str, Any]] = []
+        sys_prefix = ""
+        for m in vlm_messages:
+            role = m.get("role")
+            blocks = m.get("content") if isinstance(m.get("content"), list) else [{"type": "text", "text": str(m.get("content") or "")}]
+            text_segs: list[str] = []
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "image":
+                    text_segs.append("<image>")
+                elif isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                    text_segs.append(str(b["text"]))
+            joined = "\n".join(text_segs).strip()
+            if role == "system":
+                sys_prefix = f"{sys_prefix}\n\n{joined}".strip()
+                continue
+            ds_role = "<|User|>" if role == "user" else "<|Assistant|>"
+            if sys_prefix and ds_role == "<|User|>":
+                joined = f"{sys_prefix}\n\n{joined}".strip()
+                sys_prefix = ""
+            conv.append({"role": ds_role, "content": joined})
+        conv.append({"role": "<|Assistant|>", "content": ""})
+        return conv
+
     def generate_stream(self, req: dict[str, Any]) -> Iterator[str]:
         import torch  # type: ignore[import-not-found]
         from transformers import TextIteratorStreamer  # type: ignore[import-not-found]
@@ -75,40 +103,72 @@ class DeepSeekVl2LanguageModel:
 
         messages = req.get("messages") or []
         tools = req.get("tools") or []
-        prepared_messages = inject_tools_into_messages(messages, tools)
-
-        if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
-            prompt = self.tokenizer.apply_chat_template(
-                prepared_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        else:
-            prompt = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in prepared_messages) + "\nassistant: "
-
+        hf_messages, images = extract_vlm_messages_and_images(messages)
         device = next(self.model.parameters()).device
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
         cancel_event = threading.Event()
         temperature = float(req.get("temperature", 0.7))
-        gen_kwargs: dict[str, Any] = {
-            **inputs,
-            "streamer": streamer,
-            "stopping_criteria": make_cancel_stopping_criteria(cancel_event),
-            "max_new_tokens": int(req.get("max_tokens") or 4096),
-            "do_sample": temperature > 0,
-            "temperature": max(0.01, temperature),
-            "top_p": float(req.get("top_p", 0.9)),
-        }
+        stop_ids = resolve_stop_token_ids(self.tokenizer, ("<｜end▁of▁sentence｜>", "<|EOT|>", "<|im_end|>"))
+
+        gen_target = getattr(self.model, "language", None) if (images and self.vl_chat_processor is not None and hasattr(self.model, "prepare_inputs_embeds")) else None
+
+        if images and self.vl_chat_processor is not None and gen_target is not None:
+            vlm_messages = inject_tools_preserving_images(hf_messages, tools, strict_alternation=False)
+            conversations = self._build_deepseek_vl_conversations(vlm_messages)
+            prepare_inputs = self.vl_chat_processor(
+                conversations=conversations,
+                images=images,
+                force_batchify=True,
+                system_prompt="",
+            ).to(device)
+            inputs_embeds = self.model.prepare_inputs_embeds(**prepare_inputs)
+            gen_kwargs: dict[str, Any] = {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": prepare_inputs.attention_mask,
+                "pad_token_id": self.tokenizer.eos_token_id,
+                "bos_token_id": self.tokenizer.bos_token_id,
+                "streamer": streamer,
+                "stopping_criteria": make_cancel_stopping_criteria(cancel_event),
+                "max_new_tokens": int(req.get("max_tokens") or 4096),
+                "do_sample": temperature > 0,
+                "temperature": max(0.01, temperature),
+                "top_p": float(req.get("top_p", 0.9)),
+                "use_cache": True,
+            }
+            runner_model = gen_target
+        else:
+            prepared_messages = inject_tools_into_messages(messages, tools)
+            if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
+                prompt = self.tokenizer.apply_chat_template(
+                    prepared_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            else:
+                prompt = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in prepared_messages) + "\nassistant: "
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+            gen_kwargs = {
+                **inputs,
+                "streamer": streamer,
+                "stopping_criteria": make_cancel_stopping_criteria(cancel_event),
+                "max_new_tokens": int(req.get("max_tokens") or 4096),
+                "do_sample": temperature > 0,
+                "temperature": max(0.01, temperature),
+                "top_p": float(req.get("top_p", 0.9)),
+            }
+            runner_model = self.model
+
+        if stop_ids is not None:
+            gen_kwargs["eos_token_id"] = stop_ids
 
         exc_holder: list[BaseException] = []
 
         def _run() -> None:
             try:
                 with torch.inference_mode():
-                    self.model.generate(**gen_kwargs)
+                    runner_model.generate(**gen_kwargs)
             except BaseException as exc:
                 exc_holder.append(exc)
                 streamer.end()

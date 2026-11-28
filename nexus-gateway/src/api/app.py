@@ -14,6 +14,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from adapters.tool_calls import create_tool_parser, has_native_tool_parser
 from api.middleware.auth import make_auth_dependency
+from core.capabilities import (
+    apply_capability_grounding,
+    build_model_capability_profile,
+    compact_tools_for_context,
+    estimate_openai_usage,
+    resolve_sampling_params,
+)
 from core.hardware_detector import detect_hardware
 from core.memory_planner import can_coreside_image_model
 from core.resource_manager import ResourceManager
@@ -25,7 +32,7 @@ from services.progress import ProgressService
 from services.web_research import research_web, search_web
 from workers.worker_protocol import WorkerGenerateRequest, WorkerImageRequest, WorkerLoadRequest, WorkerStatus
 
-GATEWAY_VERSION = "2.2.0"
+GATEWAY_VERSION = "2.3.0"
 IMAGE_QUALITY_PROFILES = ("normal", "detailed", "maximum")
 
 
@@ -49,11 +56,13 @@ def create_app(
 
     lang_spec = config.session.language_model
     img_spec = config.session.image_model
+    cap_profile = build_model_capability_profile(lang_spec, img_spec)
     prog = progress or ProgressService()
     res_mgr = resources or ResourceManager()
     worker_mgr = worker or WorkerManager()
 
     app.state.config = config
+    app.state.capabilities = cap_profile
     app.state.progress = prog
     app.state.resources = res_mgr
     app.state.worker = worker_mgr
@@ -146,6 +155,7 @@ def create_app(
             "worker": ws.to_dict(),
             "language_model": lang_spec.to_openai_model(),
             "image_model": img_spec.to_dict() if img_spec is not None else None,
+            "capabilities": cap_profile.to_dict(),
             "quality_profiles": list(IMAGE_QUALITY_PROFILES),
         }
 
@@ -315,10 +325,11 @@ def create_app(
 
         messages = normalize_openai_messages(
             body.get("messages") or [],
-            allow_images="image" in (lang_spec.modalities or []),
+            allow_images=cap_profile.vision_input_enabled,
         )
         if not messages:
             raise HTTPException(status_code=400, detail="messages must be a non-empty list")
+        messages = apply_capability_grounding(messages, cap_profile)
 
         tools = body.get("tools") or []
         tool_choice = body.get("tool_choice", "auto")
@@ -341,11 +352,27 @@ def create_app(
                 status_code=422,
                 detail=f"Language model '{lang_spec.id}' ({lang_spec.implementation}) has no native tool parser",
             )
+        if tools and cap_profile.compact_tool_schemas:
+            tools = compact_tools_for_context(tools, max_desc_chars=cap_profile.max_tool_desc_chars)
 
         stream = bool(body.get("stream", False))
         max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or lang_spec.max_output_tokens or 4096)
-        temperature = float(body.get("temperature", 0.7))
-        top_p = float(body.get("top_p", 0.9))
+        raw_temp = body.get("temperature")
+        raw_top_p = body.get("top_p")
+        sampling = resolve_sampling_params(
+            cap_profile,
+            has_tools=bool(tools),
+            requested_temperature=float(raw_temp) if raw_temp is not None else None,
+            requested_top_p=float(raw_top_p) if raw_top_p is not None else None,
+        )
+        req_stops = body.get("stop")
+        merged_stops = list(sampling["stop"])
+        if isinstance(req_stops, str) and req_stops and req_stops not in merged_stops:
+            merged_stops.append(req_stops)
+        elif isinstance(req_stops, list):
+            for s in req_stops:
+                if isinstance(s, str) and s and s not in merged_stops:
+                    merged_stops.append(s)
 
         requested_effort = (
             (body.get("reasoning") or {}).get("effort")
@@ -359,6 +386,15 @@ def create_app(
         )
         started_in_think = lang_spec.implementation == "qwen3_5" and enable_thinking is not False
 
+        def _is_context_overflow_msg(msg: str) -> bool:
+            low = (msg or "").lower()
+            return (
+                "maximum context length" in low
+                or "exceed_context_size" in low
+                or "exceeds the available context size" in low
+                or "context_length_exceeded" in low
+            )
+
         request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
         created = int(time.time())
         gen_req = WorkerGenerateRequest(
@@ -366,8 +402,11 @@ def create_app(
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
-            temperature=temperature,
-            top_p=top_p,
+            temperature=sampling["temperature"],
+            top_p=sampling["top_p"],
+            min_p=sampling["min_p"],
+            repeat_penalty=sampling["repeat_penalty"],
+            stop=merged_stops,
             max_tokens=max_tokens,
             reasoning_effort=wire_effort,
             enable_thinking=enable_thinking,
@@ -391,15 +430,25 @@ def create_app(
                 prog.complete(gen_op.operation_id, phase="ready", message="Response complete")
             except WorkerError as exc:
                 prog.fail(gen_op.operation_id, str(exc))
+                if _is_context_overflow_msg(str(exc)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"This model's maximum context length is {cap_profile.context_window} tokens: {exc}",
+                    ) from exc
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
             except Exception as exc:
                 prog.fail(gen_op.operation_id, str(exc))
+                if _is_context_overflow_msg(str(exc)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"This model's maximum context length is {cap_profile.context_window} tokens: {exc}",
+                    ) from exc
                 raise
 
             parser = create_tool_parser(lang_spec.implementation, started_in_think=started_in_think)
             parser.feed(str(raw.get("text") or ""))
             parsed = parser.finish(tools, tool_choice=tool_choice)
-            if parsed.errors:
+            if parsed.errors and not parsed.tool_calls and not parsed.text:
                 raise HTTPException(
                     status_code=422,
                     detail={"error": {"message": "; ".join(parsed.errors), "type": "tool_call_parse_error"}},
@@ -411,12 +460,25 @@ def create_app(
             if parsed.tool_calls:
                 message["tool_calls"] = [tc.to_openai_dict() for tc in parsed.tool_calls]
                 finish_reason = "tool_calls"
+            raw_usage = raw.get("usage") if isinstance(raw, dict) else None
+            usage = (
+                raw_usage
+                if isinstance(raw_usage, dict) and raw_usage.get("total_tokens")
+                else estimate_openai_usage(
+                    messages,
+                    tools,
+                    parsed.text,
+                    parsed.reasoning,
+                    [tc.to_openai_dict() for tc in parsed.tool_calls],
+                )
+            )
             return {
                 "id": request_id,
                 "object": "chat.completion",
                 "created": created,
                 "model": lang_spec.id,
                 "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                "usage": usage,
             }
 
         def sse_events():
@@ -484,7 +546,8 @@ def create_app(
                     yield "data: [DONE]\n\n"
                     return
                 finish_reason = "tool_calls" if parsed.tool_calls else "stop"
-                for idx, tc in enumerate(parsed.tool_calls):
+                serialized_tcalls = [tc.to_openai_dict() for tc in parsed.tool_calls]
+                for idx, tc_dict in enumerate(serialized_tcalls):
                     yield "data: " + json.dumps({
                         "id": request_id,
                         "object": "chat.completion.chunk",
@@ -492,10 +555,22 @@ def create_app(
                         "model": lang_spec.id,
                         "choices": [{
                             "index": 0,
-                            "delta": {"tool_calls": [{"index": idx, **tc.to_openai_dict()}]},
+                            "delta": {"tool_calls": [{"index": idx, **tc_dict}]},
                             "finish_reason": None,
                         }],
                     }, ensure_ascii=False) + "\n\n"
+                stream_usage = getattr(worker_mgr, "last_stream_usage", None)
+                usage = (
+                    stream_usage
+                    if isinstance(stream_usage, dict) and stream_usage.get("total_tokens")
+                    else estimate_openai_usage(
+                        messages,
+                        tools,
+                        parsed.text,
+                        parsed.reasoning,
+                        serialized_tcalls,
+                    )
+                )
                 prog.complete(gen_op.operation_id, phase="ready", message="Response complete")
                 yield "data: " + json.dumps({
                     "id": request_id,
@@ -503,15 +578,23 @@ def create_app(
                     "created": created,
                     "model": lang_spec.id,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                    "usage": usage,
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
             except GeneratorExit:
                 prog.update(gen_op.operation_id, status="cancelled", indeterminate=False, message="Cancelled by client disconnect")
                 raise
             except Exception as exc:
-                prog.fail(gen_op.operation_id, f"{type(exc).__name__}: {exc}")
+                err_txt = f"{type(exc).__name__}: {exc}"
+                if _is_context_overflow_msg(err_txt):
+                    err_txt = f"400 This model's maximum context length is {cap_profile.context_window} tokens ({exc})"
+                prog.fail(gen_op.operation_id, err_txt)
                 yield "data: " + json.dumps({
-                    "error": {"message": f"{type(exc).__name__}: {exc}", "type": "nexus_inference_error"}
+                    "error": {
+                        "message": err_txt,
+                        "type": "invalid_request_error" if _is_context_overflow_msg(err_txt) else "nexus_inference_error",
+                        "code": "context_length_exceeded" if _is_context_overflow_msg(err_txt) else None,
+                    }
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
 

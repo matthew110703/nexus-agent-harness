@@ -99,6 +99,10 @@ function isLoopbackRemoteAddress(address: string | undefined): boolean {
  * Determine whether the incoming request arrived over HTTPS, honoring
  * `X-Forwarded-Proto: https` only when explicitly enabled and received from a
  * loopback proxy peer.
+ * @param request - Incoming connection trust request with headers and socket address.
+ * @param serverProtocol - Bound server protocol (`'https:'` or `'http:'`).
+ * @param trustForwardedProto - Whether loopback `X-Forwarded-Proto` headers are trusted.
+ * @returns `true` when the request is effectively HTTPS.
  */
 export function isEffectiveHttps(
   request: ConnectionTrustRequest,

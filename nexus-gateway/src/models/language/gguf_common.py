@@ -1,4 +1,4 @@
-"""Base process controller and HTTP client for local `llama-server` GGUF instances."""
+"""Base process controller and HTTP client for local `llama-server` GGUF instances (v2.3.0)."""
 
 from __future__ import annotations
 
@@ -13,10 +13,19 @@ from typing import Any, Iterator, Optional
 
 import httpx
 
-from models.base import GenerationCancelledError
 from models.gguf_metadata import inspect_gguf_directory
 from models.language.common import deserialize_tool_call_arguments, normalize_tools_for_jinja
 from models.language.prompt_tools import build_tools_instruction
+
+RAW_TURN_BOUNDARY_MARKERS: tuple[str, ...] = (
+    "<|im_end|>",
+    "<|im_start|>",
+    "<|eot_id|>",
+    "<|eot|>",
+    "<|end_of_text|>",
+    "<|start_header_id|>",
+    "<|header_start|>",
+)
 
 
 def _pick_free_loopback_port() -> int:
@@ -64,8 +73,15 @@ def find_primary_gguf_file(model_path: Path) -> Path:
 
 
 def find_mmproj_file(model_path: Path) -> Optional[Path]:
-    """Find an optional multimodal projector mmproj-*.gguf in the directory."""
-    candidates = sorted(p for p in model_path.glob("*mmproj*.gguf") if p.stat().st_size > 0)
+    """Find an optional multimodal projector (`*mmproj*.gguf` or `*projector*.gguf`) in the directory."""
+    layout = inspect_gguf_directory(model_path)
+    if layout.mmproj_file is not None:
+        return layout.mmproj_file
+    candidates = sorted(
+        p
+        for p in model_path.glob("*.gguf")
+        if any(tag in p.name.lower() for tag in ("mmproj", "vision-projector", "projector")) and p.stat().st_size > 0
+    )
     return candidates[0] if candidates else None
 
 
@@ -89,6 +105,7 @@ class LlamaServerRuntimeBase:
         merge_consecutive_roles: bool = False,
         allow_quantized_kv: bool = True,
         moe_cpu_offload: bool = False,
+        chat_template_file: Optional[Path] = None,
     ) -> None:
         self.model_id = model_id
         self.model_path = model_path
@@ -104,7 +121,9 @@ class LlamaServerRuntimeBase:
         self.merge_consecutive_roles = merge_consecutive_roles
         self.allow_quantized_kv = allow_quantized_kv
         self.moe_cpu_offload = moe_cpu_offload
+        self.chat_template_file = chat_template_file
         self.has_mmproj = find_mmproj_file(model_path) is not None
+        self.last_usage: Optional[dict[str, int]] = None
         self.process: Optional[subprocess.Popen[Any]] = None
         self._active_port = port or 0
         self._log_path: Optional[Path] = None
@@ -131,6 +150,7 @@ class LlamaServerRuntimeBase:
         flag_set: list[str],
         env: dict[str, str],
         log_path: Path,
+        use_moe_ot: bool = False,
     ) -> None:
         self.stop()
         self._active_port = self.port if self.port > 0 else _pick_free_loopback_port()
@@ -148,9 +168,11 @@ class LlamaServerRuntimeBase:
             "--host", "127.0.0.1",
             "--jinja",
         ]
+        if self.chat_template_file is not None and self.chat_template_file.is_file():
+            cmd.extend(["--chat-template-file", str(self.chat_template_file)])
         if self.threads > 0:
             cmd.extend(["-t", str(self.threads)])
-        if self.moe_cpu_offload and n_gpu_layers < 999:
+        if use_moe_ot:
             cmd.extend(["-ot", ".ffn_.*_exps.=CPU"])
         if mmproj_path is not None:
             cmd.extend(["--mmproj", str(mmproj_path)])
@@ -211,24 +233,32 @@ class LlamaServerRuntimeBase:
         if self.reasoning_format:
             perf_flags.extend(["--reasoning-format", self.reasoning_format])
 
-        # Try full perf + Flash Attention + Q8_0 KV cache first; step down gracefully for hybrid
-        # architectures (e.g. Qwen 3.5 Gated DeltaNet) or tight VRAM (smaller n_ctx / partial -ngl).
         ctx_primary = max(4096, self.n_ctx)
         ctx_stepdown = max(8192, ctx_primary // 2) if ctx_primary > 8192 else ctx_primary
         ngl_primary = self.n_gpu_layers
         ngl_stepdown = int(ngl_primary * 0.8) if 0 < ngl_primary < 999 else ngl_primary
+        default_moe_ot = bool(self.moe_cpu_offload and ngl_primary < 999)
 
-        attempts: list[tuple[int, int, list[str]]] = []
+        attempts: list[tuple[int, int, list[str], bool]] = []
+        # MoE Hybrid GPU+RAM Fast-Path (Llama 4 Scout, Qwen3.5-35B-A3B, Gemma 4):
+        # Keep all 48 attention + shared-expert layers on CUDA (-ngl 999) while placing only routed
+        # FFN experts (.ffn_.*_exps.) in System RAM, stepping down to partial -ngl only if VRAM overflows.
+        if self.moe_cpu_offload and 0 < ngl_primary < 999:
+            if self.allow_quantized_kv:
+                attempts.append((ctx_primary, 999, ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", *perf_flags], True))
+            attempts.append((ctx_primary, 999, ["-fa", "on", *perf_flags], True))
+
         if self.allow_quantized_kv:
-            attempts.append((ctx_primary, ngl_primary, ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", *perf_flags]))
+            attempts.append((ctx_primary, ngl_primary, ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", *perf_flags], default_moe_ot))
         attempts.extend([
-            (ctx_primary, ngl_primary, ["-fa", "on", *perf_flags]),
-            (ctx_primary, ngl_primary, ["-fa", "on"]),
-            (ctx_stepdown, ngl_stepdown, ["-fa", "on"]),
-            (ctx_stepdown, ngl_stepdown, []),
+            (ctx_primary, ngl_primary, ["-fa", "on", *perf_flags], default_moe_ot),
+            (ctx_primary, ngl_primary, ["-fa", "on"], default_moe_ot),
+            (ctx_stepdown, ngl_stepdown, ["-fa", "on"], bool(self.moe_cpu_offload and ngl_stepdown < 999)),
+            (ctx_stepdown, ngl_stepdown, [], bool(self.moe_cpu_offload and ngl_stepdown < 999)),
         ])
+
         last_exc: Optional[Exception] = None
-        for ctx_val, ngl_val, flags in attempts:
+        for ctx_val, ngl_val, flags, moe_ot in attempts:
             try:
                 self._launch_with_flags(
                     binary=binary,
@@ -239,6 +269,7 @@ class LlamaServerRuntimeBase:
                     flag_set=flags,
                     env=env,
                     log_path=log_path,
+                    use_moe_ot=moe_ot,
                 )
                 return
             except RuntimeError as exc:
@@ -272,9 +303,9 @@ class LlamaServerRuntimeBase:
         messages: list[dict[str, Any]],
         *,
         inject_tools: Optional[list[dict[str, Any]]] = None,
-        deserialize_args: bool = False,
+        deserialize_args: bool = True,
     ) -> list[dict[str, Any]]:
-        """Normalize OpenAI messages for llama-server Jinja templates."""
+        """Normalize OpenAI messages for `llama-server` Jinja templates."""
         source_messages = deserialize_tool_call_arguments(messages) if deserialize_args else messages
         prepared: list[dict[str, Any]] = []
         for raw in source_messages:
@@ -306,14 +337,43 @@ class LlamaServerRuntimeBase:
             else:
                 prepared.insert(0, {"role": "system", "content": tool_block})
 
+            # Preserve full historical tool-call & tool-result memory when falling back to prompt-injected tools!
+            prompt_mode_msgs: list[dict[str, Any]] = []
+            for m in prepared:
+                role = m.get("role")
+                if role == "assistant" and isinstance(m.get("tool_calls"), list) and m["tool_calls"]:
+                    rendered_calls: list[str] = []
+                    for tc in m["tool_calls"]:
+                        if not isinstance(tc, dict):
+                            continue
+                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                        t_name = str(fn.get("name") or "")
+                        t_args = fn.get("arguments", {})
+                        if isinstance(t_args, str):
+                            try:
+                                t_args = json.loads(t_args)
+                            except json.JSONDecodeError:
+                                pass
+                        rendered_calls.append(
+                            f"<tool_call>{json.dumps({'name': t_name, 'arguments': t_args}, ensure_ascii=False)}</tool_call>"
+                        )
+                    base_txt = str(m.get("content") or "").strip()
+                    combined = "\n".join([p for p in (base_txt, *rendered_calls) if p])
+                    prompt_mode_msgs.append({"role": "assistant", "content": combined})
+                elif role == "tool":
+                    t_name = str(m.get("name") or m.get("tool_call_id") or "tool")
+                    t_body = str(m.get("content") or "")
+                    prompt_mode_msgs.append({"role": "user", "content": f"[Tool Result: {t_name}]\n{t_body}"})
+                else:
+                    prompt_mode_msgs.append(m)
+            prepared = prompt_mode_msgs
+
         if not self.merge_consecutive_roles:
             return prepared
 
         merged: list[dict[str, Any]] = []
         for msg in prepared:
             role = msg.get("role")
-            if merged and merged[-1].get("role") == "tool" and role == "user":
-                merged.append({"role": "assistant", "content": "(Previous tool turn was cancelled.)"})
             if (
                 merged
                 and role in ("system", "user")
@@ -334,7 +394,10 @@ class LlamaServerRuntimeBase:
     def _stream_once(self, payload: dict[str, Any]) -> Iterator[str]:
         url = f"{self.base_url}/v1/chat/completions"
         in_think = False
+        halted_on_boundary = False
         pending_tool_calls: dict[int, dict[str, str]] = {}
+        self.last_usage = None
+
         with httpx.Client(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
             with client.stream("POST", url, json=payload) as response:
                 if response.status_code != 200:
@@ -355,6 +418,16 @@ class LlamaServerRuntimeBase:
                             break
                         try:
                             chunk = json.loads(data_str)
+                            usage_obj = chunk.get("usage")
+                            if isinstance(usage_obj, dict) and usage_obj.get("total_tokens"):
+                                self.last_usage = {
+                                    "prompt_tokens": int(usage_obj.get("prompt_tokens") or 0),
+                                    "completion_tokens": int(usage_obj.get("completion_tokens") or 0),
+                                    "total_tokens": int(usage_obj.get("total_tokens") or 0),
+                                }
+                            if halted_on_boundary:
+                                continue
+
                             choices = chunk.get("choices") or []
                             if not choices:
                                 continue
@@ -372,6 +445,17 @@ class LlamaServerRuntimeBase:
                                 if in_think:
                                     yield "</think>"
                                     in_think = False
+                                earliest_cut = -1
+                                for marker in RAW_TURN_BOUNDARY_MARKERS:
+                                    pos = content.find(marker)
+                                    if pos != -1 and (earliest_cut == -1 or pos < earliest_cut):
+                                        earliest_cut = pos
+                                if earliest_cut != -1:
+                                    prefix = content[:earliest_cut]
+                                    if prefix:
+                                        yield prefix
+                                    halted_on_boundary = True
+                                    break
                                 yield content
 
                             raw_tool_calls = delta.get("tool_calls")
@@ -404,6 +488,23 @@ class LlamaServerRuntimeBase:
                 args_obj = args_raw
             yield f"<tool_call>{json.dumps({'name': entry['name'], 'arguments': args_obj}, ensure_ascii=False)}</tool_call>"
 
+    def _build_sampling_fields(self, req: dict[str, Any]) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "stream": True,
+            "temperature": req.get("temperature", 0.7),
+            "top_p": req.get("top_p", 0.9),
+            "max_tokens": req.get("max_tokens") or 4096,
+            "stream_options": {"include_usage": True},
+        }
+        if req.get("min_p") is not None:
+            fields["min_p"] = float(req["min_p"])
+        if req.get("repeat_penalty") is not None:
+            fields["repeat_penalty"] = float(req["repeat_penalty"])
+        stops = req.get("stop")
+        if isinstance(stops, list) and stops:
+            fields["stop"] = [str(s) for s in stops if s]
+        return fields
+
     def generate_chat_stream(self, req: dict[str, Any]) -> Iterator[str]:
         if not self.is_ready():
             rc = self.process.poll() if self.process is not None else "no-process"
@@ -420,48 +521,47 @@ class LlamaServerRuntimeBase:
         messages = req.get("messages") or []
         raw_tools = req.get("tools") or []
         tools = normalize_tools_for_jinja(raw_tools) if raw_tools else []
-        temperature = req.get("temperature", 0.7)
-        max_tokens = req.get("max_tokens") or 4096
+        sampling_fields = self._build_sampling_fields(req)
 
-        payload: dict[str, Any] = {
-            "messages": self._prepare_messages(messages),
-            "stream": True,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+        # Primary attempt: deserialize `tool_calls[].function.arguments` into dicts so Jinja templates
+        # using `|items` (Qwen 3.5) or `|tojson` (Llama 3.1/4, Gemma 4) never double-encode strings!
+        primary_payload: dict[str, Any] = {
+            "messages": self._prepare_messages(messages, deserialize_args=True),
+            **sampling_fields,
         }
         if tools:
-            payload["tools"] = tools
+            primary_payload["tools"] = tools
 
         try:
-            yield from self._stream_once(payload)
+            yield from self._stream_once(primary_payload)
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (400, 500):
-                # Retry once with deserialized tool_call arguments for templates using `|items`.
-                if tools:
-                    try:
-                        dict_args_payload: dict[str, Any] = {
-                            "messages": self._prepare_messages(messages, deserialize_args=True),
-                            "stream": True,
-                            "temperature": temperature,
-                            "max_tokens": max_tokens,
-                            "tools": tools,
-                        }
-                        yield from self._stream_once(dict_args_payload)
-                        return
-                    except httpx.HTTPStatusError:
-                        pass
-                    # Final fallback when a GGUF's embedded Jinja template rejects OpenAI `tools`
-                    fallback_payload: dict[str, Any] = {
-                        "messages": self._prepare_messages(messages, inject_tools=tools),
-                        "stream": True,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
+            err_body = exc.response.text if hasattr(exc.response, "text") else str(exc)
+            low_err = err_body.lower()
+            if "exceed_context_size" in low_err or "exceeds the available context size" in low_err:
+                raise ValueError(f"maximum context length exceeded ({self.n_ctx} tokens): {err_body}") from exc
+
+            if exc.response.status_code in (400, 500) and tools:
+                # Secondary attempt: stringified tool_call arguments for templates expecting string `arguments`.
+                try:
+                    str_args_payload: dict[str, Any] = {
+                        "messages": self._prepare_messages(messages, deserialize_args=False),
+                        **sampling_fields,
+                        "tools": tools,
                     }
-                    try:
-                        yield from self._stream_once(fallback_payload)
-                        return
-                    except Exception as fb_exc:
-                        raise RuntimeError(f"llama-server fallback streaming failed: {fb_exc}") from fb_exc
+                    yield from self._stream_once(str_args_payload)
+                    return
+                except httpx.HTTPStatusError:
+                    pass
+                # Final fallback: prompt-injected tools with full historical tool-call + result serialization.
+                fallback_payload: dict[str, Any] = {
+                    "messages": self._prepare_messages(messages, inject_tools=tools, deserialize_args=True),
+                    **sampling_fields,
+                }
+                try:
+                    yield from self._stream_once(fallback_payload)
+                    return
+                except Exception as fb_exc:
+                    raise RuntimeError(f"llama-server fallback streaming failed: {fb_exc}") from fb_exc
             raise RuntimeError(f"llama-server streaming failed: {exc}") from exc
         except Exception as exc:
             raise RuntimeError(f"llama-server streaming failed: {exc}") from exc

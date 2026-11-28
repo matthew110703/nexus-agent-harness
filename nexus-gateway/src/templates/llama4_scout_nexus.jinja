@@ -1,0 +1,94 @@
+{{- bos_token }}
+{%- set system_message = "" %}
+{%- if messages and messages[0]['role'] == 'system' %}
+    {%- set system_message = messages[0]['content'] | trim %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+{%- if system_message or (tools is defined and tools) %}
+{{- "<|header_start|>system<|header_end|>\n\n" }}
+{%- if system_message %}
+{{- system_message }}
+{%- endif %}
+{%- if tools is defined and tools %}
+{%- if system_message %}
+{{- "\n\n" }}
+{%- endif %}
+{{- "# Tool Calling Protocol\n" }}
+{{- "You have access to the following functions. Call a function ONLY when needed to inspect files, run commands, search the web, or generate an explicitly requested image.\n" }}
+{{- "For normal questions, greetings, or capability inquiries, reply directly in plain text without calling any tool.\n" }}
+{{- "When calling a function, emit:\n" }}
+{{- "<|python_start|>{\"name\": \"function_name\", \"arguments\": {\"param\": \"value\"}}<|python_end|>\n\n" }}
+{{- "Available functions:\n" }}
+{%- for t in tools %}
+{{- (t['function'] if 'function' in t else t) | tojson }}
+{{- "\n" }}
+{%- endfor %}
+{%- endif %}
+{{- "<|eot|>" }}
+{%- endif %}
+{%- for message in loop_messages %}
+    {%- set role = message['role'] %}
+    {%- if role == 'user' %}
+        {{- "<|header_start|>user<|header_end|>\n\n" }}
+        {%- if message['content'] is sequence and message['content'] is not string %}
+            {%- for part in message['content'] %}
+                {%- if part['type'] == 'text' %}
+                    {{- part['text'] }}
+                {%- elif part['type'] == 'image' or part['type'] == 'image_url' %}
+                    {{- "<|image|>" }}
+                {%- endif %}
+            {%- endfor %}
+        {%- else %}
+            {{- message['content'] | default('', true) | trim }}
+        {%- endif %}
+        {{- "<|eot|>" }}
+    {%- elif role == 'assistant' %}
+        {{- "<|header_start|>assistant<|header_end|>\n\n" }}
+        {%- if message.get('reasoning_content') %}
+            {{- "<think>\n" + (message['reasoning_content'] | trim) + "\n</think>\n\n" }}
+        {%- endif %}
+        {%- if message.get('content') %}
+            {{- message['content'] | trim }}
+        {%- endif %}
+        {%- if message.get('tool_calls') %}
+            {%- if message.get('content') %}
+                {{- "\n" }}
+            {%- endif %}
+            {{- "<|python_start|>" }}
+            {%- for tool_call in message['tool_calls'] %}
+                {%- set fn = tool_call['function'] if 'function' in tool_call else tool_call %}
+                {%- set args = fn['arguments'] %}
+                {{- '{"name": "' + fn['name'] + '", "arguments": ' }}
+                {%- if args is string %}
+                    {{- args }}
+                {%- else %}
+                    {{- args | tojson }}
+                {%- endif %}
+                {{- "}" }}
+                {%- if not loop.last %}
+                    {{- "\n" }}
+                {%- endif %}
+            {%- endfor %}
+            {{- "<|python_end|>" }}
+        {%- endif %}
+        {{- "<|eot|>" }}
+    {%- elif role == 'tool' or role == 'ipython' %}
+        {{- "<|header_start|>ipython<|header_end|>\n\n" }}
+        {%- if message.get('name') %}
+            {{- "[Tool Result: " + message['name'] + "]\n" }}
+        {%- endif %}
+        {%- if message['content'] is mapping or message['content'] is sequence and message['content'] is not string %}
+            {{- message['content'] | tojson }}
+        {%- else %}
+            {{- message['content'] | default('', true) }}
+        {%- endif %}
+        {{- "<|eot|>" }}
+    {%- elif role == 'system' %}
+        {{- "<|header_start|>user<|header_end|>\n\n[Runtime Notice]\n" + (message['content'] | default('', true) | trim) + "<|eot|>" }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- "<|header_start|>assistant<|header_end|>\n\n" }}
+{%- endif %}

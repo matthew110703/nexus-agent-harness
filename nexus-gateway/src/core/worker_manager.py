@@ -64,6 +64,7 @@ class WorkerManager:
         self._active_kind: Optional[str] = None
         self._active_model_id: Optional[str] = None
         self._last_error: Optional[str] = None
+        self.last_stream_usage: Optional[dict[str, int]] = None
 
     @property
     def is_running(self) -> bool:
@@ -202,6 +203,7 @@ class WorkerManager:
         self.ensure_started()
         if self._port is None:
             raise WorkerError("Model worker is not running", status_code=503)
+        self.last_stream_usage = None
         payload = {**req.to_dict(), "stream": True}
         url = f"http://127.0.0.1:{self._port}/worker/generate"
         http_req = urllib.request.Request(
@@ -218,7 +220,16 @@ class WorkerManager:
                         continue
                     parsed_line = json.loads(line)
                     if "error" in parsed_line and parsed_line["error"]:
-                        raise WorkerError(f"Worker stream error: {self._redact(str(parsed_line['error']))}", status_code=502)
+                        err_msg = self._redact(str(parsed_line["error"]))
+                        st_code = int(parsed_line.get("status_code") or (400 if "maximum context length" in err_msg.lower() or "exceed_context_size" in err_msg.lower() else 502))
+                        raise WorkerError(f"Worker stream error: {err_msg}", status_code=st_code)
+                    usage_obj = parsed_line.get("usage")
+                    if isinstance(usage_obj, dict):
+                        self.last_stream_usage = {
+                            "prompt_tokens": int(usage_obj.get("prompt_tokens") or 0),
+                            "completion_tokens": int(usage_obj.get("completion_tokens") or 0),
+                            "total_tokens": int(usage_obj.get("total_tokens") or 0),
+                        }
                     chunk = parsed_line.get("chunk")
                     if isinstance(chunk, str) and chunk:
                         yield chunk

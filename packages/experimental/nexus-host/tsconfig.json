@@ -10,7 +10,9 @@
   "references": [
     { "path": "../../attachment/attachment" },
     { "path": "../../client/connection/tsconfig.host.json" },
+    { "path": "../../core/system-prompt" },
     { "path": "../../core/tools" },
+    { "path": "../../fs/fs" },
     { "path": "../../session/working-directory" },
     { "path": "../../web/web" },
     { "path": "../../../vendor/cordis" },

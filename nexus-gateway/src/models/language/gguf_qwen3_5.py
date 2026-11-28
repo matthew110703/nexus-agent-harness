@@ -39,7 +39,12 @@ class GgufQwen35Model:
             ubatch_size=ubatch_size,
             threads=threads,
             reasoning_format="deepseek",
+            moe_cpu_offload=("a3b" in model_id.lower() or "moe" in architecture.lower()),
         )
+
+    @property
+    def last_usage(self) -> Optional[dict[str, int]]:
+        return self.server.last_usage
 
     def is_ready(self) -> bool:
         return self.server.is_ready()

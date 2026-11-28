@@ -1,4 +1,4 @@
-"""Dedicated Gemma 3 language and multimodal runtime (Gemma-3-12B-IT)."""
+"""Dedicated Gemma 3 language and multimodal runtime (Gemma-3-4B / 12B / 27B-IT)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,18 @@ import threading
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from models.language.common import enable_cuda_fast_math, make_cancel_stopping_criteria
-from models.language.prompt_tools import inject_tools_into_messages
+from models.language.common import (
+    enable_cuda_fast_math,
+    extract_vlm_messages_and_images,
+    make_cancel_stopping_criteria,
+    resolve_stop_token_ids,
+)
+from models.language.prompt_tools import inject_tools_into_messages, inject_tools_preserving_images
 from models.language.quantization import resolve_quantization_config
 
 
 class Gemma3LanguageModel:
-    """Dedicated runtime for Gemma 3 (`Gemma3ForConditionalGeneration`)."""
+    """Dedicated runtime for Gemma 3 (`Gemma3ForConditionalGeneration`) with true VLM image input."""
 
     implementation = "gemma3"
 
@@ -59,22 +64,33 @@ class Gemma3LanguageModel:
 
         messages = req.get("messages") or []
         tools = req.get("tools") or []
-        prepared_messages = inject_tools_into_messages(messages, tools, strict_alternation=True)
-
+        hf_messages, images = extract_vlm_messages_and_images(messages)
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        prompt = tokenizer.apply_chat_template(
-            prepared_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
         device = next(self.model.parameters()).device
-        inputs = tokenizer(prompt, return_tensors="pt")
+
+        if images and hasattr(self.processor, "apply_chat_template"):
+            vlm_messages = inject_tools_preserving_images(hf_messages, tools, strict_alternation=True)
+            prompt = self.processor.apply_chat_template(
+                vlm_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = self.processor(text=[prompt], images=images, return_tensors="pt")
+        else:
+            prepared_messages = inject_tools_into_messages(messages, tools, strict_alternation=True)
+            prompt = tokenizer.apply_chat_template(
+                prepared_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            inputs = tokenizer(prompt, return_tensors="pt")
+
         inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         cancel_event = threading.Event()
         temperature = float(req.get("temperature", 0.7))
+        stop_ids = resolve_stop_token_ids(tokenizer, ("<end_of_turn>", "<eos>", "<|im_end|>"))
         gen_kwargs: dict[str, Any] = {
             **inputs,
             "streamer": streamer,
@@ -84,6 +100,8 @@ class Gemma3LanguageModel:
             "temperature": max(0.01, temperature),
             "top_p": float(req.get("top_p", 0.9)),
         }
+        if stop_ids is not None:
+            gen_kwargs["eos_token_id"] = stop_ids
 
         exc_holder: list[BaseException] = []
 

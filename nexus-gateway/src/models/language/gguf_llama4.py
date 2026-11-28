@@ -5,7 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from core.capabilities import resolve_curated_template_path
+from models.gguf_metadata import inspect_gguf_directory
 from models.language.gguf_common import LlamaServerRuntimeBase
+
+
+def select_llama4_template_file(model_path: Path) -> Optional[Path]:
+    """Select curated `llama4_scout_nexus.jinja` when GGUF lacks clean Llama 4 tool_calls support."""
+    layout = inspect_gguf_directory(model_path if model_path.is_dir() else model_path.parent)
+    hdr = layout.header
+    if hdr is None or (not hdr.template_has_tools) or hdr.template_has_ipython_compulsion or hdr.template_style != "llama4":
+        return resolve_curated_template_path("llama4_scout_nexus.jinja")
+    return None
 
 
 class GgufLlama4Model:
@@ -41,7 +52,12 @@ class GgufLlama4Model:
             reasoning_format=None,
             allow_quantized_kv=False,
             moe_cpu_offload=True,
+            chat_template_file=select_llama4_template_file(model_path),
         )
+
+    @property
+    def last_usage(self) -> Optional[dict[str, int]]:
+        return self.server.last_usage
 
     def is_ready(self) -> bool:
         return self.server.is_ready()

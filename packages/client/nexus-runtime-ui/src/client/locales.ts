@@ -63,7 +63,7 @@ export const NEXUS_UI_COPY = {
   'notify.imageReadyBody': 'Your generated image is ready to view.',
   'notify.tabBadge': '(✓) Ready — ',
 
-  // Inline generated image tool card
+  // Inline generated image tool card & turn-tail showcase
   'imageCard.generating': 'Generating image…',
   'imageCard.title': 'Generated image',
   'imageCard.failed': 'Image generation failed',
@@ -71,10 +71,13 @@ export const NEXUS_UI_COPY = {
   'imageCard.previewError': 'Could not load image preview',
   'imageCard.savedToDrive': 'Saved to Drive',
   'imageCard.inspect': 'Inspect',
+  'imageCard.zoom': 'Zoom',
+  'imageCard.closeLightbox': 'Close',
   'imageCard.closeLightboxAria': 'Close image preview',
   'imageCard.altFallback': 'Generated image',
-  'imageCard.download': 'Download PNG',
-  'imageCard.openPreview': 'Open in Preview',
+  'imageCard.workspaceFileBadge': 'generated_images/{name}',
+  'imageCard.download': 'Download',
+  'imageCard.openPreview': 'Preview in sidebar',
   'imageCard.copyPath': 'Copy path',
   'imageCard.copied': 'Copied',
   'imageCard.drivePath': 'Drive',

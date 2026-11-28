@@ -4,7 +4,6 @@
  * composer's `conversation.input.right` slot.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
-import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {} from '@deepseek-ai/dsh-client-ui-context-menu/client'
@@ -127,14 +126,22 @@ export function apply(ctx: ClientContext): void {
       inject: (sessionId: SessionId): NexusTurnImagesTailInjected => {
         const binding = convScope.sessions.binding(sessionId)
         if (binding === undefined) {
-          return { useImages: () => [] }
+          return {
+            keyedHooks: {
+              images: () => undefined,
+            },
+          }
         }
         const chat = convScope.uiConversation.binding(binding).target('chat')
         return {
-          useImages: (turn: PropsRuntime<'conversation.chat.turnTail'>['turn']) => {
-            const snapshot = chat.getSnapshot()
-            if (snapshot === undefined) return []
-            return snapshot.nodes.turnDataSource(Number(turn), 'nexus-generated-images').getSnapshot()
+          keyedHooks: {
+            images: (turn: string) => {
+              const snapshot = chat.getSnapshot()
+              if (snapshot === undefined) return undefined
+              const turnNumber = Number(turn)
+              if (!Number.isFinite(turnNumber)) return undefined
+              return snapshot.nodes.turnDataSource(turnNumber, 'nexus-generated-images')
+            },
           },
         }
       },

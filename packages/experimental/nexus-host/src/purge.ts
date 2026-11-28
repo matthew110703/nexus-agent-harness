@@ -45,6 +45,19 @@ function isStrictlyInsideAllowedRoot(targetPath: string): boolean {
   return false
 }
 
+async function maybePurgeSingleSidecar(metaPath: string, entry: string, dir: string, sessionId: string): Promise<string | undefined> {
+  const raw = await fs.readFile(metaPath, 'utf8')
+  const meta = JSON.parse(raw) as { session_id?: string; filename?: string }
+  if (meta.session_id === sessionId) {
+    const pngName = meta.filename || entry.slice(0, -5)
+    const pngPath = path.join(dir, pngName)
+    await fs.rm(metaPath, { force: true })
+    await fs.rm(pngPath, { force: true })
+    return pngPath
+  }
+  return undefined
+}
+
 async function deleteSessionGeneratedImages(sessionId: string, extraDirs: string[]): Promise<string[]> {
   const deleted: string[] = []
   const dirs = new Set<string>([
@@ -55,24 +68,21 @@ async function deleteSessionGeneratedImages(sessionId: string, extraDirs: string
     let entries: string[]
     try {
       entries = await fs.readdir(dir)
-    } catch {
+    } catch (_readdirErr) {
+      // Directory does not exist on disk yet; skip cleanly.
       continue
     }
     for (const entry of entries) {
       if (!entry.endsWith('.png.json')) continue
       const metaPath = path.join(dir, entry)
+      let removedPng: string | undefined
       try {
-        const raw = await fs.readFile(metaPath, 'utf8')
-        const meta = JSON.parse(raw) as { session_id?: string; filename?: string }
-        if (meta.session_id === sessionId) {
-          const pngName = meta.filename || entry.slice(0, -5)
-          const pngPath = path.join(dir, pngName)
-          await fs.rm(metaPath, { force: true })
-          await fs.rm(pngPath, { force: true })
-          deleted.push(pngPath)
-        }
-      } catch {
-        // Skip unreadable or malformed sidecar files
+        removedPng = await maybePurgeSingleSidecar(metaPath, entry, dir, sessionId)
+      } catch (_sidecarErr) {
+        // Skip unreadable or malformed sidecar files.
+      }
+      if (removedPng !== undefined) {
+        deleted.push(removedPng)
       }
     }
   }
@@ -145,13 +155,13 @@ export function registerNexusPurgeRoutes(ctx: Context): void {
             if (commands?.execute) {
               try {
                 await commands.execute('session.stop', { sessionId })
-              } catch {
-                // Session may already be idle
+              } catch (_stopErr) {
+                // Session may already be idle.
               }
               try {
                 await commands.execute('workspace.removeSession', { sessionId })
-              } catch {
-                // Session may not belong to a workspace
+              } catch (_removeErr) {
+                // Session may not belong to a workspace.
               }
             }
             const extraDirs = body.workspacePath

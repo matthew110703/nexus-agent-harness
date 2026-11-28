@@ -1,23 +1,30 @@
 /**
- * Turn-tail image gallery rendered directly beneath the assistant reply (outside `Called tools`).
- * Displays full-bleed PNG previews via `/api/file?path=...`, click-to-zoom lightbox,
- * Download PNG, Open in Preview, and exact Drive/Workspace save paths.
+ * Turn-tail image showcase rendered directly beneath the assistant reply (outside `Called tools`).
+ * Uses reactive `keyedHooks` store subscription, native `--dsw-alias-*` tokens, one-click
+ * Right-Sidebar zoom/pan preview (`openFile`), and an `Escape`-enabled blurred modal lightbox.
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
-import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
+import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import { resolveCompactModelName } from './displayName.ts'
 import { tNexus } from './locales.ts'
+import css from './NexusImageCard.module.css'
 import type { NexusTurnImage } from './turn-images.ts'
 
+/** Turn-keyed reactive image source injected from `conversation.chat.turnTail`. */
 export interface NexusTurnImagesTailInjected {
-  useImages: (turn: PropsRuntime<'conversation.chat.turnTail'>['turn']) => readonly NexusTurnImage[]
+  keyedHooks: {
+    images: (turn: string) => ObservableSnapshot<readonly NexusTurnImage[]> | undefined
+  }
 }
 
-export type NexusTurnImagesTailProps = PropsRuntime<'conversation.chat.turnTail'> & NexusTurnImagesTailInjected
+/** Complete props received by `NexusTurnImagesTail`. */
+export type NexusTurnImagesTailProps = PropsRuntime<'conversation.chat.turnTail'> & InjectFace<NexusTurnImagesTailInjected>
 
-function resolveImageUrl(item: NexusTurnImage): string {
-  const diskPath = item.masterPath || item.drivePath || item.workspacePath
+function resolvePrimaryImageUrl(item: NexusTurnImage): string {
+  const diskPath = item.workspacePath || item.masterPath || item.drivePath
   if (diskPath) {
     return `/api/file?path=${encodeURIComponent(diskPath)}`
   }
@@ -27,125 +34,189 @@ function resolveImageUrl(item: NexusTurnImage): string {
   return ''
 }
 
+function resolveFallbackImageUrl(item: NexusTurnImage): string {
+  const altDiskPath = item.drivePath && item.drivePath !== item.workspacePath ? item.drivePath : item.masterPath
+  if (altDiskPath) {
+    return `/api/file?path=${encodeURIComponent(altDiskPath)}`
+  }
+  return ''
+}
+
+function formatShortBadgeLabel(item: NexusTurnImage): string {
+  const name = item.filename || 'generated.png'
+  if (item.workspacePath) {
+    return tNexus('imageCard.workspaceFileBadge', { name })
+  }
+  return name
+}
+
+interface LightboxState {
+  url: string
+  alt: string
+  filename: string
+  sidebarPath: string
+}
+
 /**
  * Render generated images for the current assistant turn directly in the main chat flow.
- * @param props - Turn-tail slot props plus `useImages` projection hook.
- * @returns Gallery JSX or `null` when the turn generated no images.
+ * @param props - Turn-tail slot props plus reactive `useImages` keyed selector hook.
+ * @returns Showcase gallery JSX or `null` when the turn generated no images.
  */
 export function NexusTurnImagesTail(props: NexusTurnImagesTailProps) {
-  const images = props.useImages(props.turn).filter(img => Boolean(img.attachmentId || img.masterPath || img.drivePath))
-  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null)
-  const [lightboxAlt, setLightboxAlt] = useState<string>('')
+  const turnKey = String(props.turn.turn)
+  const rawImages = props.useImages(turnKey) ?? []
+  const images = rawImages.filter(img => Boolean(img.attachmentId || img.masterPath || img.drivePath || img.workspacePath))
+
+  const [loadedMap, setLoadedMap] = useState<Record<string, boolean>>({})
+  const [fallbackMap, setFallbackMap] = useState<Record<string, boolean>>({})
+  const [errorMap, setErrorMap] = useState<Record<string, boolean>>({})
+  const [lightbox, setLightbox] = useState<LightboxState | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (lightbox === null || typeof window === 'undefined') return
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') {
+        ev.stopPropagation()
+        setLightbox(null)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [lightbox])
 
   if (images.length === 0) {
     return null
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '10px', maxWidth: '580px' }}>
+    <div className={css.gallery} data-nexus-turn-gallery={turnKey}>
       {images.map((item) => {
-        const src = resolveImageUrl(item)
-        const primaryPath = item.drivePath || item.masterPath || item.workspacePath
+        const useFallback = fallbackMap[item.callId] === true
+        const primaryUrl = resolvePrimaryImageUrl(item)
+        const backupUrl = resolveFallbackImageUrl(item)
+        const src = useFallback && backupUrl ? backupUrl : primaryUrl
+        const sidebarTargetPath = item.workspacePath || item.masterPath || item.drivePath
+        const copyTargetPath = item.workspacePath || item.drivePath || item.masterPath
+        const altText = item.prompt || item.filename || tNexus('imageCard.altFallback')
+        const isLoaded = loadedMap[item.callId] === true
+        const hasError = errorMap[item.callId] === true
+
         const metaParts = [
-          item.width > 0 && item.height > 0 ? `${item.width}x${item.height}` : '',
+          item.width > 0 && item.height > 0 ? `${item.width}×${item.height}` : '',
+          item.model ? resolveCompactModelName(item.model) : '',
           item.steps > 0 ? tNexus('imageCard.stepsLabel', { steps: item.steps }) : '',
-          item.model,
         ].filter(Boolean)
 
-        return (
-          <div
-            key={item.callId}
-            data-nexus-turn-image={item.callId}
-            style={{
-              border: '1px solid var(--border-subtle, rgba(255,255,255,0.14))',
-              borderRadius: '12px',
-              padding: '10px',
-              background: 'var(--bg-elevated, rgba(255,255,255,0.03))',
-            }}
-          >
-            {src ? (
-              <img
-                src={src}
-                alt={item.prompt || item.filename || tNexus('imageCard.altFallback')}
-                onClick={() => {
-                  setLightboxUrl(src)
-                  setLightboxAlt(item.prompt || item.filename || tNexus('imageCard.altFallback'))
-                }}
-                style={{
-                  display: 'block',
-                  width: '100%',
-                  maxHeight: '480px',
-                  objectFit: 'contain',
-                  borderRadius: '8px',
-                  cursor: 'zoom-in',
-                  background: 'rgba(0,0,0,0.18)',
-                }}
-              />
-            ) : null}
+        const openLightbox = () => {
+          if (!src) return
+          setLightbox({
+            url: src,
+            alt: altText,
+            filename: item.filename || 'generated.png',
+            sidebarPath: sidebarTargetPath,
+          })
+        }
 
-            <div
-              style={{
-                display: 'flex',
-                flexWrap: 'wrap',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: '8px',
-                marginTop: '8px',
-                fontSize: '11px',
-              }}
-            >
-              <span style={{ opacity: 0.72 }}>{metaParts.join(' · ')}</span>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+        return (
+          <div key={item.callId} className={css.heroCard} data-nexus-turn-image={item.callId}>
+            <div className={css.stage}>
+              {!isLoaded ? (
+                <div className={css.skeleton}>
+                  {hasError ? tNexus('imageCard.previewError') : tNexus('imageCard.loadingPreview')}
+                </div>
+              ) : null}
+
+              {src && !hasError ? (
+                <button
+                  type="button"
+                  className={css.stageButton}
+                  aria-label={tNexus('imageCard.zoom')}
+                  onClick={openLightbox}
+                >
+                  <img
+                    src={src}
+                    alt={altText}
+                    className={css.heroImg}
+                    data-loading={isLoaded ? 'false' : 'true'}
+                    onLoad={() => {
+                      setLoadedMap(prev => ({ ...prev, [item.callId]: true }))
+                    }}
+                    onError={() => {
+                      if (!useFallback && backupUrl && backupUrl !== primaryUrl) {
+                        setFallbackMap(prev => ({ ...prev, [item.callId]: true }))
+                      } else {
+                        setErrorMap(prev => ({ ...prev, [item.callId]: true }))
+                      }
+                    }}
+                  />
+                </button>
+              ) : null}
+
+              <div className={css.floatingActions}>
+                {src && !hasError ? (
+                  <button type="button" className={css.glassBtn} onClick={openLightbox}>
+                    {tNexus('imageCard.zoom')}
+                  </button>
+                ) : null}
                 {src ? (
                   <a
                     href={src}
                     download={item.filename || 'generated.png'}
-                    style={{
-                      padding: '3px 8px',
-                      borderRadius: '6px',
-                      border: '1px solid var(--border-subtle, rgba(255,255,255,0.16))',
-                      color: 'inherit',
-                      textDecoration: 'none',
-                    }}
+                    className={css.glassBtn}
                   >
                     {tNexus('imageCard.download')}
                   </a>
                 ) : null}
-                {primaryPath ? (
+              </div>
+            </div>
+
+            <div className={css.footer}>
+              <div className={css.footerMeta}>
+                {sidebarTargetPath ? (
                   <button
                     type="button"
+                    className={css.workspaceBadge}
+                    title={sidebarTargetPath}
                     onClick={() => {
-                      props.openFile(primaryPath)
+                      props.openFile(sidebarTargetPath)
                     }}
-                    style={{
-                      padding: '3px 8px',
-                      borderRadius: '6px',
-                      border: '1px solid var(--border-subtle, rgba(255,255,255,0.16))',
-                      background: 'transparent',
-                      color: 'inherit',
-                      cursor: 'pointer',
+                  >
+                    {formatShortBadgeLabel(item)}
+                  </button>
+                ) : (
+                  <span className={css.workspaceBadge}>{formatShortBadgeLabel(item)}</span>
+                )}
+                {metaParts.length > 0 ? (
+                  <span className={css.metaSubline}>{metaParts.join(' · ')}</span>
+                ) : null}
+              </div>
+
+              <div className={css.footerActions}>
+                {sidebarTargetPath ? (
+                  <button
+                    type="button"
+                    className={css.actionBtn}
+                    onClick={() => {
+                      props.openFile(sidebarTargetPath)
                     }}
                   >
                     {tNexus('imageCard.openPreview')}
                   </button>
                 ) : null}
-                {primaryPath ? (
+                {copyTargetPath ? (
                   <button
                     type="button"
+                    className={css.actionBtn}
                     onClick={() => {
-                      void navigator.clipboard.writeText(primaryPath).then(() => {
+                      void navigator.clipboard.writeText(copyTargetPath).then(() => {
                         setCopiedId(item.callId)
-                        setTimeout(() => { setCopiedId(cur => (cur === item.callId ? null : cur)) }, 1500)
+                        setTimeout(() => {
+                          setCopiedId(cur => (cur === item.callId ? null : cur))
+                        }, 1500)
                       })
-                    }}
-                    style={{
-                      padding: '3px 8px',
-                      borderRadius: '6px',
-                      border: '1px solid var(--border-subtle, rgba(255,255,255,0.16))',
-                      background: 'transparent',
-                      color: 'inherit',
-                      cursor: 'pointer',
                     }}
                   >
                     {copiedId === item.callId ? tNexus('imageCard.copied') : tNexus('imageCard.copyPath')}
@@ -153,40 +224,66 @@ export function NexusTurnImagesTail(props: NexusTurnImagesTailProps) {
                 ) : null}
               </div>
             </div>
-
-            {primaryPath ? (
-              <div style={{ marginTop: '6px', fontSize: '11px', opacity: 0.6, wordBreak: 'break-all' }}>
-                {item.drivePath ? `${tNexus('imageCard.drivePath')}: ${item.drivePath}` : primaryPath}
-              </div>
-            ) : null}
           </div>
         )
       })}
 
-      {lightboxUrl && typeof document !== 'undefined'
+      {lightbox !== null && typeof document !== 'undefined'
         ? createPortal(
           <div
             role="dialog"
             aria-modal="true"
             aria-label={tNexus('imageCard.closeLightboxAria')}
-            onClick={() => { setLightboxUrl(null) }}
-            style={{
-              position: 'fixed',
-              inset: 0,
-              zIndex: 9999,
-              background: 'rgba(0,0,0,0.88)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: '24px',
-              cursor: 'zoom-out',
-            }}
+            className={css.lightboxBackdrop}
           >
-            <img
-              src={lightboxUrl}
-              alt={lightboxAlt}
-              style={{ maxWidth: '94vw', maxHeight: '92vh', borderRadius: '8px', objectFit: 'contain' }}
+            <div
+              className={css.lightboxMask}
+              onClick={() => {
+                setLightbox(null)
+              }}
             />
+            <div
+              className={css.lightboxStage}
+              onClick={(ev) => {
+                if (ev.target === ev.currentTarget) {
+                  setLightbox(null)
+                }
+              }}
+            >
+              <div className={css.lightboxToolbar}>
+                {lightbox.sidebarPath ? (
+                  <button
+                    type="button"
+                    className={css.glassBtn}
+                    onClick={() => {
+                      const target = lightbox.sidebarPath
+                      setLightbox(null)
+                      props.openFile(target)
+                    }}
+                  >
+                    {tNexus('imageCard.openPreview')}
+                  </button>
+                ) : null}
+                <a
+                  href={lightbox.url}
+                  download={lightbox.filename}
+                  className={css.glassBtn}
+                >
+                  {tNexus('imageCard.download')}
+                </a>
+                <button
+                  type="button"
+                  className={css.glassBtn}
+                  aria-label={tNexus('imageCard.closeLightboxAria')}
+                  onClick={() => {
+                    setLightbox(null)
+                  }}
+                >
+                  {tNexus('imageCard.closeLightbox')}
+                </button>
+              </div>
+              <img src={lightbox.url} alt={lightbox.alt} className={css.lightboxImage} />
+            </div>
           </div>,
           document.body,
         )

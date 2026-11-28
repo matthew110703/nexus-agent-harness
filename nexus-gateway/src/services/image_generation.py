@@ -135,11 +135,7 @@ def save_generated_image_artifact(
     tmp_meta = drive_dir / f".{filename}.json.tmp"
     tmp_meta.write_text(meta_json, encoding="utf-8")
     os.replace(tmp_meta, drive_meta_path)
-    if ws_dir is not None and workspace_path is not None:
-        ws_meta_path = ws_dir / f"{filename}.json"
-        tmp_ws_meta = ws_dir / f".{filename}.json.tmp"
-        tmp_ws_meta.write_text(meta_json, encoding="utf-8")
-        os.replace(tmp_ws_meta, ws_meta_path)
+    # Keep workspace/generated_images clean with only .png deliverables (metadata lives in outputs/generated_images).
 
     return {
         "artifact_id": artifact_id,

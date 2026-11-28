@@ -77,6 +77,9 @@ class GgufHeaderInfo:
     block_count: Optional[int] = None
     context_length: Optional[int] = None
     has_think_template: bool = False
+    template_has_tools: bool = False
+    template_has_ipython_compulsion: bool = False
+    template_style: str = "unknown"
     tensor_count: int = 0
     version: int = 0
 
@@ -155,6 +158,32 @@ def infer_quantization_from_name(name: str) -> str:
     return m.group(1).upper() if m else "unknown"
 
 
+def _classify_template(tpl: str) -> tuple[bool, bool, str]:
+    low = (tpl or "").lower()
+    has_tools = bool(
+        "tools" in low
+        and (
+            "tool_calls" in low
+            or "tool_call" in low
+            or "python_tag" in low
+            or "python_start" in low
+            or "start_function_call" in low
+        )
+    )
+    has_ipython_compulsion = "environment: ipython" in low
+    if "<|header_start|>" in tpl or "<|python_start|>" in tpl:
+        style = "llama4"
+    elif "<|start_header_id|>" in tpl or "<|eot_id|>" in tpl:
+        style = "llama3"
+    elif "<|im_start|>" in tpl or "<|im_end|>" in tpl:
+        style = "chatml"
+    elif "<start_of_turn>" in tpl or "<end_of_turn>" in tpl:
+        style = "gemma"
+    else:
+        style = "unknown"
+    return has_tools, has_ipython_compulsion, style
+
+
 def read_gguf_header(path: Path, *, max_kv_scan: int = 256) -> Optional[GgufHeaderInfo]:
     """Read core GGUF metadata keys from `path` in milliseconds without loading weights."""
     try:
@@ -193,6 +222,7 @@ def read_gguf_header(path: Path, *, max_kv_scan: int = 256) -> Optional[GgufHead
             block_count = raw_meta.get(f"{arch}.block_count")
             ctx_len = raw_meta.get(f"{arch}.context_length")
             tpl = str(raw_meta.get("tokenizer.chat_template") or "")
+            tpl_has_tools, tpl_ipython, tpl_style = _classify_template(tpl)
 
             return GgufHeaderInfo(
                 architecture=arch,
@@ -202,6 +232,9 @@ def read_gguf_header(path: Path, *, max_kv_scan: int = 256) -> Optional[GgufHead
                 block_count=int(block_count) if isinstance(block_count, int) and block_count > 0 else None,
                 context_length=int(ctx_len) if isinstance(ctx_len, int) and ctx_len > 0 else None,
                 has_think_template="<think>" in tpl.lower(),
+                template_has_tools=tpl_has_tools,
+                template_has_ipython_compulsion=tpl_ipython,
+                template_style=tpl_style,
                 tensor_count=int(tensor_count),
                 version=int(version),
             )
@@ -270,7 +303,21 @@ def inspect_gguf_directory(model_dir: Path) -> GgufDirectoryLayout:
         p for p in root.iterdir()
         if p.is_file() and not p.name.endswith(".copying") and not p.name.startswith(".")
     )
-    mmproj_candidates = [p for p in files if p.name.lower().endswith(".gguf") and "mmproj" in p.name.lower() and p.stat().st_size > 0]
+    mmproj_candidates = [
+        p
+        for p in files
+        if p.name.lower().endswith(".gguf")
+        and any(tag in p.name.lower() for tag in ("mmproj", "vision-projector", "projector"))
+        and p.stat().st_size > 0
+    ]
+    if not mmproj_candidates and root != model_dir:
+        mmproj_candidates = sorted(
+            p
+            for p in model_dir.rglob("*.gguf")
+            if p.is_file()
+            and any(tag in p.name.lower() for tag in ("mmproj", "vision-projector", "projector"))
+            and p.stat().st_size > 0
+        )
     mmproj_file = mmproj_candidates[0] if mmproj_candidates else None
 
     # 1. Check raw byte-split parts (`<name>.gguf.part1ofN` ... `.partNofN`)

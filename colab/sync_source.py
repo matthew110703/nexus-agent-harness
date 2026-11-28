@@ -118,7 +118,12 @@ def classify_restart_target(runtime_rel_path: str) -> RestartTarget:
     norm = runtime_rel_path.replace("\\", "/")
     if norm.endswith(("requirements.txt", "pyproject.toml", "package.json", "pnpm-lock.yaml")):
         return "dependencies"
-    if norm.startswith(("nexus-gateway/src/workers/", "nexus-gateway/src/adapters/", "nexus-gateway/src/models/")):
+    if norm.startswith((
+        "nexus-gateway/src/workers/",
+        "nexus-gateway/src/adapters/",
+        "nexus-gateway/src/models/",
+        "nexus-gateway/src/templates/",
+    )):
         return "model_worker"
     if norm.startswith("nexus-gateway/") or norm == "colab/plugin-index.json":
         return "gateway_api"

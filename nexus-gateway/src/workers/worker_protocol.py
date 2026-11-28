@@ -32,6 +32,9 @@ class WorkerGenerateRequest:
     tool_choice: Any = "auto"
     temperature: float = 0.7
     top_p: float = 0.9
+    min_p: Optional[float] = None
+    repeat_penalty: Optional[float] = None
+    stop: list[str] = field(default_factory=list)
     max_tokens: int = 4096
     reasoning_effort: Optional[str] = None
     enable_thinking: Optional[bool] = None

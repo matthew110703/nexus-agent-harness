@@ -661,7 +661,7 @@ def validate_selected_pair(
 def format_inventory_report(inv: DriveInventory, *, gpu_summary: str = "Unknown GPU") -> str:
     """Format a copy-pasteable inventory report for the Colab Inventory cell."""
     lines = [
-        f"=== NEXUS AI LAB v2.1.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
+        f"=== NEXUS AI LAB v2.3.0 — DRIVE MODEL INVENTORY ({gpu_summary}) ===",
         "",
         f"Selectable Language Models ({len(inv.language_models)}):",
     ]
@@ -674,8 +674,9 @@ def format_inventory_report(inv: DriveInventory, *, gpu_summary: str = "Unknown 
         quant_str = f"{m.quantization}" if m.quantization != "unknown" else "-"
         shard_str = f"{m.shard_count}p" if m.shard_count > 1 else "1f"
         ctx_str = f"ctx={m.n_ctx}" if m.n_ctx else f"ctx={m.context_window}"
+        vis_str = "VISION" if "image" in (m.modalities or []) else "TEXT-ONLY"
         lines.append(
-            f"  - {m.id:<34} | impl={m.implementation:<14} | {m.size_bytes / GIB:5.1f} GiB "
+            f"  - {m.id:<34} | impl={m.implementation:<14} | {vis_str:<9} | {m.size_bytes / GIB:5.1f} GiB "
             f"| q={quant_str:<7} ({shard_str}) | {ctx_str:<9} | {tier}"
         )
 

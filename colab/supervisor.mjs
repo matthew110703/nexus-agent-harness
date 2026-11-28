@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 /**
- * Nexus Harness Colab Supervisor (v1.1.0 — Single-Model Lock)
+ * Nexus Harness Colab Supervisor (v2.3.0 — Dynamic Model Capability & Workspace Sync)
  *
  * Verifies live Gateway readiness and the single Colab-loaded language model
- * via `/v1/runtime`, locks Harness `llm-pi-ai` and `agent-default-model` to
- * that single model, launches `cloudflared` (quick tunnel -> 127.0.0.1:3080)
- * and `dsh web`, redacts `NEXUS_API_KEY`, and cleans up only managed children.
+ * via `/v1/runtime`, exports true vision vs image-generation capability flags,
+ * ensures `default-workspace` exists on Google Drive, launches `cloudflared`
+ * (quick tunnel -> 127.0.0.1:3080) and `dsh web`, redacts `NEXUS_API_KEY`,
+ * and cleans up only managed children.
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import * as fs from 'node:fs'
 import net from 'node:net'
+import * as path from 'node:path'
 import process from 'node:process'
 
 const HARNESS_PORT = Number(process.env.NEXUS_HARNESS_PORT || 3080)
@@ -132,7 +135,7 @@ export function buildLockedModelProfile(item) {
   return entry
 }
 
-/** Verify Gateway live readiness and return the single locked language model profile. */
+/** Verify Gateway live readiness and return the single locked language model + capability flags. */
 async function verifyGatewaySessionReady() {
   if (!API_KEY) {
     throw new Error('NEXUS_API_KEY is not set in the environment')
@@ -148,7 +151,11 @@ async function verifyGatewaySessionReady() {
   const payload = await res.json()
   const worker = payload?.worker ?? {}
   const lang = payload?.language_model
-  if (!payload?.ready || !worker.alive || worker.active_model_id !== lang?.id) {
+  if (
+    !payload?.ready
+    || !worker.alive
+    || (worker.active_language_id !== lang?.id && worker.active_model_id !== lang?.id)
+  ) {
     throw new Error(
       `Nexus gateway is not ready (ready=${payload?.ready}, state=${payload?.state}, `
       + `worker.alive=${worker.alive}, active_model=${worker.active_model_id ?? 'none'}). `
@@ -156,7 +163,16 @@ async function verifyGatewaySessionReady() {
     )
   }
   const lockedModel = buildLockedModelProfile(lang)
-  if (payload?.image_model?.id) {
+  const nativeVisionInput = Boolean(
+    payload?.capabilities?.vision_input_enabled
+      ?? (Array.isArray(lang?.modalities) && lang.modalities.includes('image')),
+  )
+  const imageModelId = payload?.image_model?.id ?? null
+
+  // Allow user image uploads in the composer when either VLM vision OR img2img generation is active,
+  // while keeping `NEXUS_VISION_INPUT_ENABLED` strictly gated on true VLM vision so text-only LLMs
+  // never receive `read_image`!
+  if (imageModelId) {
     const curInput = Array.isArray(lockedModel.input) ? lockedModel.input : ['text']
     if (!curInput.includes('image')) {
       lockedModel.input = [...curInput, 'image']
@@ -164,7 +180,8 @@ async function verifyGatewaySessionReady() {
   }
   return {
     lockedModel,
-    imageModelId: payload?.image_model?.id ?? null,
+    imageModelId,
+    nativeVisionInput,
   }
 }
 
@@ -172,9 +189,10 @@ async function main() {
   assertMinNodeVersion()
   console.log(`[supervisor] Node ${process.versions.node} verified.`)
   console.log('[supervisor] Verifying live Nexus gateway readiness and single loaded model...')
-  const { lockedModel, imageModelId } = await verifyGatewaySessionReady()
+  const { lockedModel, imageModelId, nativeVisionInput } = await verifyGatewaySessionReady()
   console.log(
     `[supervisor] Locked language model ready: ${lockedModel.id}`
+    + ` | Vision input: ${nativeVisionInput ? 'ENABLED' : 'TEXT-ONLY'}`
     + (imageModelId ? ` | Image model: ${imageModelId}` : ' | Image model: disabled'),
   )
 
@@ -190,8 +208,8 @@ async function main() {
       if (!child.killed) {
         try {
           child.kill('SIGTERM')
-        } catch {
-          // Process already exited.
+        } catch (_killErr) {
+          // Child process already exited before shutdown signal arrived.
         }
       }
     }
@@ -260,14 +278,25 @@ async function main() {
       console.log('[supervisor] bwrap user-namespace unavailable in Colab container; using DSH_PERMISSION_MODE=danger-full-access so Bash/Write work.')
     }
   }
-  const defaultWorkspace = process.env.NEXUS_DEFAULT_WORKSPACE || process.env.NEXUS_WORKSPACE_ROOT || '/content/drive/MyDrive/Nexus/workspaces/projects'
-  console.log(`[supervisor] Starting locked Nexus Harness (${publicUrl})...`)
+
+  const projectsRoot = process.env.NEXUS_WORKSPACE_ROOT || '/content/drive/MyDrive/Nexus/workspaces/projects'
+  const defaultWorkspace = process.env.NEXUS_DEFAULT_WORKSPACE || path.join(projectsRoot, 'default-workspace')
+  try {
+    fs.mkdirSync(defaultWorkspace, { recursive: true })
+  } catch (_mkdirErr) {
+    // Non-fatal if running in a local test environment without /content/drive mounted.
+  }
+
+  console.log(`[supervisor] Starting locked Nexus Harness (${publicUrl}, workspace=${defaultWorkspace})...`)
   const harnessEnv = {
     ...process.env,
     DSH_PERMISSION_MODE: permissionMode,
+    NEXUS_WORKSPACE_ROOT: projectsRoot,
     NEXUS_DEFAULT_WORKSPACE: defaultWorkspace,
     NEXUS_DISCOVERED_MODELS: JSON.stringify([lockedModel]),
     NEXUS_SELECTED_LANGUAGE_MODEL: lockedModel.id,
+    NEXUS_VISION_INPUT_ENABLED: nativeVisionInput ? '1' : '0',
+    NEXUS_IMAGE_MODEL_ENABLED: imageModelId ? '1' : '0',
   }
   const harness = spawn('pnpm', dshArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],

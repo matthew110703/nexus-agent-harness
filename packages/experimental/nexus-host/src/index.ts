@@ -1,9 +1,9 @@
 /**
- * Nexus Host plugin (v1.1.0 — Single-Model Lock):
- * Registers the `nexus_generate_image` tool (backed by `ctx.attachments.saveImage`)
- * and read-only authenticated same-origin Host proxies for live Gateway runtime
- * status and operation progress. Model selection, staging, and loading are owned
- * exclusively by Colab bootstrap.
+ * Nexus Host plugin (v2.3.0 — Intent-Guarded Image Generation & Workspace Sync):
+ * Registers `nexus_generate_image` (with pre-GPU visual-question intent guard and
+ * `fs/observed` workspace file-tree invalidations for Google Drive FUSE),
+ * `nexus_web_research`, `nexus_inspect_runtime`, and read-only authenticated
+ * same-origin Host proxies for live Gateway runtime status and operation progress.
  * @module @deepseek-ai/dsh-nexus-host
  */
 
@@ -14,9 +14,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-client-connection'
+import type { FileSystem } from '@deepseek-ai/dsh-fs'
+import type {} from '@deepseek-ai/dsh-system-prompt'
+import { defineTool, ToolArgsError } from '@deepseek-ai/dsh-tools'
+import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-working-directory'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { registerNexusPurgeRoutes } from './purge.ts'
 import {
   createNexusInspectRuntimeTool,
@@ -34,6 +36,21 @@ const MAX_IMAGE_RESPONSE_BYTES = 24 * 1024 * 1024
 /** Maximum JSON proxy snapshot size relayed to the browser (256 KiB). */
 const MAX_PROXY_RESPONSE_BYTES = 256 * 1024
 const OPERATION_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/
+
+const VISUAL_QUESTION_RE = new RegExp(
+  '\\b(?:who\\s+is|what\\s+is|what\'s\\s+in|identify|recognize|recognise|analyze|analyse|'
+  + 'describe|explain\\s+(?:this|the)\\s+(?:image|photo|picture)|ocr|read\\s+(?:the\\s+)?text|'
+  + 'tell\\s+me\\s+(?:who|what)|can\\s+you\\s+(?:see|analyze|identify))\\b',
+  'i',
+)
+const EXPLICIT_IMAGE_GEN_RE = new RegExp(
+  '\\b(?:generate|create|draw|paint|render|illustrate|make\\s+(?:an?\\s+|me\\s+)?'
+  + '(?:image|picture|photo|portrait|artwork|wallpaper|logo|illustration)|edit|modify|restyle|stylize|'
+  + 'transform|turn\\s+(?:this|him|her|it|them)\\s+into|change\\s+(?:the\\s+)?'
+  + '(?:background|style|outfit|hair|lighting|color)|add\\s+.*\\s+to\\s+(?:the\\s+)?(?:image|photo)|'
+  + 'remove\\s+.*\\s+from\\s+(?:the\\s+)?(?:image|photo)|upscale|remix|img2img)\\b',
+  'i',
+)
 
 /** Validated configuration for the Nexus Host plugin. */
 export interface Config {
@@ -55,7 +72,11 @@ export const Config: z<Config> = z.object({
   progressTimeoutMs: z.natural().min(500).default(5000),
 })
 
-/** Verify that the configured gateway URL targets loopback only. */
+/**
+ * Verify that the configured gateway URL targets loopback only.
+ * @param rawUrl - Candidate gateway base URL.
+ * @returns Validated loopback URL instance.
+ */
 export function assertLoopbackGatewayUrl(rawUrl: string): URL {
   const parsed = new URL(rawUrl)
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
@@ -66,6 +87,37 @@ export function assertLoopbackGatewayUrl(rawUrl: string): URL {
     throw new Error(`Nexus gateway URL must be loopback-only, got ${parsed.hostname}`)
   }
   return parsed
+}
+
+/**
+ * Check whether an image generation call is actually a hallucinated attempt to identify
+ * or analyze an uploaded image when the user asked a visual question without requesting generation.
+ * @param userText - Latest human prompt text in the session.
+ * @param promptArg - Tool `prompt` argument passed by the model.
+ * @param hasUploadedImage - Whether the latest user turn attached an image or `use_uploaded_image` is set.
+ * @returns `true` when the call should be blocked before touching the GPU.
+ */
+export function shouldBlockUnsolicitedImageGen(
+  userText: string,
+  promptArg: string,
+  hasUploadedImage: boolean,
+): boolean {
+  const cleanUser = userText.trim()
+  const cleanPrompt = promptArg.trim()
+  if (VISUAL_QUESTION_RE.test(cleanPrompt) && !EXPLICIT_IMAGE_GEN_RE.test(cleanPrompt)) {
+    return true
+  }
+  if (!cleanUser) return false
+  if (EXPLICIT_IMAGE_GEN_RE.test(cleanUser)) {
+    return false
+  }
+  if (VISUAL_QUESTION_RE.test(cleanUser)) {
+    return true
+  }
+  if (hasUploadedImage && cleanUser.endsWith('?')) {
+    return true
+  }
+  return false
 }
 
 interface GatewayImagePayload {
@@ -85,12 +137,39 @@ interface GatewayImagePayload {
   b64_png?: string
 }
 
-async function resolveLastUploadedImageB64(
-  ctx: Context,
+interface LatestUserTurnSnapshot {
+  text: string
+  hasImage: boolean
+  imageAttachment?: ImageAttachmentRef
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function extractMessageContentFromEvent(parsed: Record<string, unknown>): {
+  role: string
+  content: unknown[]
+  isRuntimeNotice: boolean
+} | undefined {
+  // Handle both SessionEvent envelope (`{ type: 'user/message', data: { message: { role, content, source } } }`)
+  // and flat legacy JSONL test fixtures (`{ role: 'user', content: [...] }`).
+  const evType = typeof parsed.type === 'string' ? parsed.type : ''
+  const data = isRecord(parsed.data) ? parsed.data : undefined
+  const msg = data && isRecord(data.message) ? data.message : parsed
+  const role = typeof msg.role === 'string' ? msg.role : (evType === 'user/message' ? 'user' : '')
+  const content = Array.isArray(msg.content) ? msg.content : undefined
+  if (!content) return undefined
+  const source = isRecord(msg.source) ? msg.source : undefined
+  const sourceKind = typeof source?.kind === 'string' ? source.kind : ''
+  const isRuntimeNotice = sourceKind !== '' && sourceKind !== 'user' && sourceKind !== 'prompt'
+  return { role, content, isRuntimeNotice }
+}
+
+async function inspectLatestUserTurn(
   sessionId: string,
-  signal: AbortSignal,
-): Promise<string | undefined> {
-  if (!sessionId) return undefined
+): Promise<LatestUserTurnSnapshot> {
+  if (!sessionId) return { text: '', hasImage: false }
   const dshHome = process.env.DSH_HOME?.trim() || path.join(os.homedir(), '.dsh')
   const candidates = [
     path.join(dshHome, 'sessions', sessionId, 'events.jsonl'),
@@ -100,51 +179,156 @@ async function resolveLastUploadedImageB64(
     let raw: string
     try {
       raw = await fs.readFile(jsonlPath, 'utf8')
-    } catch {
+    } catch (_readErr) {
+      // Try next candidate session log path when absent.
       continue
     }
     const lines = raw.trim().split('\n')
+    let latestUserText = ''
+    let latestUserHasImg = false
+    let latestImgRef: ImageAttachmentRef | undefined
+
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i]?.trim()
       if (!line) continue
+      let parsed: unknown
       try {
-        const ev = JSON.parse(line) as {
-          type?: string
-          role?: string
-          content?: Array<{ type?: string; attachment?: unknown }>
-        }
-        if (!Array.isArray(ev.content)) continue
-        for (let j = ev.content.length - 1; j >= 0; j--) {
-          const block = ev.content[j]
-          if (block !== undefined && block.type === 'image') {
-            const att = block.attachment ?? block
-            if (isImageAttachmentRef(att)) {
-              const stored = await ctx.attachments.readImage(att, signal)
-              return Buffer.from(stored.data).toString('base64')
-            }
+        parsed = JSON.parse(line)
+      } catch (_jsonErr) {
+        // Skip malformed trailing JSONL line.
+        continue
+      }
+      if (!isRecord(parsed)) continue
+      const extracted = extractMessageContentFromEvent(parsed)
+      if (!extracted || extracted.role !== 'user' || extracted.isRuntimeNotice) continue
+
+      const textParts: string[] = []
+      let foundImgInTurn = false
+      for (let j = extracted.content.length - 1; j >= 0; j--) {
+        const block = extracted.content[j]
+        if (!isRecord(block)) continue
+        if (block.type === 'text' && typeof block.text === 'string') {
+          textParts.unshift(block.text)
+        } else if (block.type === 'image') {
+          foundImgInTurn = true
+          const att = block.attachment ?? block
+          if (latestImgRef === undefined && isImageAttachmentRef(att)) {
+            latestImgRef = att
           }
         }
-      } catch {
-        // Ignore malformed JSONL lines while scanning backwards
+      }
+      if (!latestUserText && (textParts.length > 0 || foundImgInTurn)) {
+        latestUserText = textParts.join('\n').trim()
+        latestUserHasImg = foundImgInTurn
+        if (latestImgRef !== undefined) break
       }
     }
+    return {
+      text: latestUserText,
+      hasImage: latestUserHasImg,
+      ...(latestImgRef === undefined ? {} : { imageAttachment: latestImgRef }),
+    }
+  }
+  return { text: '', hasImage: false }
+}
+
+async function resolveLastUploadedImageB64(
+  ctx: Context,
+  sessionId: string,
+  signal: AbortSignal,
+): Promise<string | undefined> {
+  const turnInfo = await inspectLatestUserTurn(sessionId)
+  if (turnInfo.imageAttachment !== undefined) {
+    const stored = await ctx.attachments.readImage(turnInfo.imageAttachment, signal)
+    return Buffer.from(stored.data).toString('base64')
   }
   return undefined
 }
 
 function isImageAttachmentRef(value: unknown): value is ImageAttachmentRef {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
-  const rec = value as Record<string, unknown>
-  return typeof rec.attachmentId === 'string'
-    && typeof rec.mediaType === 'string'
-    && typeof rec.bytes === 'number'
-    && typeof rec.width === 'number'
-    && typeof rec.height === 'number'
+  if (!isRecord(value)) return false
+  return typeof value.attachmentId === 'string'
+    && typeof value.mediaType === 'string'
+    && typeof value.bytes === 'number'
+    && typeof value.width === 'number'
+    && typeof value.height === 'number'
+}
+
+async function observeSinglePath(
+  ctx: Context,
+  hostFs: FileSystem,
+  candidatePath: string,
+  exec: ToolExecution,
+): Promise<void> {
+  const target = await hostFs.resolve(candidatePath, { signal: exec.signal })
+  const info = await hostFs.stat(target, exec.signal)
+  if (info !== undefined) {
+    ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
+  }
+}
+
+async function emitWorkspaceImageObserved(
+  ctx: Context,
+  workspaceRoot: string,
+  filename: string,
+  pngBytes: Uint8Array,
+  exec: ToolExecution,
+): Promise<string> {
+  if (!workspaceRoot.trim() || !filename.trim()) return ''
+  const genDir = path.join(workspaceRoot, 'generated_images')
+  const fullFilePath = path.join(genDir, filename)
+  try {
+    await fs.mkdir(genDir, { recursive: true })
+  } catch (_mkdirErr) {
+    // Best-effort workspace mirror; Drive master copy is already saved.
+    return ''
+  }
+  let existsOnDisk = true
+  try {
+    await fs.access(fullFilePath)
+  } catch (_missingErr) {
+    // Gateway had not mirrored into workspaceRoot yet; write PNG bytes from Host.
+    existsOnDisk = false
+  }
+  if (!existsOnDisk) {
+    try {
+      await fs.writeFile(fullFilePath, pngBytes)
+    } catch (_writeErr) {
+      // Best-effort workspace mirror; Drive master copy is already saved.
+      return ''
+    }
+  }
+
+  const hostFs: FileSystem | undefined = ctx.get('fs')
+  if (hostFs !== undefined) {
+    for (const candidatePath of [workspaceRoot, genDir, fullFilePath]) {
+      try {
+        await observeSinglePath(ctx, hostFs, candidatePath, exec)
+      } catch (_obsErr) {
+        // Ignore non-fatal observation errors outside sandboxed roots.
+      }
+    }
+  }
+  return fullFilePath
+}
+
+function extractSessionId(exec: ToolExecution): string {
+  if (exec.agent !== undefined && exec.agent.session.id) {
+    return String(exec.agent.session.id)
+  }
+  if ('sessionId' in exec && typeof exec.sessionId === 'string') {
+    return exec.sessionId
+  }
+  return ''
 }
 
 /**
  * Create the `nexus_generate_image` tool bound to the single Colab-configured
  * image model on the loopback Nexus gateway and the Host attachment store.
+ * @param ctx - Host Cordis context.
+ * @param config - Validated Nexus Host configuration.
+ * @param fetchImpl - Fetch implementation (injectable for unit tests).
+ * @returns Registered `ToolDefinition` for `nexus_generate_image`.
  */
 export function createNexusGenerateImageTool(
   ctx: Context,
@@ -156,31 +340,33 @@ export function createNexusGenerateImageTool(
   return defineTool({
     name: 'nexus_generate_image',
     description:
-      'Generate 1 image using the Colab-selected local Nexus Diffusers pipeline, '
-      + 'attach it durably to the conversation (displayed inline automatically in the chat UI), '
-      + 'and save a PNG master copy to Google Drive. Do not emit a Markdown image link after calling this tool.',
+      'Synthesize 1 NEW or EDITED image using the local Diffusers image generator, attach it inline to the chat, '
+      + 'and save a PNG to the Workspace (`generated_images/`) and Google Drive. '
+      + 'CRITICAL: This tool is a blind image synthesizer — it CANNOT see, inspect, OCR, describe, or identify people/objects in uploaded images. '
+      + 'ONLY call this tool when the user explicitly asks to generate, draw, create, edit, or restyle an image. '
+      + 'Do not emit a Markdown ![]() image link after calling this tool.',
     parameters: {
-      prompt: { type: 'string', description: 'Text prompt describing the image to generate.', required: true },
+      prompt: { type: 'string', description: 'Visual prompt describing the new or edited image to synthesize.', required: true },
       quality: {
         type: 'string',
         enum: ['normal', 'detailed', 'maximum'],
-        description: 'Explicit image quality profile independent of chat reasoning Effort.',
+        description: 'Image quality profile (`normal`, `detailed`, or `maximum`).',
       },
-      width: { type: 'integer', description: 'Optional image width in pixels (256–1536, aligned to 16).' },
-      height: { type: 'integer', description: 'Optional image height in pixels (256–1536, aligned to 16).' },
-      steps: { type: 'integer', description: 'Optional denoising step count (model-specific default when omitted).' },
-      seed: { type: 'integer', description: 'Optional integer RNG seed for reproducibility.' },
+      width: { type: 'integer', description: 'Optional width in pixels (256–1536, multiple of 16).' },
+      height: { type: 'integer', description: 'Optional height in pixels (256–1536, multiple of 16).' },
+      steps: { type: 'integer', description: 'Optional denoising step count.' },
+      seed: { type: 'integer', description: 'Optional RNG seed.' },
       use_uploaded_image: {
         type: 'boolean',
-        description: 'Use the most recent image uploaded by the user in this chat as the img2img reference.',
+        description: 'Set true ONLY when editing/restyling an image uploaded by the user on explicit user request.',
       },
       reference_image_path: {
         type: 'string',
-        description: 'Optional workspace or Drive file path to a reference image for img2img editing.',
+        description: 'Optional file path to a reference image for explicit img2img editing.',
       },
       strength: {
         type: 'number',
-        description: 'Img2img denoising strength from 0.1 (subtle edit) to 1.0 (full re-imagining), default 0.75.',
+        description: 'Img2img denoising strength from 0.1 (subtle edit) to 1.0 (full restyle), default 0.75.',
       },
     },
     output: {
@@ -204,17 +390,15 @@ export function createNexusGenerateImageTool(
         },
       },
       render(_args, value) {
-        const pathNote = value.drivePath
-          ? ` Saved to Drive: ${value.drivePath}` + (value.workspacePath ? ` and Workspace: ${value.workspacePath}.` : '.')
-          : ''
+        const wsNote = value.workspacePath ? ` Workspace file: generated_images/${value.filename}.` : ''
         const blocks: Array<{ type: 'text'; text: string } | { type: 'image'; attachment: ImageAttachmentRef }> = [
           {
             type: 'text',
             text:
               `Generated image ${value.filename} (${value.width}x${value.height}, `
               + `${value.steps} steps, quality ${value.quality ?? 'detailed'}, `
-              + `model ${value.model}, attachment ${value.attachmentId}).${pathNote} `
-              + 'The image is already displayed inline in the UI; do not include a Markdown ![]() image link.',
+              + `model ${value.model}, attachment ${value.attachmentId}).${wsNote} `
+              + 'The image preview is already rendered beneath your reply; do not include a Markdown ![]() image link.',
           },
         ]
         if (isImageAttachmentRef(value.attachment)) {
@@ -244,16 +428,28 @@ export function createNexusGenerateImageTool(
       if (!apiKey) {
         throw new Error(`Missing Nexus gateway bearer token in env var ${config.apiKeyEnv}`)
       }
+      const sessionId = extractSessionId(exec)
+      const latestTurn = await inspectLatestUserTurn(sessionId)
+      const hasRefFlag = args.use_uploaded_image === true
+        || (typeof args.reference_image_path === 'string' && args.reference_image_path.trim().length > 0)
+        || latestTurn.hasImage
+      if (shouldBlockUnsolicitedImageGen(latestTurn.text, args.prompt, hasRefFlag)) {
+        throw new ToolArgsError([
+          'Aborted: nexus_generate_image is an image synthesizer and CANNOT see, identify, describe, or analyze images. '
+          + 'The user did not ask to generate or edit an image. Answer the user directly in plain text without calling nexus_generate_image.',
+        ])
+      }
+
       const endpoint = new URL('/v1/images/generations', baseUrl)
       const timeoutSignal = AbortSignal.timeout(config.imageTimeoutMs)
       const signal = AbortSignal.any([exec.signal, timeoutSignal])
-      let rawWorkspace = ''
+      let rawWorkspace = process.env.NEXUS_DEFAULT_WORKSPACE?.trim() ?? ''
       const workingDir = ctx.get('workingDirectory')
       if (exec.agent !== undefined && workingDir !== undefined) {
         try {
           rawWorkspace = await workingDir.ensure(exec.agent, exec.signal)
-        } catch {
-          rawWorkspace = ''
+        } catch (_wdErr) {
+          // Fall back to NEXUS_DEFAULT_WORKSPACE when session working directory is unavailable.
         }
       }
 
@@ -279,10 +475,8 @@ export function createNexusGenerateImageTool(
         const refBytes = await fs.readFile(resolvedRef)
         referenceImageB64 = refBytes.toString('base64')
       } else if (args.use_uploaded_image) {
-        const sid = 'sessionId' in exec && typeof exec.sessionId === 'string' ? exec.sessionId : ''
-        referenceImageB64 = await resolveLastUploadedImageB64(ctx, sid, signal)
+        referenceImageB64 = await resolveLastUploadedImageB64(ctx, sessionId, signal)
       }
-      const sessionId = 'sessionId' in exec && typeof exec.sessionId === 'string' ? exec.sessionId : ''
 
       let response: Response
       try {
@@ -328,6 +522,12 @@ export function createNexusGenerateImageTool(
         mediaType: 'image/png',
         name: payload.filename,
       })
+
+      const syncedWorkspaceFile = rawWorkspace
+        ? await emitWorkspaceImageObserved(ctx, rawWorkspace, payload.filename, bytes, exec)
+        : ''
+      const finalWorkspacePath = payload.workspace_path || syncedWorkspaceFile
+
       const attachmentJson: Record<string, string | number> = {
         attachmentId: String(ref.attachmentId),
         mediaType: ref.mediaType,
@@ -347,8 +547,8 @@ export function createNexusGenerateImageTool(
         operationId: payload.operation_id ?? '',
         savedToDrive: Boolean(payload.drive_path || payload.master_path),
         drivePath: payload.drive_path ?? payload.master_path ?? '',
-        workspacePath: payload.workspace_path ?? '',
-        masterPath: payload.master_path ?? '',
+        workspacePath: finalWorkspacePath,
+        masterPath: finalWorkspacePath || payload.master_path || payload.drive_path || '',
         attachment: attachmentJson,
       }
     },
@@ -371,13 +571,12 @@ function normalizeUpstreamError(status: number, rawBody: string, apiKey: string)
     let message = typeof parsed.error === 'string' ? parsed.error : ''
     if (!message && typeof detail === 'string') {
       message = detail
-    } else if (!message && detail && typeof detail === 'object') {
-      const nested = detail as Record<string, unknown>
-      const errObj = nested.error as Record<string, unknown> | undefined
+    } else if (!message && isRecord(detail)) {
+      const errObj = isRecord(detail.error) ? detail.error : undefined
       if (typeof errObj?.message === 'string') {
         message = errObj.message
-      } else if (typeof nested.message === 'string') {
-        message = nested.message
+      } else if (typeof detail.message === 'string') {
+        message = detail.message
       }
     }
     if (!message) {
@@ -394,7 +593,8 @@ function normalizeUpstreamError(status: number, rawBody: string, apiKey: string)
       payload.details = safeRaw
     }
     return JSON.stringify(payload)
-  } catch {
+  } catch (_jsonErr) {
+    // Upstream returned non-JSON text; truncate and wrap safely.
     return JSON.stringify({
       error: safeRaw.trim().slice(0, 300) || `Gateway request failed (HTTP ${status})`,
       status,
@@ -430,8 +630,11 @@ async function fetchGatewayJson(
 }
 
 /**
- * Register the `nexus_generate_image` tool and read-only same-origin Host
- * endpoints for live Gateway runtime status and operation progress.
+ * Register `nexus_generate_image` (when an image model is enabled), `nexus_web_research`,
+ * `nexus_inspect_runtime`, and read-only same-origin Host endpoints for live Gateway status.
+ * @param ctx - Host Cordis context.
+ * @param config - Validated Nexus Host configuration.
+ * @param fetchImpl - Optional fetch override for tests.
  */
 export function apply(
   ctx: Context,
@@ -440,8 +643,22 @@ export function apply(
 ): void {
   const baseUrl = assertLoopbackGatewayUrl(config.gatewayUrl)
 
-  const tool = createNexusGenerateImageTool(ctx, config, fetchImpl)
-  ctx.effect(() => ctx.tools.register(tool), 'nexus-host: nexus_generate_image tool')
+  if (process.env.NEXUS_IMAGE_MODEL_ENABLED !== '0') {
+    const tool = createNexusGenerateImageTool(ctx, config, fetchImpl)
+    ctx.effect(() => ctx.tools.register(tool), 'nexus-host: nexus_generate_image tool')
+
+    const sysPrompt = ctx.get('systemPrompt')
+    if (sysPrompt !== undefined) {
+      sysPrompt.section({
+        name: 'tool:nexus_generate_image',
+        order: 2950,
+        text:
+          'Only call `nexus_generate_image` when the user explicitly asks to create, draw, generate, edit, or restyle an image. '
+          + '`nexus_generate_image` cannot see, OCR, describe, or identify uploaded images; never call it to analyze an attached image.',
+        retirement: 'The nexus_generate_image tool is no longer available.',
+      })
+    }
+  }
 
   const researchTool = createNexusWebResearchTool(baseUrl.toString(), process.env[config.apiKeyEnv] ?? '', fetchImpl)
   ctx.effect(() => ctx.tools.register(researchTool), 'nexus-host: nexus_web_research tool')

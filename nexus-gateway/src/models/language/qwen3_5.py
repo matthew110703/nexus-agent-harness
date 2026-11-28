@@ -100,7 +100,7 @@ class Qwen35LanguageModel:
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=False)
         temperature = float(req.get("temperature", 0.7))
         cancel_event = threading.Event()
-        from models.language.common import make_cancel_stopping_criteria
+        stop_ids = resolve_stop_token_ids(self.tokenizer, ("<|im_end|>", "<|endoftext|>"))
 
         gen_kwargs: dict[str, Any] = {
             **inputs,
@@ -111,6 +111,8 @@ class Qwen35LanguageModel:
             "temperature": max(0.01, temperature),
             "top_p": float(req.get("top_p", 0.9)),
         }
+        if stop_ids is not None:
+            gen_kwargs["eos_token_id"] = stop_ids
 
         exc_holder: list[BaseException] = []
 

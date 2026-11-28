@@ -249,7 +249,11 @@ def create_worker_app(secret_token: str) -> FastAPI:
                     text = "".join(state.language_runtime.generate_stream(body))
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
-            return {"text": text, "model_id": state.active_language_id}
+                usage = getattr(state.language_runtime, "last_usage", None)
+            resp_payload: dict[str, Any] = {"text": text, "model_id": state.active_language_id}
+            if isinstance(usage, dict):
+                resp_payload["usage"] = usage
+            return resp_payload
 
         def event_stream():
             state.lock.acquire()
@@ -257,6 +261,11 @@ def create_worker_app(secret_token: str) -> FastAPI:
                 for chunk in state.language_runtime.generate_stream(body):
                     if chunk:
                         yield json.dumps({"chunk": chunk}, ensure_ascii=False) + "\n"
+                usage = getattr(state.language_runtime, "last_usage", None)
+                if isinstance(usage, dict):
+                    yield json.dumps({"usage": usage}, ensure_ascii=False) + "\n"
+            except ValueError as exc:
+                yield json.dumps({"error": str(exc), "status_code": 400}, ensure_ascii=False) + "\n"
             except Exception as exc:
                 yield json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False) + "\n"
             finally:

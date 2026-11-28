@@ -25,6 +25,9 @@ import type {
  * True when `canonicalTarget` is equal to or nested inside `canonicalRoot`.
  * Uses `path.relative` so sibling prefixes like `/workspace` vs `/workspace2`
  * never falsely match.
+ * @param canonicalTarget - Resolved candidate path to check.
+ * @param canonicalRoot - Approved root directory path.
+ * @returns `true` when `canonicalTarget` is `canonicalRoot` or inside it.
  */
 export function isWithinRoot(canonicalTarget: string, canonicalRoot: string): boolean {
   const rel = relative(canonicalRoot, canonicalTarget)

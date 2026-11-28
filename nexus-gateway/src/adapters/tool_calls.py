@@ -1,4 +1,4 @@
-"""Model-specific native tool-call & reasoning stream parsers and recursive JSON Schema validator."""
+"""Model-specific native tool-call & reasoning stream parsers and recursive JSON Schema validator (v2.3.0)."""
 
 from __future__ import annotations
 
@@ -13,9 +13,15 @@ OPEN_TOOL_TAG = "<tool_call>"
 CLOSE_TOOL_TAG = "</tool_call>"
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
-CONTROL_TOKEN_RE = re.compile(
-    r"<\|(?:im_end|im_start|endoftext|return|end|call|start|channel|message|constrain|python_tag|python_start|python_end|eot_id|eom_id|tool_call)\|>"
+
+HARD_TURN_BOUNDARY_RE = re.compile(
+    r"(?:<\|im_end\|>|<\|im_start\|>|<\|eot_id\|>|<\|eot\|>|<\|end_of_text\|>|<\|start_header_id\|>|<\|header_start\|>|<end_of_turn>|<start_of_turn>)"
 )
+
+CONTROL_TOKEN_RE = re.compile(
+    r"<\|(?:im_end|im_start|endoftext|end_of_text|return|end|call|start|channel|message|constrain|python_tag|python_start|python_end|eot_id|eom_id|eot|tool_call|start_header_id|end_header_id|header_start|header_end)\|>"
+)
+
 IMPLEMENTED_PARSER_FAMILIES = frozenset({
     "qwen3_vl",
     "qwen3_5",
@@ -35,10 +41,18 @@ _XML_FUNC_RE = re.compile(r"<function=([^\s>]+)>\s*(.*?)\s*</function>", re.DOTA
 _XML_PARAM_RE = re.compile(r"<parameter=([^\s>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
 _HARMONY_TO_FUNC_RE = re.compile(r"to=functions\.([A-Za-z0-9_.-]+)")
 _GEMMA4_CALL_RE = re.compile(
-    r"(?:<\|tool_call\|>|<start_function_call>)\s*call:([A-Za-z0-9_.-]+)\s*(\{.*?\})\s*(?:<\|tool_call\|>|<end_function_call>)",
+    r"(?:<\|tool_call\|>|<start_function_call>)\s*call:([A-Za-z0-9_.-]+)\s*(\{.*?\})\s*(?:<\|tool_call\|>|<end_function_call>)?",
     re.DOTALL,
 )
-_PYTHON_TAG_RE = re.compile(r"<\|python_tag\|>([\s\S]*?)(?=<\|eom_id\|>|<\|eot_id\|>|$)")
+_STANDALONE_BRACKET_RE = re.compile(r"\[\s*(?:[A-Za-z_][A-Za-z0-9_.-]*\s+)?[A-Za-z_][A-Za-z0-9_.-]*\s*\([^\[\]]*?\)\s*\]")
+
+
+def _truncate_at_turn_boundary(text: str) -> str:
+    """Hard-cut any simulated multi-turn leakage after `<|im_end|>`, `<|eot_id|>`, `<|eot|>`, etc."""
+    m = HARD_TURN_BOUNDARY_RE.search(text)
+    if m is not None:
+        return text[: m.start()]
+    return text
 
 
 def has_native_tool_parser(implementation: str) -> bool:
@@ -82,96 +96,44 @@ class ToolCallStreamParser(Protocol):
 
 
 class QwenJsonToolStreamParser:
-    """Incremental parser for Qwen3-VL JSON `<tool_call>{"name":...,"arguments":...}</tool_call>` blocks."""
+    """Incremental parser for Qwen3-VL JSON `<tool_call>{...}</tool_call>` with optional `<think>` support."""
 
     def __init__(self) -> None:
-        self._buffer = ""
-        self._in_call = False
-        self._call_buf = ""
-        self._text_parts: list[str] = []
-        self._raw_calls: list[str] = []
-        self._errors: list[str] = []
+        self._delegate = Qwen35XmlToolStreamParser(started_in_think=False)
 
     def feed(self, chunk: str) -> StreamDelta:
-        self._buffer += chunk
-        emitted: list[str] = []
-        while self._buffer:
-            if not self._in_call:
-                idx = self._buffer.find(OPEN_TOOL_TAG)
-                if idx != -1:
-                    if idx > 0:
-                        visible = CONTROL_TOKEN_RE.sub("", self._buffer[:idx])
-                        if visible:
-                            self._text_parts.append(visible)
-                            emitted.append(visible)
-                    self._buffer = self._buffer[idx + len(OPEN_TOOL_TAG) :]
-                    self._in_call = True
-                    self._call_buf = ""
-                    continue
-                keep = _partial_prefix_len(self._buffer, OPEN_TOOL_TAG)
-                safe = len(self._buffer) - keep
-                if safe > 0:
-                    visible = CONTROL_TOKEN_RE.sub("", self._buffer[:safe])
-                    if visible:
-                        self._text_parts.append(visible)
-                        emitted.append(visible)
-                    self._buffer = self._buffer[safe:]
-                break
-            else:
-                idx = self._buffer.find(CLOSE_TOOL_TAG)
-                if idx != -1:
-                    self._call_buf += self._buffer[:idx]
-                    self._raw_calls.append(self._call_buf.strip())
-                    self._call_buf = ""
-                    self._in_call = False
-                    self._buffer = self._buffer[idx + len(CLOSE_TOOL_TAG) :]
-                    continue
-                keep = _partial_prefix_len(self._buffer, CLOSE_TOOL_TAG)
-                safe = len(self._buffer) - keep
-                if safe > 0:
-                    self._call_buf += self._buffer[:safe]
-                    self._buffer = self._buffer[safe:]
-                break
-        return StreamDelta(content="".join(emitted))
+        return self._delegate.feed(chunk)
 
     def finish(self, advertised_tools: list[dict[str, Any]], tool_choice: Any = "auto") -> ToolParseResult:
-        trailing = ""
-        if self._in_call:
-            self._errors.append("Unterminated <tool_call> block")
-            self._in_call = False
-            self._call_buf = ""
-            self._buffer = ""
-        elif self._buffer:
-            visible = CONTROL_TOKEN_RE.sub("", self._buffer)
-            if visible:
-                self._text_parts.append(visible)
-                trailing = visible
-            self._buffer = ""
-
-        if tool_choice == "none":
-            return ToolParseResult(text="".join(self._text_parts).strip(), trailing_text=trailing)
-
-        valid_calls, errors = _validate_json_tool_calls(self._raw_calls, advertised_tools, self._errors)
-        return ToolParseResult(
-            text="".join(self._text_parts).strip(),
-            trailing_text=trailing,
-            tool_calls=valid_calls,
-            errors=errors,
-        )
+        return self._delegate.finish(advertised_tools, tool_choice=tool_choice)
 
 
 class Qwen35XmlToolStreamParser:
     """
-    Incremental parser for Qwen3.5 / Qwen3.6 and all GGUF models:
+    Incremental parser for Qwen3.5 / Qwen3.6, Gemma 4, Llama 3.1/4, and GGUF models:
     - Streams `<think>...</think>` reasoning blocks into `StreamDelta.reasoning`.
-    - Parses `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`,
-      JSON `<tool_call>...</tool_call>`, Llama `<|python_tag|>...`, and Gemma 4 `<|tool_call|>call:...`.
+    - Live-buffers `<tool_call>...</tool_call>`, `<|python_start|>...<|python_end|>`,
+      `<|python_tag|>...`, `<|tool_call|>...<|tool_call|>`, and `<start_function_call>...<end_function_call>`
+      so zero raw tool syntax leaks into visible chat text.
+    - Halts visible output immediately at `<|im_end|>`, `<|im_start|>`, `<|eot_id|>`, `<|eot|>`, etc.
     """
 
-    def __init__(self, *, started_in_think: bool = False) -> None:
+    _OPEN_TAGS: tuple[str, ...] = (
+        OPEN_TOOL_TAG,
+        OPEN_THINK_TAG,
+        "<|python_start|>",
+        "<|python_tag|>",
+        "<|tool_call|>",
+        "<start_function_call>",
+    )
+
+    def __init__(self, *, started_in_think: bool = False, buffer_brackets: bool = False) -> None:
         self._buffer = ""
         self._state: str = "think" if started_in_think else "text"
         self._call_buf = ""
+        self._bracket_buf = ""
+        self._buffer_brackets = buffer_brackets
+        self._halted = False
         self._text_parts: list[str] = []
         self._reasoning_parts: list[str] = []
         self._raw_calls: list[str] = []
@@ -179,17 +141,19 @@ class Qwen35XmlToolStreamParser:
         self._errors: list[str] = []
 
     def feed(self, chunk: str) -> StreamDelta:
+        if self._halted or not chunk:
+            return StreamDelta()
         self._raw_chunks.append(chunk)
         self._buffer += chunk
         emitted_content: list[str] = []
         emitted_reasoning: list[str] = []
 
-        while self._buffer:
+        while self._buffer and not self._halted:
             if self._state == "think":
                 idx = self._buffer.find(CLOSE_THINK_TAG)
                 if idx != -1:
                     if idx > 0:
-                        r = CONTROL_TOKEN_RE.sub("", self._buffer[:idx])
+                        r = CONTROL_TOKEN_RE.sub("", _truncate_at_turn_boundary(self._buffer[:idx]))
                         if r:
                             self._reasoning_parts.append(r)
                             emitted_reasoning.append(r)
@@ -222,42 +186,144 @@ class Qwen35XmlToolStreamParser:
                     self._buffer = self._buffer[safe:]
                 break
 
-            if self._state == "python_call":
-                # Buffer Llama <|python_tag|> call until end of stream or <|eom_id|>/<|eot_id|>.
+            if self._state == "python_start_call":
                 stop_idx = -1
                 stop_len = 0
-                for end_tok in ("<|eom_id|>", "<|eot_id|>"):
+                for end_tok in ("<|python_end|>", "<|eot|>", "<|eom_id|>", "<|eot_id|>"):
                     pos = self._buffer.find(end_tok)
                     if pos != -1 and (stop_idx == -1 or pos < stop_idx):
                         stop_idx = pos
                         stop_len = len(end_tok)
                 if stop_idx != -1:
                     self._call_buf += self._buffer[:stop_idx]
-                    self._raw_calls.extend(_split_json_objects(self._call_buf))
+                    body = self._call_buf.strip()
+                    if body:
+                        objs = _split_json_objects(body)
+                        self._raw_calls.extend(objs if objs else [body])
                     self._call_buf = ""
                     self._state = "text"
                     self._buffer = self._buffer[stop_idx + stop_len :]
                     continue
-                keep = max(_partial_prefix_len(self._buffer, "<|eom_id|>"), _partial_prefix_len(self._buffer, "<|eot_id|>"))
+                keep = max(
+                    _partial_prefix_len(self._buffer, tok)
+                    for tok in ("<|python_end|>", "<|eot|>", "<|eom_id|>", "<|eot_id|>")
+                )
                 safe = len(self._buffer) - keep
                 if safe > 0:
                     self._call_buf += self._buffer[:safe]
                     self._buffer = self._buffer[safe:]
                 break
 
-            # state == "text"
-            idx_tool = self._buffer.find(OPEN_TOOL_TAG)
-            idx_think = self._buffer.find(OPEN_THINK_TAG)
-            idx_py = self._buffer.find("<|python_tag|>")
-            candidates = [
-                (i, tag)
-                for i, tag in (
-                    (idx_tool, OPEN_TOOL_TAG),
-                    (idx_think, OPEN_THINK_TAG),
-                    (idx_py, "<|python_tag|>"),
+            if self._state == "python_call":
+                stop_idx = -1
+                stop_len = 0
+                for end_tok in ("<|eom_id|>", "<|eot_id|>", "<|eot|>", "<|im_end|>"):
+                    pos = self._buffer.find(end_tok)
+                    if pos != -1 and (stop_idx == -1 or pos < stop_idx):
+                        stop_idx = pos
+                        stop_len = len(end_tok)
+                if stop_idx != -1:
+                    self._call_buf += self._buffer[:stop_idx]
+                    body = self._call_buf.strip()
+                    if body:
+                        objs = _split_json_objects(body)
+                        self._raw_calls.extend(objs if objs else [body])
+                    self._call_buf = ""
+                    self._state = "text"
+                    self._buffer = self._buffer[stop_idx + stop_len :]
+                    continue
+                keep = max(
+                    _partial_prefix_len(self._buffer, tok)
+                    for tok in ("<|eom_id|>", "<|eot_id|>", "<|eot|>", "<|im_end|>")
                 )
-                if i != -1
-            ]
+                safe = len(self._buffer) - keep
+                if safe > 0:
+                    self._call_buf += self._buffer[:safe]
+                    self._buffer = self._buffer[safe:]
+                break
+
+            if self._state == "gemma_call":
+                stop_idx = -1
+                stop_len = 0
+                for end_tok in ("<|tool_call|>", "<end_function_call>", "<end_of_turn>"):
+                    pos = self._buffer.find(end_tok)
+                    if pos != -1 and (stop_idx == -1 or pos < stop_idx):
+                        stop_idx = pos
+                        stop_len = len(end_tok)
+                if stop_idx != -1:
+                    self._call_buf += self._buffer[:stop_idx]
+                    gm = _GEMMA4_CALL_RE.search(f"<|tool_call|>{self._call_buf.strip()}<|tool_call|>")
+                    if gm is not None:
+                        self._raw_calls.append(
+                            json.dumps({"name": gm.group(1), "arguments": _parse_gemma4_args(gm.group(2))})
+                        )
+                    elif self._call_buf.strip():
+                        self._raw_calls.append(self._call_buf.strip())
+                    self._call_buf = ""
+                    self._state = "text"
+                    self._buffer = self._buffer[stop_idx + stop_len :]
+                    continue
+                keep = max(
+                    _partial_prefix_len(self._buffer, tok)
+                    for tok in ("<|tool_call|>", "<end_function_call>", "<end_of_turn>")
+                )
+                safe = len(self._buffer) - keep
+                if safe > 0:
+                    self._call_buf += self._buffer[:safe]
+                    self._buffer = self._buffer[safe:]
+                break
+
+            if self._state == "bracket_maybe":
+                # Buffer `[...]` on Llama models so standalone `[func(...)]` never flashes in chat!
+                nl_pos = self._buffer.find("\n")
+                close_pos = self._buffer.find("]")
+                if close_pos != -1 and (nl_pos == -1 or close_pos < nl_pos):
+                    self._bracket_buf += self._buffer[: close_pos + 1]
+                    self._buffer = self._buffer[close_pos + 1 :]
+                    candidate = self._bracket_buf
+                    self._bracket_buf = ""
+                    self._state = "text"
+                    if "(" in candidate and ")" in candidate:
+                        self._raw_calls.append(candidate)
+                    else:
+                        self._text_parts.append(candidate)
+                        emitted_content.append(candidate)
+                    continue
+                if nl_pos != -1 or len(self._bracket_buf) + len(self._buffer) > 512:
+                    # Not a single-line tool bracket; flush cleanly as visible text.
+                    flush_txt = CONTROL_TOKEN_RE.sub("", self._bracket_buf)
+                    self._bracket_buf = ""
+                    self._state = "text"
+                    if flush_txt:
+                        self._text_parts.append(flush_txt)
+                        emitted_content.append(flush_txt)
+                    continue
+                self._bracket_buf += self._buffer
+                self._buffer = ""
+                break
+
+            # state == "text"
+            b_match = HARD_TURN_BOUNDARY_RE.search(self._buffer)
+            candidates: list[tuple[int, str]] = []
+            for tag in self._OPEN_TAGS:
+                pos = self._buffer.find(tag)
+                if pos != -1:
+                    candidates.append((pos, tag))
+            if self._buffer_brackets:
+                b_pos = self._buffer.find("[")
+                if b_pos != -1:
+                    candidates.append((b_pos, "["))
+
+            earliest_tag_pos = min((c[0] for c in candidates), default=-1)
+            if b_match is not None and (earliest_tag_pos == -1 or b_match.start() < earliest_tag_pos):
+                prefix = CONTROL_TOKEN_RE.sub("", self._buffer[: b_match.start()])
+                if prefix:
+                    self._text_parts.append(prefix)
+                    emitted_content.append(prefix)
+                self._buffer = ""
+                self._halted = True
+                break
+
             if candidates:
                 idx, tag = min(candidates, key=lambda pair: pair[0])
                 if idx > 0:
@@ -265,22 +331,43 @@ class Qwen35XmlToolStreamParser:
                     if visible:
                         self._text_parts.append(visible)
                         emitted_content.append(visible)
+                if tag == "[":
+                    self._bracket_buf = "["
+                    self._buffer = self._buffer[idx + 1 :]
+                    self._state = "bracket_maybe"
+                    continue
                 self._buffer = self._buffer[idx + len(tag) :]
                 if tag == OPEN_TOOL_TAG:
                     self._state = "call"
                     self._call_buf = ""
+                elif tag == "<|python_start|>":
+                    self._state = "python_start_call"
+                    self._call_buf = ""
                 elif tag == "<|python_tag|>":
                     self._state = "python_call"
+                    self._call_buf = ""
+                elif tag in ("<|tool_call|>", "<start_function_call>"):
+                    self._state = "gemma_call"
                     self._call_buf = ""
                 else:
                     self._state = "think"
                 continue
 
-            keep = max(
-                _partial_prefix_len(self._buffer, OPEN_TOOL_TAG),
-                _partial_prefix_len(self._buffer, OPEN_THINK_TAG),
-                _partial_prefix_len(self._buffer, "<|python_tag|>"),
-            )
+            keep_candidates = [
+                _partial_prefix_len(self._buffer, t)
+                for t in (
+                    *self._OPEN_TAGS,
+                    "<|im_end|>",
+                    "<|im_start|>",
+                    "<|eot_id|>",
+                    "<|eot|>",
+                    "<|end_of_text|>",
+                    "<|start_header_id|>",
+                    "<|header_start|>",
+                    "<end_of_turn>",
+                )
+            ]
+            keep = max(keep_candidates) if keep_candidates else 0
             safe = len(self._buffer) - keep
             if safe > 0:
                 visible = CONTROL_TOKEN_RE.sub("", self._buffer[:safe])
@@ -296,38 +383,62 @@ class Qwen35XmlToolStreamParser:
         trailing_text = ""
         trailing_reasoning = ""
         if self._state == "call":
-            self._errors.append("Unterminated <tool_call> block")
-            self._state = "text"
-            self._call_buf = ""
-            self._buffer = ""
-        elif self._state == "python_call":
             tail = (self._call_buf + self._buffer).strip()
             if tail:
-                self._raw_calls.extend(_split_json_objects(tail))
+                # Attempt recovery if JSON/XML was complete before stream ended without closing tag
+                recovered, _ = _validate_json_tool_calls([tail], advertised_tools, [])
+                if recovered or _XML_FUNC_RE.search(tail):
+                    self._raw_calls.append(tail)
+                else:
+                    self._errors.append("Unterminated <tool_call> block")
+            else:
+                self._errors.append("Unterminated <tool_call> block")
             self._state = "text"
             self._call_buf = ""
             self._buffer = ""
+        elif self._state in ("python_call", "python_start_call"):
+            tail = _truncate_at_turn_boundary(self._call_buf + self._buffer).strip()
+            if tail:
+                objs = _split_json_objects(tail)
+                self._raw_calls.extend(objs if objs else [tail])
+            self._state = "text"
+            self._call_buf = ""
+            self._buffer = ""
+        elif self._state == "gemma_call":
+            tail = _truncate_at_turn_boundary(self._call_buf + self._buffer).strip()
+            if tail:
+                gm = _GEMMA4_CALL_RE.search(f"<|tool_call|>{tail}<|tool_call|>")
+                if gm is not None:
+                    self._raw_calls.append(
+                        json.dumps({"name": gm.group(1), "arguments": _parse_gemma4_args(gm.group(2))})
+                    )
+                else:
+                    self._raw_calls.append(tail)
+            self._state = "text"
+            self._call_buf = ""
+            self._buffer = ""
+        elif self._state == "bracket_maybe":
+            rem_b = CONTROL_TOKEN_RE.sub("", _truncate_at_turn_boundary(self._bracket_buf + self._buffer))
+            self._bracket_buf = ""
+            self._buffer = ""
+            self._state = "text"
+            if rem_b:
+                self._text_parts.append(rem_b)
+                trailing_text = rem_b
         elif self._state == "think" and self._buffer:
-            r = CONTROL_TOKEN_RE.sub("", self._buffer)
+            r = CONTROL_TOKEN_RE.sub("", _truncate_at_turn_boundary(self._buffer))
             if r:
                 self._reasoning_parts.append(r)
                 trailing_reasoning = r
             self._buffer = ""
         elif self._buffer:
-            visible = CONTROL_TOKEN_RE.sub("", self._buffer)
+            visible = CONTROL_TOKEN_RE.sub("", _truncate_at_turn_boundary(self._buffer))
             if visible:
                 self._text_parts.append(visible)
                 trailing_text = visible
             self._buffer = ""
 
-        # Check for Gemma 4 native `<|tool_call|>call:name{...}` blocks if no `<tool_call>` was seen.
-        full_text = "".join(self._text_parts)
-        if tool_choice != "none" and not self._raw_calls and advertised_tools:
-            gemma_matches = list(_GEMMA4_CALL_RE.finditer("".join(self._raw_chunks)))
-            if gemma_matches:
-                for gm in gemma_matches:
-                    self._raw_calls.append(json.dumps({"name": gm.group(1), "arguments": _parse_gemma4_args(gm.group(2))}))
-                full_text = _GEMMA4_CALL_RE.sub("", full_text)
+        full_text = _truncate_at_turn_boundary("".join(self._text_parts))
 
         if tool_choice == "none":
             return ToolParseResult(
@@ -338,8 +449,23 @@ class Qwen35XmlToolStreamParser:
             )
 
         schema_by_name = _index_tool_schemas(advertised_tools)
+
+        # Fallback scan for any residual `[tool_name(...)]` in `full_text` if not buffered
+        if advertised_tools and "[" in full_text and "]" in full_text:
+            def _extract_inline_bracket(m: re.Match[str]) -> str:
+                cand = m.group(0)
+                py_calls = _parse_pythonic_calls(cand, set(schema_by_name.keys()))
+                if py_calls:
+                    self._raw_calls.append(cand)
+                    return ""
+                return cand
+
+            full_text = _STANDALONE_BRACKET_RE.sub(_extract_inline_bracket, full_text)
+
         valid_calls: list[ParsedToolCall] = []
         errors = list(self._errors)
+        non_tool_brackets: list[str] = []
+
         for raw in self._raw_calls:
             func_match = _XML_FUNC_RE.search(raw)
             if func_match is not None:
@@ -357,7 +483,7 @@ class Qwen35XmlToolStreamParser:
                     p_name = p_match.group(1).strip()
                     p_raw = p_match.group(2).strip()
                     arguments[p_name] = _coerce_xml_parameter(p_raw, props.get(p_name))
-                arguments = _coerce_arguments_to_schema(arguments, schema)
+                arguments = _coerce_arguments_to_schema(arguments, schema, tool_name=name)
                 err = validate_tool_arguments(arguments, schema)
                 if err is not None:
                     errors.append(f"Invalid arguments for tool {name!r}: {err}")
@@ -365,9 +491,43 @@ class Qwen35XmlToolStreamParser:
                 valid_calls.append(ParsedToolCall(id=f"call_{uuid.uuid4().hex[:12]}", name=name, arguments=arguments))
                 continue
 
+            # If a buffered `[...]` was actually normal markdown/citation text (not a known tool), restore it!
+            if raw.startswith("[") and raw.endswith("]"):
+                py_try = _parse_pythonic_calls(raw, set(schema_by_name.keys()))
+                if not py_try and _repair_and_parse_json_obj(raw) is None:
+                    # Check if any advertised tool name appears before '('; if not, treat as prose, not error.
+                    m_fn = re.search(r"([A-Za-z_][A-Za-z0-9_.-]*)\s*\(", raw)
+                    if m_fn is None or (schema_by_name and m_fn.group(1) not in schema_by_name):
+                        # Only drop silently if it looks like a hallucinated disabled tool call (`[list_agents()]`)
+                        hallucinated_tool = m_fn is not None and (
+                            m_fn.group(1) in {
+                                "list_agents",
+                                "wait_agent",
+                                "subagent",
+                                "subagent_fork",
+                                "job_output",
+                                "job_kill",
+                                "job_list",
+                                "ask_user_question",
+                                "team_task_create",
+                                "team_task_list",
+                                "team_task_get",
+                                "team_task_update",
+                            }
+                            or "()" in raw
+                        )
+                        if not hallucinated_tool:
+                            non_tool_brackets.append(raw)
+                        continue
+
             calls_from_json, json_errs = _validate_json_tool_calls([raw], advertised_tools, [])
             valid_calls.extend(calls_from_json)
             errors.extend(json_errs)
+
+        if non_tool_brackets:
+            restored = " ".join(non_tool_brackets)
+            full_text = f"{full_text} {restored}".strip() if full_text else restored
+            trailing_text = f"{trailing_text}{restored}"
 
         return ToolParseResult(
             text=full_text.strip(),
@@ -377,6 +537,13 @@ class Qwen35XmlToolStreamParser:
             tool_calls=valid_calls,
             errors=errors,
         )
+
+
+class LlamaToolStreamParser(Qwen35XmlToolStreamParser):
+    """Dedicated stream parser for Llama 3.1 / 3.3 and Llama 4 Scout GGUFs with live bracket buffering."""
+
+    def __init__(self, *, started_in_think: bool = False) -> None:
+        super().__init__(started_in_think=started_in_think, buffer_brackets=True)
 
 
 class GptOssHarmonyStreamParser:
@@ -446,7 +613,6 @@ class GptOssHarmonyStreamParser:
                 if safe > 0:
                     seg = self._buffer[:safe]
                     self._pre_channel_buf += seg
-                    # Only stream outside channels if no Harmony start tag or function route is forming.
                     if "<|start|>" not in seg and "<|" not in seg and "to=functions." not in seg:
                         self._text_parts.append(seg)
                         emitted_content.append(seg)
@@ -481,7 +647,6 @@ class GptOssHarmonyStreamParser:
                     self._buffer = self._buffer[safe:]
                 break
 
-            # States: analysis | final | call_body
             stop_idx, stop_tag = self._find_earliest_stop(self._buffer)
             if stop_idx != -1:
                 body_seg = self._buffer[:stop_idx]
@@ -566,7 +731,7 @@ class GptOssHarmonyStreamParser:
                 if not isinstance(arguments, dict):
                     errors.append(f"Arguments for tool {name!r} must be an object")
                     continue
-                arguments = _coerce_arguments_to_schema(arguments, schema_by_name[name])
+                arguments = _coerce_arguments_to_schema(arguments, schema_by_name[name], tool_name=name)
                 err = validate_tool_arguments(arguments, schema_by_name[name])
                 if err is not None:
                     errors.append(f"Invalid arguments for tool {name!r}: {err}")
@@ -588,51 +753,137 @@ _FENCED_JSON_TOOL_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGN
 
 class FencedJsonToolStreamParser:
     """
-    Parser for prompt-injected tool-calling models (Gemma 3, DeepSeek-VL, DeepSeek-VL2):
-    Supports both `<tool_call>{"name":...,"arguments":...}</tool_call>` and fenced
-    ```` ```json {"name":...,"arguments":...} ``` ```` blocks.
+    Incremental streaming parser for prompt-injected tool-calling models (Gemma 3, DeepSeek-VL, DeepSeek-VL2):
+    Streams plain text live while holding back `<tool_call>...</tool_call>` and ```` ```json {...} ``` ```` fences.
     """
 
     def __init__(self) -> None:
-        self._chunks: list[str] = []
+        self._buffer = ""
+        self._mode = "text"  # text | tag | fence
+        self._hold = ""
+        self._halted = False
+        self._text_parts: list[str] = []
+        self._raw_calls: list[str] = []
 
     def feed(self, chunk: str) -> StreamDelta:
-        self._chunks.append(chunk)
-        return StreamDelta()
+        if self._halted or not chunk:
+            return StreamDelta()
+        self._buffer += chunk
+        emitted: list[str] = []
+
+        while self._buffer and not self._halted:
+            if self._mode == "tag":
+                idx = self._buffer.find(CLOSE_TOOL_TAG)
+                if idx != -1:
+                    self._hold += self._buffer[:idx]
+                    self._raw_calls.append(self._hold.strip())
+                    self._hold = ""
+                    self._mode = "text"
+                    self._buffer = self._buffer[idx + len(CLOSE_TOOL_TAG) :]
+                    continue
+                keep = _partial_prefix_len(self._buffer, CLOSE_TOOL_TAG)
+                safe = len(self._buffer) - keep
+                if safe > 0:
+                    self._hold += self._buffer[:safe]
+                    self._buffer = self._buffer[safe:]
+                break
+
+            if self._mode == "fence":
+                idx = self._buffer.find("```")
+                if idx != -1:
+                    body = self._hold + self._buffer[:idx]
+                    full_fence = f"```{body}```"
+                    self._hold = ""
+                    self._mode = "text"
+                    self._buffer = self._buffer[idx + 3 :]
+                    m = _FENCED_JSON_TOOL_RE.match(full_fence)
+                    if m is not None:
+                        cand = m.group(1).strip()
+                        parsed = _repair_and_parse_json_obj(cand)
+                        if isinstance(parsed, dict) and "name" in parsed and ("arguments" in parsed or "parameters" in parsed):
+                            self._raw_calls.append(cand)
+                            continue
+                    self._text_parts.append(full_fence)
+                    emitted.append(full_fence)
+                    continue
+                keep = _partial_prefix_len(self._buffer, "```")
+                safe = len(self._buffer) - keep
+                if safe > 0:
+                    self._hold += self._buffer[:safe]
+                    self._buffer = self._buffer[safe:]
+                break
+
+            b_match = HARD_TURN_BOUNDARY_RE.search(self._buffer)
+            idx_tag = self._buffer.find(OPEN_TOOL_TAG)
+            idx_fence = self._buffer.find("```")
+            candidates = [(p, t) for p, t in ((idx_tag, OPEN_TOOL_TAG), (idx_fence, "```")) if p != -1]
+            earliest = min((c[0] for c in candidates), default=-1)
+
+            if b_match is not None and (earliest == -1 or b_match.start() < earliest):
+                prefix = CONTROL_TOKEN_RE.sub("", self._buffer[: b_match.start()])
+                if prefix:
+                    self._text_parts.append(prefix)
+                    emitted.append(prefix)
+                self._buffer = ""
+                self._halted = True
+                break
+
+            if candidates:
+                pos, tok = min(candidates, key=lambda x: x[0])
+                if pos > 0:
+                    vis = CONTROL_TOKEN_RE.sub("", self._buffer[:pos])
+                    if vis:
+                        self._text_parts.append(vis)
+                        emitted.append(vis)
+                self._buffer = self._buffer[pos + len(tok) :]
+                self._hold = ""
+                self._mode = "tag" if tok == OPEN_TOOL_TAG else "fence"
+                continue
+
+            keep = max(
+                _partial_prefix_len(self._buffer, OPEN_TOOL_TAG),
+                _partial_prefix_len(self._buffer, "```"),
+                _partial_prefix_len(self._buffer, "<|im_end|>"),
+                _partial_prefix_len(self._buffer, "<end_of_turn>"),
+            )
+            safe = len(self._buffer) - keep
+            if safe > 0:
+                vis = CONTROL_TOKEN_RE.sub("", self._buffer[:safe])
+                if vis:
+                    self._text_parts.append(vis)
+                    emitted.append(vis)
+                self._buffer = self._buffer[safe:]
+            break
+
+        return StreamDelta(content="".join(emitted))
 
     def finish(self, advertised_tools: list[dict[str, Any]], tool_choice: Any = "auto") -> ToolParseResult:
-        raw = CONTROL_TOKEN_RE.sub("", "".join(self._chunks))
+        trailing = ""
+        if self._mode == "tag":
+            tail = _truncate_at_turn_boundary(self._hold + self._buffer).strip()
+            if tail:
+                self._raw_calls.append(tail)
+        elif self._mode == "fence":
+            rem_fence = "```" + CONTROL_TOKEN_RE.sub("", _truncate_at_turn_boundary(self._hold + self._buffer))
+            self._text_parts.append(rem_fence)
+            trailing = rem_fence
+        elif self._buffer:
+            vis = CONTROL_TOKEN_RE.sub("", _truncate_at_turn_boundary(self._buffer))
+            if vis:
+                self._text_parts.append(vis)
+                trailing = vis
+        self._buffer = ""
+        self._hold = ""
+        self._mode = "text"
+
+        full_text = _truncate_at_turn_boundary("".join(self._text_parts)).strip()
         if tool_choice == "none" or not advertised_tools:
-            text = raw.strip()
-            return ToolParseResult(text=text, trailing_text=text)
+            return ToolParseResult(text=full_text, trailing_text=trailing)
 
-        raw_calls: list[str] = []
-        cleaned = raw
-
-        def _collect_tag(match: re.Match[str]) -> str:
-            raw_calls.append(match.group(1).strip())
-            return ""
-
-        cleaned = re.sub(r"<tool_call>([\s\S]*?)</tool_call>", _collect_tag, cleaned)
-
-        def _collect_fenced(match: re.Match[str]) -> str:
-            candidate = match.group(1).strip()
-            try:
-                parsed = json.loads(candidate)
-                if isinstance(parsed, dict) and "name" in parsed and ("arguments" in parsed or "parameters" in parsed):
-                    raw_calls.append(candidate)
-                    return ""
-            except json.JSONDecodeError:
-                pass
-            return match.group(0)
-
-        cleaned = _FENCED_JSON_TOOL_RE.sub(_collect_fenced, cleaned)
-
-        valid_calls, errors = _validate_json_tool_calls(raw_calls, advertised_tools, [])
-        text = cleaned.strip()
+        valid_calls, errors = _validate_json_tool_calls(self._raw_calls, advertised_tools, [])
         return ToolParseResult(
-            text=text,
-            trailing_text=text,
+            text=full_text,
+            trailing_text=trailing,
             tool_calls=valid_calls,
             errors=errors,
         )
@@ -642,13 +893,13 @@ def create_tool_parser(implementation: str, *, started_in_think: bool = False) -
     """Create the dedicated stream parser for the selected language model implementation."""
     if implementation == "qwen3_vl":
         return QwenJsonToolStreamParser()
+    if implementation in ("gguf_llama3", "gguf_llama4"):
+        return LlamaToolStreamParser(started_in_think=started_in_think)
     if implementation in (
         "qwen3_5",
         "gguf_qwen3_5",
         "gguf_gemma4",
         "gguf_deepseek_qwen3_5",
-        "gguf_llama3",
-        "gguf_llama4",
         "gguf_generic",
     ):
         return Qwen35XmlToolStreamParser(started_in_think=started_in_think)
@@ -660,7 +911,7 @@ def create_tool_parser(implementation: str, *, started_in_think: bool = False) -
 
 
 def _split_json_objects(raw: str) -> list[str]:
-    """Extract one or more JSON objects from Llama `<|python_tag|>` output (handles `;` separators)."""
+    """Extract one or more JSON objects from Llama `<|python_tag|>` / `<|python_start|>` output."""
     decoder = json.JSONDecoder()
     idx = 0
     out: list[str] = []
@@ -670,13 +921,15 @@ def _split_json_objects(raw: str) -> list[str]:
             idx += 1
         if idx >= n:
             break
+        if raw[idx] != "{":
+            break
         try:
             obj, end_idx = decoder.raw_decode(raw, idx)
             if isinstance(obj, dict):
                 out.append(json.dumps(obj))
             idx = end_idx
         except json.JSONDecodeError:
-            idx += 1
+            return []
     return out
 
 
@@ -775,6 +1028,8 @@ _PARAM_ALIASES: dict[str, tuple[str, ...]] = {
     "query": ("queries",),
     "urls": ("url",),
     "url": ("urls",),
+    "timeoutMs": ("timeout_ms", "timeout"),
+    "timeout_ms": ("timeoutMs", "timeout"),
 }
 
 
@@ -839,55 +1094,175 @@ def _coerce_value_to_schema(value: Any, prop_schema: Any) -> Any:
     return value
 
 
-def _coerce_arguments_to_schema(arguments: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+def _coerce_arguments_to_schema(
+    arguments: dict[str, Any],
+    schema: dict[str, Any],
+    *,
+    tool_name: str = "",
+) -> dict[str, Any]:
     if not isinstance(schema, dict):
         return arguments
     props = schema.get("properties")
     if not isinstance(props, dict) or not props:
         return arguments
+    required_keys = set(schema.get("required") or [])
     out = dict(arguments)
+
+    # 1. Resolve common parameter aliases (`path` -> `file_path`, `timeout` -> `timeoutMs`, etc.)
     for target_key in props:
         if target_key not in out:
             for alias in _PARAM_ALIASES.get(target_key, ()):
                 if alias in out:
                     out[target_key] = out.pop(alias)
                     break
+
+    # 2. Strip unadvertised hallucinated keys (e.g. `run_in_background`, `sandbox_permissions`)
+    for key in list(out.keys()):
+        if key not in props:
+            out.pop(key, None)
+
+    # 3. Coerce types and sanitize timeout / numeric bounds
     for key, val in list(out.items()):
-        if key in props:
-            out[key] = _coerce_value_to_schema(val, props[key])
+        prop_schema = props.get(key)
+        coerced = _coerce_value_to_schema(val, prop_schema)
+
+        if key in ("timeout_ms", "timeoutMs") or key.endswith(("_ms", "Ms")):
+            if isinstance(coerced, (int, float)) and not isinstance(coerced, bool):
+                if coerced <= 0:
+                    if key not in required_keys:
+                        out.pop(key, None)
+                        continue
+                    coerced = 10000
+                elif 1 <= coerced <= 300:
+                    # Model passed seconds (e.g. `30`) to a millisecond field -> convert to ms!
+                    coerced = int(coerced * 1000)
+                if key == "timeout_ms":
+                    coerced = max(10000, min(3600000, int(coerced)))
+
+        if isinstance(prop_schema, dict) and isinstance(coerced, (int, float)) and not isinstance(coerced, bool):
+            min_v = prop_schema.get("minimum")
+            max_v = prop_schema.get("maximum")
+            if isinstance(min_v, (int, float)) and coerced < min_v:
+                coerced = int(min_v) if prop_schema.get("type") == "integer" else float(min_v)
+            if isinstance(max_v, (int, float)) and coerced > max_v:
+                coerced = int(max_v) if prop_schema.get("type") == "integer" else float(max_v)
+
+        out[key] = coerced
+
+    # 4. Auto-fill required `description` on `bash` / `pwsh` when omitted or blank by local models
+    if tool_name in ("bash", "pwsh") and "description" in props:
+        cur_desc = out.get("description")
+        if not isinstance(cur_desc, str) or not cur_desc.strip():
+            cmd_preview = str(out.get("command") or "shell command").strip().splitlines()[0][:64]
+            out["description"] = f"Run: {cmd_preview}"
+
     return out
 
 
-def _parse_pythonic_calls(raw: str) -> list[tuple[str, dict[str, Any]]]:
-    """Parse `[func(k=v, ...)]` or `func(k=v, ...)` Pythonic tool calls via AST."""
+def _colon_kwargs_to_equals(expr: str) -> str:
+    """Convert JSON-style `func(key: "val", n: 2)` outside quotes into valid Python `func(key="val", n=2)`."""
+    out: list[str] = []
+    in_quote: Optional[str] = None
+    escaped = False
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and in_quote is not None:
+            out.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            if in_quote == ch:
+                in_quote = None
+            elif in_quote is None:
+                in_quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if in_quote is None and ch == ":":
+            # Check if preceded by an identifier right after `(` or `,`
+            prefix = "".join(out)
+            if re.search(r"[(,]\s*[A-Za-z_][A-Za-z0-9_]*\s*$", prefix):
+                out.append("=")
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _normalize_python_literals(expr: str) -> str:
+    """Convert unquoted JSON `true`/`false`/`null` keyword values into Python `True`/`False`/`None`."""
+    out = re.sub(r"(=\s*)true\b", r"\1True", expr)
+    out = re.sub(r"(=\s*)false\b", r"\1False", out)
+    out = re.sub(r"(=\s*)null\b", r"\1None", out)
+    return out
+
+
+def _parse_pythonic_calls(
+    raw: str,
+    known_tools: Optional[set[str]] = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """
+    Parse `[func(k=v, ...)]`, `func(k: "v")`, or fused `[subagent_fork web_search(query: "...")]`
+    into `(tool_name, kwargs)` pairs via AST.
+    """
     text = (raw or "").strip()
     if not text:
         return []
-    try:
-        tree = ast.parse(text, mode="eval")
-    except SyntaxError:
-        return []
-    nodes: list[ast.expr] = list(tree.body.elts) if isinstance(tree.body, ast.List) else [tree.body]
-    parsed: list[tuple[str, dict[str, Any]]] = []
-    for node in nodes:
-        if not isinstance(node, ast.Call):
-            return []
-        if isinstance(node.func, ast.Name):
-            fn_name = node.func.id
-        elif isinstance(node.func, ast.Attribute):
-            fn_name = node.func.attr
-        else:
-            return []
-        kwargs: dict[str, Any] = {}
-        for kw in node.keywords:
-            if not kw.arg:
-                continue
-            try:
-                kwargs[kw.arg] = ast.literal_eval(kw.value)
-            except Exception:
-                return []
-        parsed.append((fn_name, kwargs))
-    return parsed
+
+    inner = text[1:-1].strip() if (text.startswith("[") and text.endswith("]")) else text
+    # Strip fused hallucinated prefix tokens before an actual `tool_name(...)` call, e.g.:
+    # `subagent_fork web_search(query: "gta 6")` -> `web_search(query: "gta 6")`
+    m_fused = re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*\s+([A-Za-z_][A-Za-z0-9_.-]*\s*\([\s\S]*\))$", inner)
+    if m_fused is not None:
+        inner = m_fused.group(1).strip()
+
+    repaired = _normalize_python_literals(_colon_kwargs_to_equals(inner))
+    for candidate in (f"[{repaired}]", repaired):
+        try:
+            tree = ast.parse(candidate, mode="eval")
+        except SyntaxError:
+            continue
+        nodes: list[ast.expr] = list(tree.body.elts) if isinstance(tree.body, ast.List) else [tree.body]
+        parsed: list[tuple[str, dict[str, Any]]] = []
+        valid_tree = True
+        for node in nodes:
+            if not isinstance(node, ast.Call):
+                valid_tree = False
+                break
+            if isinstance(node.func, ast.Name):
+                fn_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                fn_name = node.func.attr
+            else:
+                valid_tree = False
+                break
+            if known_tools is not None and known_tools and fn_name not in known_tools:
+                valid_tree = False
+                break
+            kwargs: dict[str, Any] = {}
+            for kw in node.keywords:
+                if not kw.arg:
+                    continue
+                try:
+                    kwargs[kw.arg] = ast.literal_eval(kw.value)
+                except Exception:
+                    valid_tree = False
+                    break
+            if not valid_tree:
+                break
+            parsed.append((fn_name, kwargs))
+        if valid_tree and parsed:
+            return parsed
+    return []
 
 
 def _validate_json_tool_calls(
@@ -907,7 +1282,7 @@ def _validate_json_tool_calls(
                     if py_name not in schema_by_name:
                         errors.append(f"Unknown or unadvertised tool: {py_name!r}")
                         continue
-                    coerced = _coerce_arguments_to_schema(py_args, schema_by_name[py_name])
+                    coerced = _coerce_arguments_to_schema(py_args, schema_by_name[py_name], tool_name=py_name)
                     err = validate_tool_arguments(coerced, schema_by_name[py_name])
                     if err is not None:
                         errors.append(f"Invalid arguments for tool {py_name!r}: {err}")
@@ -932,7 +1307,7 @@ def _validate_json_tool_calls(
         if not isinstance(arguments, dict):
             errors.append(f"Arguments for tool {name!r} must be an object")
             continue
-        arguments = _coerce_arguments_to_schema(arguments, schema_by_name[name])
+        arguments = _coerce_arguments_to_schema(arguments, schema_by_name[name], tool_name=name)
         err = validate_tool_arguments(arguments, schema_by_name[name])
         if err is not None:
             errors.append(f"Invalid arguments for tool {name!r}: {err}")
